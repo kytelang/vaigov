@@ -1,0 +1,12 @@
+// Persistence entity: one row of the `vendors` table (third-party vendors whose
+// AI risk the control plane tracks). The VendorDto view projection is derived
+// from it by the feature mapper. Snake_case fields match the Postgres columns.
+@serializable
+pub struct Vendor {
+    pub id: string,
+    pub name: string,
+    pub risk_json: string,
+    pub tenant: string,
+    pub review_due_ms: long,
+    pub created_ms: long,
+}

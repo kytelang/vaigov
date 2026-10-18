@@ -1,0 +1,35 @@
+// POST /auth/entra/bindings -> onboard a customer Entra tenant (binding upsert).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+fn obstr(body: json.JsonValue, key: string): string {
+    if (!json.has(body, key)) { return ""; }
+    return json.asString(json.get(body, key)) ?? "";
+}
+
+pub struct EntraOnboardHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraOnboardHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterApp)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let tid = obstr(body, "entra_tid");
+        if (tid.length == 0) { return Http.badRequest("entra_tid is required"); }
+        let tenantId = obstr(body, "tenant_id");
+        if (tenantId.length == 0) { tenantId = "default"; }
+        let issuer = string.concat(string.concat("https://login.microsoftonline.com/", tid), "/v2.0");
+        self.app.trust.upsertBinding(Auth.EntraBinding(tid, tenantId, issuer, "connected", 1));
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("entra_tid", json.str(tid));
+        m.set("tenant_id", json.str(tenantId));
+        return Http.okObj(m);
+    }
+}

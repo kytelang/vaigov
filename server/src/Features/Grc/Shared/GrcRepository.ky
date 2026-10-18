@@ -1,0 +1,112 @@
+// GrcRepository: governance records over the shared `acp` Postgres db. SQL mirrors
+// acp-server store.rs (grc_records / grc_comments / grc_links / ingested_evidence).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.GrcRow;
+
+pub struct GrcRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: GrcRepository, tenant: string): Rows<GrcRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<GrcRow>(conn, "grc_records").query(
+            "SELECT id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id AS tenant FROM grc_records WHERE tenant_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn get(self: GrcRepository, id: string): Rows<GrcRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id));
+        let r = await Repository<GrcRow>(conn, "grc_records").query(
+            "SELECT id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id AS tenant FROM grc_records WHERE id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn add(self: GrcRepository, id: string, kind: string, subject: string, title: string, status: string, body: string, operator: string, createdMs: long, pubkeyHex: string, sigHex: string, linkedRefs: string, answersJson: string, assignee: string, dueMs: long, stage: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(kind)); p.push(db.dbText(subject)); p.push(db.dbText(title));
+        p.push(db.dbText(status)); p.push(db.dbText(body)); p.push(db.dbText(operator)); p.push(db.dbLong(createdMs));
+        p.push(db.dbText(pubkeyHex)); p.push(db.dbText(sigHex)); p.push(db.dbText(linkedRefs)); p.push(db.dbText(answersJson));
+        p.push(db.dbText(assignee)); p.push(db.dbLong(dueMs)); p.push(db.dbText(stage)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("INSERT INTO grc_records (id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn updateSigned(self: GrcRepository, id: string, status: string, body: string, stage: string, pubkeyHex: string, sigHex: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(status)); p.push(db.dbText(body)); p.push(db.dbText(stage));
+        p.push(db.dbText(pubkeyHex)); p.push(db.dbText(sigHex)); p.push(db.dbText(id));
+        let _r = await conn.exec("UPDATE grc_records SET status = $1, body = $2, stage = $3, pubkey_hex = $4, sig_hex = $5 WHERE id = $6", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn setAssignment(self: GrcRepository, id: string, assignee: string, dueMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(assignee)); p.push(db.dbLong(dueMs)); p.push(db.dbText(id));
+        let _r = await conn.exec("UPDATE grc_records SET assignee = $1, due_ms = $2 WHERE id = $3", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn setLinkedRefs(self: GrcRepository, id: string, linkedRefs: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(linkedRefs)); p.push(db.dbText(id));
+        let _r = await conn.exec("UPDATE grc_records SET linked_refs = $1 WHERE id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: GrcRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM grc_records WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn addComment(self: GrcRepository, id: string, grcId: string, author: string, body: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(grcId)); p.push(db.dbText(author)); p.push(db.dbText(body)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO grc_comments (id, grc_id, author, body, created_ms) VALUES ($1,$2,$3,$4,$5)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listComments(self: GrcRepository, grcId: string): Rows<GrcCommentRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(grcId));
+        let r = await Repository<GrcCommentRow>(conn, "grc_comments").query(
+            "SELECT id, author, body, created_ms FROM grc_comments WHERE grc_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addLink(self: GrcRepository, fromRecord: string, toRecord: string, relation: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(fromRecord)); p.push(db.dbText(toRecord)); p.push(db.dbText(relation)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO grc_links (from_record, to_record, relation, created_ms) VALUES ($1,$2,$3,$4)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn ingestedExists(self: GrcRepository, decisionId: string): bool {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(decisionId));
+        let r = await Repository<GrcProbeRow>(conn, "ingested_evidence").query("SELECT 1 AS one FROM ingested_evidence WHERE decision_id = $1", p);
+        self.db.pool.release(conn);
+        return r.items.size() > 0;
+    }
+}

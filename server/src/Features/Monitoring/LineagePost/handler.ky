@@ -1,0 +1,27 @@
+// POST /monitor/lineage {data_class,tool,count} -> {"ok":true}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Monitoring.Shared.MonitorRepository;
+import Features.Monitoring.Shared.monitorjson;
+
+pub struct LineagePostHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: LineagePostHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let dc = string.trim(json.asString(json.get(body, "data_class")) ?? "");
+        let tool = string.trim(json.asString(json.get(body, "tool")) ?? "");
+        if (dc.length == 0 || tool.length == 0) { return Http.errResp(Status.BadRequest, "data_class and tool are required"); }
+        let cd = monitorjson.bodyNum(body, "count");
+        let count = if (cd == undefined) (1) else ((cd ?? 1.0) as long);
+        await self.repo.reportLineage(dc, tool, count, Http.nowMs());
+        return Http.okTrue();
+    }
+}

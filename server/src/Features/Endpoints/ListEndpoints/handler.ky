@@ -1,0 +1,41 @@
+// GET /ai-endpoints -> {"endpoints":[{id,host,port,enabled(bool),note}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Endpoints.Shared.EndpointRepository;
+import Domain.Dtos.EndpointRow;
+
+pub fn endpointRowJson(r: EndpointRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("host", json.str(r.host));
+    m.set("port", json.number(r.port as long));
+    m.set("enabled", json.bool(r.enabled != 0));
+    m.set("note", json.str(r.note));
+    return json.object(m);
+}
+
+pub struct ListEndpointsHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListEndpointsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(endpointRowJson(rows.items.getOr(i, EndpointRow{ id: "", host: "", port: 443, enabled: 0, note: "" })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("endpoints", json.array(arr));
+        return Http.signedObj(self.app, m);
+    }
+}

@@ -1,0 +1,29 @@
+// Row of GET /principals, field names = acp-server's serialized Principal struct.
+@serializable pub struct PrincipalListRow {
+    pub id: string,
+    pub display: string,
+    pub source: string,
+    pub groups_json: string,
+    pub created_ms: long,
+}
+
+// Projections for agent resolve-key / verify.
+@serializable pub struct AgentAuthRow {
+    pub id: string,
+    pub name: string,
+    pub app_id: string,
+    pub tenant: string,
+}
+@serializable pub struct AgentVerifyRow {
+    pub an: string,
+    pub aid: string,
+    pub apn: string,
+}
+// Control-state KV projection (groups registry) + existence probe.
+@serializable pub struct KvRow {
+    pub k: string,
+    pub v: string,
+}
+@serializable pub struct ProbeRow {
+    pub one: int,
+}

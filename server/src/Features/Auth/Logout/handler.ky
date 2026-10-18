@@ -1,0 +1,16 @@
+// GET /auth/logout -> clear the session cookie and redirect home (mirrors acp).
+import web.routing;
+import web.response;
+import string;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct LogoutHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: LogoutHandler, ctx: routing.Context): response.Response {
+        let clear = string.concat(Http.sessionCookieName(), "=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0");
+        return Http.redirectWithCookie("/", clear);
+    }
+}

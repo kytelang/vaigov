@@ -1,0 +1,141 @@
+//! In-memory evidence ledger: an append-only, RFC 6962-verifiable log.
+//!
+//! A port of the in-memory core of Rust `acp-core`'s `ledger/mod.rs`. Records
+//! are leaves in a Merkle tree (`core.merkle.MerkleLog`); on every append the
+//! ledger builds a `SignedTreeHead` and signs its canonical bytes with Ed25519,
+//! exactly as the Rust ledger signs a new head per append (never per record).
+//!
+//! The SQLite/Postgres persistence seam (append-only triggers, args-blob table,
+//! idempotency by decision id, read-only verify of a file) is a LATER slice.
+//! What is preserved here is the record and STH canonical byte format and the
+//! verification logic: an edited leaf changes a stored head's recomputed root,
+//! and a head cannot be re-signed without the key.
+//!
+//! Key handling simplification: the ledger holds the signing keypair (hex) so
+//! `appendRecord` can sign without a key argument, matching the Rust `Ledger`
+//! that owns its `Signer`. `signedHead(privHex)` still honours an explicit key,
+//! and `verify(pubHex)` checks every stored head's signature under the caller's
+//! public key plus append-only consistency between the first and latest head.
+
+import list;
+import string;
+import types;
+import hashing;
+import merkle;
+import canonical;
+import sign;
+
+/// A stored tree head together with its Ed25519 signature (hex).
+pub struct HeadEntry {
+    pub sth: types.SignedTreeHead,
+    pub sigHex: string,
+
+    init(sth: types.SignedTreeHead, sigHex: string) {
+        self.sth = sth;
+        self.sigHex = sigHex;
+    }
+}
+
+/// The signed head returned by `signedHead`: the tree head plus its signature.
+/// A struct stands in for the Rust `(SignedTreeHead, Vec<u8>)` tuple.
+pub struct SignedHead {
+    pub sth: types.SignedTreeHead,
+    pub sigHex: string,
+
+    init(sth: types.SignedTreeHead, sigHex: string) {
+        self.sth = sth;
+        self.sigHex = sigHex;
+    }
+}
+
+pub class Ledger {
+    /// The underlying RFC 6962 log of record leaf hashes.
+    pub log: merkle.MerkleLog,
+    /// Every signed head produced so far, in append (ascending size) order.
+    pub heads: List<HeadEntry>,
+    /// Signing keypair (hex), used to sign a new head on each append.
+    pub privHex: string,
+    pub pubHex: string,
+    /// Monotone-ish timestamp stamped into each head (ms). Caller-advanced.
+    pub tsMs: long,
+
+    /// Creates an empty ledger that signs heads with the given keypair.
+    init(privHex: string, pubHex: string) {
+        self.log = merkle.MerkleLog();
+        self.heads = List<HeadEntry>();
+        self.privHex = privHex;
+        self.pubHex = pubHex;
+        self.tsMs = 0;
+    }
+
+    /// Appends a record: hashes its canonical bytes into a leaf, extends the
+    /// tree, then builds and signs a new `SignedTreeHead`. Returns the 0-based
+    /// leaf index (the record's `seq`).
+    pub fn appendRecord(self: Ledger, rec: types.Record): int {
+        let canon = canonical.recordCanonicalBytes(rec);
+        let idx = self.log.append(canon as ptr, canon.length);
+        self.tsMs = self.tsMs + 1;
+        let sth = self.headAtCurrent();
+        let sig = sign.signSth(self.privHex, sth);
+        self.heads.push(HeadEntry(sth, sig));
+        return idx;
+    }
+
+    // The tree head describing the current full tree.
+    fn headAtCurrent(self: Ledger): types.SignedTreeHead {
+        return types.SignedTreeHead(self.log.size() as long, self.log.root(), self.tsMs);
+    }
+
+    /// Current number of records (leaves).
+    pub fn size(self: Ledger): int {
+        return self.log.size();
+    }
+
+    /// The current tree head (unsigned view).
+    pub fn head(self: Ledger): types.SignedTreeHead {
+        return self.headAtCurrent();
+    }
+
+    /// RFC 6962 root (hex) of the first `m` records, for a consistency proof.
+    pub fn rootAtSize(self: Ledger, m: int): string {
+        return merkle.rootOf(self.log.leaves.slice(0, m));
+    }
+
+    /// Signs the current head with `privHex` and returns it with its signature.
+    pub fn signedHead(self: Ledger, privHex: string): SignedHead {
+        let sth = self.headAtCurrent();
+        let sig = sign.signSth(privHex, sth);
+        return SignedHead(sth, sig);
+    }
+
+    /// Verifies the ledger under `pubHex`: every stored head's signature is
+    /// valid and its root matches the recomputed root at that size, and the
+    /// first and latest heads are append-only consistent (slice-1
+    /// `verifyConsistency`). An empty ledger verifies vacuously.
+    pub fn verify(self: Ledger, pubHex: string): bool {
+        let n = self.heads.size();
+        if (n == 0) { return true; }
+
+        let i = 0;
+        while (i < n) {
+            let e = self.heads.at(i);
+            let sz = e.sth.treeSize as int;
+            let recomputed = merkle.rootOf(self.log.leaves.slice(0, sz));
+            if (!string.eql(recomputed, e.sth.rootHashHex)) { return false; }
+            if (!sign.verifySth(pubHex, e.sth, e.sigHex)) { return false; }
+            i = i + 1;
+        }
+
+        if (n >= 2) {
+            let first = self.heads.at(0);
+            let last = self.heads.at(n - 1);
+            let m = first.sth.treeSize as int;
+            let big = last.sth.treeSize as int;
+            let proof = self.log.consistencyProof(m) ?? List<string>();
+            if (!merkle.verifyConsistency(m, first.sth.rootHashHex, big, last.sth.rootHashHex, proof)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}

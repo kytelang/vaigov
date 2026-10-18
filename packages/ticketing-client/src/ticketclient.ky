@@ -1,0 +1,139 @@
+//! Ticketing client (single package for Jira, ServiceNow and a generic ITSM
+//! webhook). One `Ticketing` value, configured with the target system, raises a
+//! ticket and returns its id/number/key. Shared by the sidecar (raise on
+//! violation) and the control plane.
+//!
+//! Framework notes (web.client), applied here deliberately:
+//!   * The client is synchronous. Every call is made with `requestTimeout` and a
+//!     bounded `timeoutMs` so a slow or hung ticketing endpoint cannot stall the
+//!     caller's reactor indefinitely (a plain `request` would block until the
+//!     socket closed).
+//!   * `web.client` does not expose verified TLS together with custom headers
+//!     (the verified helpers take no headers, and the header+CA path is private).
+//!     Auth headers are mandatory here, so these calls use `requestTimeout`,
+//!     which does the TLS handshake but does NOT verify the server certificate.
+//!     Terminate/verify TLS at your egress proxy, or use a framework
+//!     `requestVerified(method,url,headers,body,caPem)` once it exists.
+//!   * A stable idempotency key (caller-supplied) is sent as the
+//!     `Idempotency-Key` header and, where the system supports it, in the body
+//!     (ServiceNow `correlation_id`), so a retry after a crash does not open a
+//!     duplicate.
+import web.client;
+import web.response;
+import web.status;
+import serde.json;
+import string;
+import list;
+import map;
+
+/// Default request timeout: a ticket create should be quick; cap the reactor stall.
+fn defaultTimeoutMs(): int { return 10000; }
+
+fn jesc(s: string): string {
+    let a = string.replace(s, "\\", "\\\\");
+    return string.replace(a, "\"", "\\\"");
+}
+
+fn trimTrailingSlash(s: string): string {
+    if (string.endsWith(s, "/")) { return string.slice(s, 0, s.length - 1); }
+    return s;
+}
+
+pub class TicketResult {
+    pub ok: bool,
+    pub status: int,
+    pub id: string,
+    pub body: string,
+    init(ok: bool, status: int, id: string, body: string) { self.ok = ok; self.status = status; self.id = id; self.body = body; }
+}
+
+pub class Ticketing {
+    pub system: string,     // "jira" | "servicenow" | "generic"
+    pub baseUrl: string,
+    pub user: string,       // Jira account email / ServiceNow user (Basic auth)
+    pub token: string,      // Jira API token / ServiceNow password / generic Bearer
+    pub project: string,    // Jira project key / generic project tag
+    pub timeoutMs: int,
+    init(system: string, baseUrl: string, user: string, token: string, project: string, timeoutMs: int) {
+        self.system = system; self.baseUrl = baseUrl; self.user = user; self.token = token;
+        self.project = project; self.timeoutMs = if (timeoutMs > 0) (timeoutMs) else (defaultTimeoutMs());
+    }
+
+    fn base(self: Ticketing): string { return trimTrailingSlash(self.baseUrl); }
+
+    fn strField(self: Ticketing, o: json.JsonValue, k: string): string {
+        if (o.kind != 5 || !json.has(o, k)) { return ""; }
+        let s = json.asString(json.get(o, k));
+        if (s != undefined) { return s ?? ""; }
+        let n = json.asNumber(json.get(o, k));
+        if (n != undefined) { return `${n ?? 0.0}`; }
+        return "";
+    }
+
+    fn extractId(self: Ticketing, body: string): string {
+        let v = json.tryParse(body);
+        if (v == undefined) { return ""; }
+        let o = v ?? json.null();
+        if (o.kind != 5) { return ""; }
+        if (string.eql(self.system, "jira")) { return self.strField(o, "key"); }
+        if (string.eql(self.system, "servicenow")) {
+            if (json.has(o, "result")) { return self.strField(json.get(o, "result"), "number"); }
+            return self.strField(o, "number");
+        }
+        // generic: try the common id field names in order.
+        let keys = list.List<string>();
+        keys.push("number"); keys.push("key"); keys.push("id"); keys.push("ticket");
+        let i = 0;
+        while (i < keys.size()) {
+            let hit = self.strField(o, keys.get(i) ?? "");
+            if (!string.eql(hit, "")) { return hit; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    fn path(self: Ticketing): string {
+        if (string.eql(self.system, "jira")) { return self.base() + "/rest/api/2/issue"; }
+        if (string.eql(self.system, "servicenow")) { return self.base() + "/api/now/table/incident"; }
+        return self.base() + "/tickets";
+    }
+
+    fn body(self: Ticketing, summary: string, description: string, verdict: string, idemKey: string): string {
+        if (string.eql(self.system, "jira")) {
+            return "{\"fields\":{\"project\":{\"key\":\"" + jesc(self.project) + "\"}" +
+                ",\"summary\":\"" + jesc(summary) + "\",\"description\":\"" + jesc(description) +
+                "\",\"issuetype\":{\"name\":\"Task\"}}}";
+        }
+        if (string.eql(self.system, "servicenow")) {
+            return "{\"short_description\":\"" + jesc(summary) + "\",\"description\":\"" + jesc(description) +
+                "\",\"correlation_id\":\"" + jesc(idemKey) + "\"}";
+        }
+        return "{\"project\":\"" + jesc(self.project) + "\",\"idempotency_key\":\"" + jesc(idemKey) +
+            "\",\"title\":\"" + jesc(summary) + "\",\"description\":\"" + jesc(description) +
+            "\",\"verdict\":\"" + jesc(verdict) + "\"}";
+    }
+
+    fn headers(self: Ticketing, idemKey: string): Map<string, string> {
+        let h = Map<string, string>(5, string.hash);
+        h.set("content-type", "application/json");
+        h.set("accept", "application/json");
+        h.set("idempotency-key", idemKey);
+        let basic = string.eql(self.system, "jira") || string.eql(self.system, "servicenow");
+        if (basic) {
+            if (self.user.length > 0) { h.set("authorization", client.basicAuth(self.user, self.token)); }
+        } else {
+            if (self.token.length > 0) { h.set("authorization", client.bearer(self.token)); }
+        }
+        return h;
+    }
+
+    /// Raise a ticket. Returns the created id/number/key (empty `id` with `ok`
+    /// false on failure, so the caller can retry).
+    pub fn raise(self: Ticketing, summary: string, description: string, verdict: string, idemKey: string): TicketResult {
+        let h = self.headers(idemKey);
+        let resp = client.Http.requestTimeout("POST", self.path(), h, self.body(summary, description, verdict, idemKey), self.timeoutMs);
+        let code = Status.toCode(resp.status);
+        if (code < 200 || code >= 300) { return TicketResult(false, code, "", resp.body); }
+        return TicketResult(true, code, self.extractId(resp.body), resp.body);
+    }
+}

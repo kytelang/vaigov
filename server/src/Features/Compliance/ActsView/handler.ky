@@ -1,0 +1,19 @@
+// GET /acts/view -> the Acts & controls hypermedia view (Datastar fragment),
+// matching acp/console ActsView.vue. Renders the embedded framework catalogue
+// (controls.frameworks) with each act's controls (controls.forFramework).
+import ds_response;
+import controls;
+import Features.Compliance.views.acts;
+import Shared.AppContext;
+import web.routing;
+import web.response;
+
+pub struct ActsViewHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: ActsViewHandler, ctx: routing.Context): response.Response {
+        let fws = controls.frameworks();
+        return await ds_response.patch(acts.actsPanel(fws));
+    }
+}

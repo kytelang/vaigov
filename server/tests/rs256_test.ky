@@ -1,0 +1,35 @@
+// RS256 (real-Entra) JWT verification + JWK-Set parsing, proven with a 2048-bit RSA
+// key signed by openssl: a valid token verifies against its JWKS n/e, a tampered
+// signature is rejected, and a full JWK Set document parses + selects the right kid.
+// Exercises Auth.verify's RS256 path (rsa.verifyPkcs1 + SHA-256) and authhelp.parseJwks.
+import assert;
+import string;
+import Shared.Auth;
+import Features.Auth.Shared.authhelp;
+
+fn directJwks(): Auth.Jwks {
+    let j = Auth.Jwks();
+    j.addRsa("kidA", "w9zDGUp8tBxZXtWMNFA5N34CkGrYK6BCcDdSqimxh-h-iItNbP94gkdvlJ2lgpFXYKLFUsr4e9idNaXU73jDWbUQkaiK_7EqOoFjjjvUHSvWZQAufXn40051SyDHXKIz2M9OnlLXUblM-iHTM3ZPBs9TCZ7PbITyHDe3yWrnE1Eftt_U9S8o0VvXOMhYntr6fydEuwEuY5HHm_x2w-MzfH_tY8h5ksKWOiu2cmnU0H3GKDegVPHdbpe8qGfl-hn26DuQ44JkzfFG8LYEEQaPUoVB3n1Rxyy54vILJr7dZzX7E2d_CL5jVQol5pBTXH0-vvAFBsv9OB-Io0RXPnkfAw", "AQAB");
+    return j;
+}
+fn cfg(): Auth.EntraConfig { return Auth.EntraConfig("https://test.issuer/", "api://test"); }
+
+@test
+fn rs256_valid_token_verifies(): void {
+    assert.isTrue(Auth.verify("eyJhbGciOiJSUzI1NiIsImtpZCI6ImtpZEEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3Rlc3QuaXNzdWVyLyIsImF1ZCI6ImFwaTovL3Rlc3QiLCJvaWQiOiJvMSIsInByZWZlcnJlZF91c2VybmFtZSI6InVAdGVzdCIsInRpZCI6ImNvbW1vbiIsInJvbGVzIjpbIlBvbGljeUFkbWluIl0sImV4cCI6NDEwMjQ0NDgwMH0.rw7B1HeMBidQ9yOexsKhhG1GF7cK1k10Mm2-JAd5vLtxY1Htnu98rqATCBixuCK-vMEJvu1yRpDunk9AUwSYj6oGixvJjGxRQFDLDcHrMyjvvaQKTJMl0c0cj7kKfRU8VYe3vEKVZNBYAJQEQEytU3NEHicyHyTnM9Qt_LBaao11oOobV8nj9q7qeh2VJRIg8F0-FqRabCQtMqhgB3miIzEKk0XKMyS021reZGvsx6U-f7Y7RewQKt42dbSCTJucbK4mV8fhrA-vSd__JO2YX43EsN6xoa91dgnJUdNrh7XVkaMtYGmJ9CgsLT4oDBbSSk8JrLFr6gWYo8_ZhqcrqQ", directJwks(), cfg(), 1700000000000).ok);
+}
+
+@test
+fn rs256_tampered_signature_rejected(): void {
+    assert.isTrue(!Auth.verify("eyJhbGciOiJSUzI1NiIsImtpZCI6ImtpZEEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3Rlc3QuaXNzdWVyLyIsImF1ZCI6ImFwaTovL3Rlc3QiLCJvaWQiOiJvMSIsInByZWZlcnJlZF91c2VybmFtZSI6InVAdGVzdCIsInRpZCI6ImNvbW1vbiIsInJvbGVzIjpbIlBvbGljeUFkbWluIl0sImV4cCI6NDEwMjQ0NDgwMH0.Aw7B1HeMBidQ9yOexsKhhG1GF7cK1k10Mm2-JAd5vLtxY1Htnu98rqATCBixuCK-vMEJvu1yRpDunk9AUwSYj6oGixvJjGxRQFDLDcHrMyjvvaQKTJMl0c0cj7kKfRU8VYe3vEKVZNBYAJQEQEytU3NEHicyHyTnM9Qt_LBaao11oOobV8nj9q7qeh2VJRIg8F0-FqRabCQtMqhgB3miIzEKk0XKMyS021reZGvsx6U-f7Y7RewQKt42dbSCTJucbK4mV8fhrA-vSd__JO2YX43EsN6xoa91dgnJUdNrh7XVkaMtYGmJ9CgsLT4oDBbSSk8JrLFr6gWYo8_ZhqcrqQ", directJwks(), cfg(), 1700000000000).ok);
+}
+
+@test
+fn jwks_set_parses_and_verifies(): void {
+    // A JWK Set document with two keys; the matching kid must be selected.
+    let other = string.concat(string.concat("{\"kty\":\"RSA\",\"kid\":\"otherKid\",\"n\":\"", "AQAB"), "\",\"e\":\"AQAB\"}");
+    let mine = string.concat(string.concat("{\"kty\":\"RSA\",\"kid\":\"kidA\",\"n\":\"", "w9zDGUp8tBxZXtWMNFA5N34CkGrYK6BCcDdSqimxh-h-iItNbP94gkdvlJ2lgpFXYKLFUsr4e9idNaXU73jDWbUQkaiK_7EqOoFjjjvUHSvWZQAufXn40051SyDHXKIz2M9OnlLXUblM-iHTM3ZPBs9TCZ7PbITyHDe3yWrnE1Eftt_U9S8o0VvXOMhYntr6fydEuwEuY5HHm_x2w-MzfH_tY8h5ksKWOiu2cmnU0H3GKDegVPHdbpe8qGfl-hn26DuQ44JkzfFG8LYEEQaPUoVB3n1Rxyy54vILJr7dZzX7E2d_CL5jVQol5pBTXH0-vvAFBsv9OB-Io0RXPnkfAw"), string.concat("\",\"e\":\"", "AQAB\"}"));
+    let doc = string.concat(string.concat("{\"keys\":[", other), string.concat(",", string.concat(mine, "]}")));
+    let jwks = authhelp.parseJwks(doc);
+    assert.isTrue(Auth.verify("eyJhbGciOiJSUzI1NiIsImtpZCI6ImtpZEEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3Rlc3QuaXNzdWVyLyIsImF1ZCI6ImFwaTovL3Rlc3QiLCJvaWQiOiJvMSIsInByZWZlcnJlZF91c2VybmFtZSI6InVAdGVzdCIsInRpZCI6ImNvbW1vbiIsInJvbGVzIjpbIlBvbGljeUFkbWluIl0sImV4cCI6NDEwMjQ0NDgwMH0.rw7B1HeMBidQ9yOexsKhhG1GF7cK1k10Mm2-JAd5vLtxY1Htnu98rqATCBixuCK-vMEJvu1yRpDunk9AUwSYj6oGixvJjGxRQFDLDcHrMyjvvaQKTJMl0c0cj7kKfRU8VYe3vEKVZNBYAJQEQEytU3NEHicyHyTnM9Qt_LBaao11oOobV8nj9q7qeh2VJRIg8F0-FqRabCQtMqhgB3miIzEKk0XKMyS021reZGvsx6U-f7Y7RewQKt42dbSCTJucbK4mV8fhrA-vSd__JO2YX43EsN6xoa91dgnJUdNrh7XVkaMtYGmJ9CgsLT4oDBbSSk8JrLFr6gWYo8_ZhqcrqQ", jwks, cfg(), 1700000000000).ok);
+}

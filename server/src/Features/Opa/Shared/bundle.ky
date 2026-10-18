@@ -1,0 +1,163 @@
+//! The OPA bundle format: compile the active rules to Rego, pack a gzip-tar
+//! bundle, and unpack one. Self-contained (512-byte ustar headers, octal size
+//! fields) so a server-built bundle round-trips through `unpack`. Shared by the
+//! Opa feature handlers and reused by the Policy feature (activeRego/revision).
+
+import string;
+import bytes;
+import list;
+import map;
+import serde.json;
+import compress.gzip;
+import rego;
+import canonical;
+import Shared.AppContext;
+import Features.Rules.Shared.RuleRepository;
+import Features.Policy.Shared.policyrules;
+
+/// The bundle revision: the first 16 hex chars of the SHA-256 of the rego.
+pub fn revision(rego: string): string {
+    let full = canonical.sha256HexOfString(rego);
+    return string.slice(full, 0, 16);
+}
+
+fn padTo512(n: int): int {
+    return ((n + 511) / 512) * 512;
+}
+
+fn putStr(buf: long, off: int, s: string): void {
+    let i = 0;
+    while (i < s.length) {
+        bytes.write_byte(buf, off + i, s[i]);
+        i = i + 1;
+    }
+}
+
+fn putOctal(buf: long, off: int, width: int, value: int): void {
+    let digits = width - 1;
+    let v = value;
+    let i = digits - 1;
+    while (i >= 0) {
+        bytes.write_byte(buf, off + i, 48 + (v % 8));
+        v = v / 8;
+        i = i - 1;
+    }
+    bytes.write_byte(buf, off + digits, 0);
+}
+
+fn writeEntry(buf: long, off: int, name: string, content: string): int {
+    putStr(buf, off, name);
+    putOctal(buf, off + 100, 8, 420);      // mode 0644
+    putOctal(buf, off + 108, 8, 0);        // uid
+    putOctal(buf, off + 116, 8, 0);        // gid
+    putOctal(buf, off + 124, 12, content.length); // size
+    putOctal(buf, off + 136, 12, 0);       // mtime
+    bytes.write_byte(buf, off + 156, 48);  // typeflag '0' (regular file)
+    putStr(buf, off + 257, "ustar");       // magic
+    bytes.write_byte(buf, off + 263, 48);  // version "00"
+    bytes.write_byte(buf, off + 264, 48);
+
+    let k = 148;
+    while (k < 156) { bytes.write_byte(buf, off + k, 32); k = k + 1; }
+    let sum = 0;
+    let j = 0;
+    while (j < 512) { sum = sum + bytes.read_byte(buf, off + j); j = j + 1; }
+    putOctal(buf, off + 148, 7, sum);
+    bytes.write_byte(buf, off + 155, 32);
+
+    putStr(buf, off + 512, content);
+    return off + 512 + padTo512(content.length);
+}
+
+/// Builds a gzip-compressed tar bundle holding `.manifest` and `policy.rego`.
+pub fn buildBundle(rev: string, regoSrc: string): string {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("revision", json.str(rev));
+    let roots = List<json.JsonValue>();
+    roots.push(json.str("acp"));
+    m.set("roots", json.array(roots));
+    let manifest = json.stringify(json.object(m));
+
+    let total = 512 + padTo512(manifest.length) + 512 + padTo512(regoSrc.length) + 1024;
+    let buf = bytes.alloc(total);
+    let z = 0;
+    while (z < total) { bytes.write_byte(buf, z, 0); z = z + 1; }
+
+    let off = writeEntry(buf, 0, ".manifest", manifest);
+    off = writeEntry(buf, off, "policy.rego", regoSrc);
+
+    let tar = bytes.read_string(buf, total);
+    bytes.free(buf);
+    return gzip.compress(tar);
+}
+
+fn readField(s: string, off: int, max: int): string {
+    let end = off;
+    let limit = off + max;
+    while (end < limit && end < s.length && s[end] != 0) { end = end + 1; }
+    return string.slice(s, off, end);
+}
+
+fn readOctal(s: string, off: int, max: int): int {
+    let v = 0;
+    let i = off;
+    let limit = off + max;
+    while (i < limit && i < s.length) {
+        let c = s[i];
+        if (c < 48 || c > 55) { break; }
+        v = v * 8 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn isZeroBlock(s: string, off: int): bool {
+    let i = 0;
+    while (i < 512) {
+        if (off + i >= s.length) { return true; }
+        if (s[off + i] != 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Unpacks a gzip tar bundle into `(revision, rego)`.
+pub fn unpack(bundleGz: string): (string, string) {
+    let tar = gzip.decompress(bundleGz);
+    let rev = "";
+    let regoOut = "";
+    let off = 0;
+    while (off + 512 <= tar.length) {
+        if (isZeroBlock(tar, off)) { break; }
+        let name = readField(tar, off, 100);
+        let size = readOctal(tar, off + 124, 12);
+        let contentOff = off + 512;
+        let content = string.slice(tar, contentOff, contentOff + size);
+        if (string.endsWith(name, ".manifest")) {
+            let v = json.tryParse(content);
+            if (v != undefined) { rev = json.asString(json.get(v ?? json.null(), "revision")) ?? ""; }
+        } else if (string.endsWith(name, "policy.rego")) {
+            regoOut = content;
+        }
+        off = contentOff + padTo512(size);
+    }
+    return (rev, regoOut);
+}
+
+/// The compiled Rego for the active rule set.
+pub fn activeRego(app: AppContext): string {
+    return rego.compileRules(app.trust.rules, app.trustCfg.defaultVerdict);
+}
+
+/// Compile the tenant's `policy_rules` (from the shared acp db) to Rego. This is
+/// the authoritative bundle source now that rules live in PG. It delegates to the
+/// same shaper the operator preview uses (`policyrules.activeRuleJson`) and honours
+/// the configured `defaultVerdict`, so the served bundle and the preview are always
+/// identical: both carry the rule's controls ({act, control_id}) and the step-up
+/// `approver_group`, and both fall through to the configured default (not a
+/// hard-coded "allow", which fails open when `defaultVerdict: deny` is set).
+pub async fn activeRegoDb(app: AppContext, tenant: string): string {
+    let repo = RuleRepository(app.db);
+    let rules = await policyrules.activeRuleJson(repo, tenant);
+    return rego.compileRules(rules, app.trustCfg.defaultVerdict);
+}

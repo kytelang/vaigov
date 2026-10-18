@@ -1,0 +1,27 @@
+// GET /firewall/threat-pack/available -> the signed built-in threat pack the control
+// plane offers. acp returns {pack, signature, pubkey}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.asr;
+
+pub struct ThreatPackAvailableHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: ThreatPackAvailableHandler, ctx: routing.Context): response.Response {
+        let pack = asr.asrBuiltinThreatPack(1);
+        let body = json.stringify(pack);
+        let pubk = self.app.trust.keypair.pubHex;
+        let sig = sign.signHex(self.app.trust.keypair.privHex, body as ptr, body.length);
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("pack", pack);
+        m.set("signature", json.str(sig));
+        m.set("pubkey", json.str(pubk));
+        return Http.okObj(m);
+    }
+}

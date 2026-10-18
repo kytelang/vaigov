@@ -1,0 +1,117 @@
+// AdminRepository: organisation/acts-catalogue/tenancy over the shared `acp` db.
+// SQL mirrors acp-server store.rs (countries/acts/conformance_checklist/
+// act_countries/tenant_settings).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.AdminRows;
+
+pub struct AdminRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn countries(self: AdminRepository): Rows<CountryRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        let r = await Repository<CountryRow>(conn, "countries").query(
+            "SELECT code, name, region FROM countries ORDER BY name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn countryRegion(self: AdminRepository, code: string): string {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(string.toUpperCase(code)));
+        let r = await Repository<CountryRow>(conn, "countries").query(
+            "SELECT code, name, region FROM countries WHERE code = $1", p);
+        self.db.pool.release(conn);
+        if (r.items.size() == 0) { return "other"; }
+        return (r.items.getOr(0, CountryRow{ code: "", name: "", region: "other" })).region;
+    }
+
+    pub async fn actsForCountry(self: AdminRepository, code: string): Rows<ActApplRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(string.toUpperCase(code)));
+        let r = await Repository<ActApplRow>(conn, "act_countries").query(
+            "SELECT act_slug, applicability FROM act_countries WHERE country_code = $1 OR country_code = 'ALL' ORDER BY applicability DESC, act_slug", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn checklist(self: AdminRepository, actId: string): Rows<ChecklistRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(actId));
+        let r = await Repository<ChecklistRow>(conn, "conformance_checklist").query(
+            "SELECT item_id, control_id, ordinal, title, description, required_evidence, reference, obligation_type, roles_json, applicability, assessment_method, citation FROM conformance_checklist WHERE act_id = $1 ORDER BY ordinal", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn orgs(self: AdminRepository): Rows<OrgRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        let r = await Repository<OrgRow>(conn, "tenant_settings").query(
+            "SELECT tenant_id, org_name, onboarded FROM tenant_settings ORDER BY org_name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn tenants(self: AdminRepository): Rows<TenantIdRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        let r = await Repository<TenantIdRow>(conn, "apps").query(
+            "SELECT tenant_id FROM grc_records UNION SELECT tenant_id FROM apps UNION SELECT tenant_id FROM models UNION SELECT tenant_id FROM vendors ORDER BY tenant_id", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn tenantSettings(self: AdminRepository, tenant: string): Rows<TenantSettingsRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<TenantSettingsRow>(conn, "tenant_settings").query(
+            "SELECT onboarded, jurisdiction, enabled_acts, org_name, address_line1, address_line2, city, postcode, country, contact_name, contact_email, contact_phone, profile_json FROM tenant_settings WHERE tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Upsert tenant settings (acp set_tenant_settings: delete-then-insert).
+    pub async fn setTenantSettings(self: AdminRepository, tenant: string, orgName: string, jurisdiction: string, actsJson: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let d = list.List<DbValue>();
+        d.push(db.dbText(tenant));
+        let _d = await conn.exec("DELETE FROM tenant_settings WHERE tenant_id = $1", d);
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(jurisdiction)); p.push(db.dbText(actsJson)); p.push(db.dbText(orgName)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO tenant_settings (tenant_id, onboarded, jurisdiction, enabled_acts, org_name, updated_ms) VALUES ($1, 1, $2, $3, $4, $5)", p);
+        self.db.pool.release(conn);
+    }
+
+    // Register a new organisation (a fresh tenant_settings row). Returns the tenant id.
+    pub async fn registerTenant(self: AdminRepository, id: string, name: string, jurisdiction: string, actsJson: string, profileJson: string, contactName: string, contactEmail: string, contactPhone: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(jurisdiction)); p.push(db.dbText(actsJson)); p.push(db.dbText(name));
+        p.push(db.dbLong(nowMs)); p.push(db.dbText(profileJson)); p.push(db.dbText(contactName)); p.push(db.dbText(contactEmail)); p.push(db.dbText(contactPhone));
+        let _r = await conn.exec("INSERT INTO tenant_settings (tenant_id, onboarded, jurisdiction, enabled_acts, org_name, updated_ms, profile_json, contact_name, contact_email, contact_phone) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9)", p);
+        self.db.pool.release(conn);
+    }
+
+    // Full self-serve registration (the signup form): persists the organisation
+    // address columns and primary-contact columns too, with registration_number,
+    // industry, company_size, website and dpo_email folded into profile_json.
+    pub async fn registerTenantFull(self: AdminRepository, id: string, name: string, jurisdiction: string, actsJson: string, line1: string, line2: string, city: string, postcode: string, country: string, profileJson: string, contactName: string, contactEmail: string, contactPhone: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(jurisdiction)); p.push(db.dbText(actsJson)); p.push(db.dbText(name));
+        p.push(db.dbText(line1)); p.push(db.dbText(line2)); p.push(db.dbText(city)); p.push(db.dbText(postcode)); p.push(db.dbText(country));
+        p.push(db.dbLong(nowMs)); p.push(db.dbText(profileJson)); p.push(db.dbText(contactName)); p.push(db.dbText(contactEmail)); p.push(db.dbText(contactPhone));
+        let _r = await conn.exec("INSERT INTO tenant_settings (tenant_id, onboarded, jurisdiction, enabled_acts, org_name, address_line1, address_line2, city, postcode, country, updated_ms, profile_json, contact_name, contact_email, contact_phone) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id) DO UPDATE SET onboarded = 1, jurisdiction = EXCLUDED.jurisdiction, enabled_acts = EXCLUDED.enabled_acts, org_name = EXCLUDED.org_name, address_line1 = EXCLUDED.address_line1, address_line2 = EXCLUDED.address_line2, city = EXCLUDED.city, postcode = EXCLUDED.postcode, country = EXCLUDED.country, updated_ms = EXCLUDED.updated_ms, profile_json = EXCLUDED.profile_json, contact_name = EXCLUDED.contact_name, contact_email = EXCLUDED.contact_email, contact_phone = EXCLUDED.contact_phone", p);
+        self.db.pool.release(conn);
+    }
+}

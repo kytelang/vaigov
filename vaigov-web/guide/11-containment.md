@@ -1,0 +1,158 @@
+# 11. Sequence, boundary and break-glass
+
+Some risks are not visible in a single call. An agent can read a secret (allowed) and then send an
+email (allowed) and the combination is exfiltration. Some risks need an instant, blunt stop. This
+chapter covers the three containment controls: sequence governance, the data boundary, and the
+kill-switch.
+
+## Trajectory: governing sequences
+
+Trajectory governance watches a session's history and denies the action that **completes a toxic
+combination** of individually-allowed steps, or that exceeds a high-impact velocity budget.
+
+```sh
+acp-agent mcp stdio --trajectory trajectory.yaml ... -- your-mcp-server
+```
+
+The classic combination is read-a-secret then egress: each step is fine alone, but the second one,
+after the first, is blocked. The monitor keeps a bounded per-session history and evaluates each new
+action against it within a time window. It is enabled per PEP with `--trajectory`.
+
+## The data boundary: destination-aware DLP
+
+The [content firewall](10-content-firewall.md) asks "is this content sensitive?". The data boundary
+asks a different question: "may this class of data cross to *that* destination?". It is
+destination-aware.
+
+```sh
+acp-agent mcp stdio --data-boundary boundary.yaml ... -- your-mcp-server
+```
+
+A rule keys on the data class (secret, PII) and the destination resource, and the most-restrictive
+outcome wins (deny beats redact beats allow). So a secret in the body of an outbound fetch is blocked,
+while PII to an internal store might be redacted rather than denied.
+
+## Break-glass: the kill-switch
+
+Break-glass is the emergency stop. It is a signed grant that overrides normal policy, and it reaches
+**every enforcement point**: the proxy (tool calls), the gateway (model calls), the interceptor (egress)
+and the guard (tool-server forwards). Each PEP loads the grant with `--break-glass-file <file>` (a file
+your deployment distributes, written when you engage from the console or `POST /break-glass/engage`), and
+pins it with `--break-glass-key <hex>` so a tampered or unsigned grant is rejected. Each PEP watches the
+file and reloads on change. Under an engaged `lockdown_all` the proxy and gateway deny matching calls, the
+interceptor blocks all egress with a `403`, and the guard refuses every forward with a `503`.
+
+Operate it from the console's **Kill-switch** control (the **Engage or clear the kill-switch** popup,
+with Mode, Scope, Reason and TTL fields), or the control-plane API for scripting:
+
+```sh
+# engage: mode is lockdown_all | disable_enforce | emergency_bypass
+curl -X POST http://<host>:8787/break-glass/engage \
+  -d '{"mode":"lockdown_all","scope":"global","reason":"incident 4821","ttl_ms":3600000}'
+curl -X POST http://<host>:8787/break-glass/engage \
+  -d '{"mode":"lockdown_all","scope":"resource:database","reason":"db incident","ttl_ms":1800000}'
+curl -X POST http://<host>:8787/break-glass/clear
+```
+
+- **Modes:** `lockdown_all` denies matching calls; `disable_enforce` observes without blocking;
+  `emergency_bypass` allows held calls (use with care).
+- **Scope:** global, or narrowed to an `agent:`, `resource:` or `tool:`, so you can contain one
+  resource or agent without downing the fleet.
+- **Fail-safe TTL:** an engaged grant carries a TTL and auto-reverts, **except** `lockdown_all`,
+  which persists past its TTL until you explicitly clear it. A lockdown should not quietly lift
+  itself.
+- **Signed:** the grant is Ed25519-signed and can be pinned to a key; a PEP verifies the signature
+  before honouring it, and rejects a tampered or unsigned grant, keeping the current state.
+
+Engaging or clearing break-glass is gated on the `BreakGlass` capability (granted by the `BreakGlassOperator` role) and is recorded in
+the [meta-audit](09-evidence.md), so the emergency stop is itself governed and evidenced. In the web
+console it is a single control with a live status ([chapter 14](14-operations.md)).
+
+### How to engage or clear the kill-switch from the console (step by step)
+
+1. Select **Kill-switch** in the sidebar, then click **Engage / clear**. The **Engage or clear the kill-switch** popup opens with the live status.
+2. Choose a **Mode**: `lockdown_all` (deny), `disable_enforce` (observe without blocking) or `emergency_bypass` (allow held calls).
+3. Set the **Scope** (`global`, or narrow it to `agent:`, `resource:` or `tool:`), a **Reason** (an incident reference), and the **TTL ms** after which a grant auto-reverts (except `lockdown_all`, which persists until cleared).
+4. Click **Engage** to write the signed grant, or **Clear** to lift it. Engaging and clearing are gated on the `BreakGlass` capability (granted by the `BreakGlassOperator` role) and are themselves recorded in the meta-audit.
+
+## Approvals: resolving a step-up hold
+
+A `step_up` verdict is the human-in-the-loop control. Instead of allowing or denying outright, the PEP
+**holds** the call and waits for a person with the right role to approve or deny it. This section is the
+runbook for resolving a hold, and the end-to-end trace of what happens.
+
+### The end-to-end step-up flow
+
+1. **The agent makes a call that matches a `step_up` rule.** The proxy does not forward it. It opens an
+   approval keyed to `hash(session, principal, tool, arg_hash)`, so the approval is bound to the exact
+   call, and returns a JSON-RPC hold to the agent: `-32001 approval required (step-up); re-issue after
+   approval`, with the `approvalId` and a `retryAfter` hint in the error data. A hold is not a failure;
+   it is a pause.
+2. **The hold appears for a human.** A pending approval carries the presented context an approver
+   sees: the tool, its impact, and the argument hash (never the raw arguments). The default approval
+   lifetime is fifteen minutes; an unresolved hold expires and the call stays blocked.
+3. **A human approves or denies.** Approving marks the approval consumable exactly once; denying (or
+   letting it expire) turns it terminal.
+4. **The agent re-issues the identical call.** On approve, the same key consumes once and the proxy
+   forwards the call to the tool server; the decision and its approval are recorded in the ledger. On
+   deny or expiry, the agent gets a structured tool error and the call never runs. Because the key
+   includes the canonical `arg_hash`, a re-issue whose arguments differ maps to a different key and
+   cannot ride the earlier approval.
+
+### Resolving a hold from the console
+
+The console **Approvals inbox** lists the pending holds held in the control plane's approval store,
+each with its tool and presented context and an **Approve** and a **Deny** button.
+
+1. Open the console and select **Approvals** (the control plane also serves a minimal inbox at `/`).
+2. Read the presented context: tool, impact and argument hash. Use `acp diagnose <ledger.db> <seq>` if
+   you want the redacted decision bundle for the matching record (it never shows raw arguments).
+3. Click **Approve** to release the held call, or **Deny** to block it.
+
+### Resolving a hold over the API
+
+The console buttons POST to these routes; use them directly for scripting or from an incident tool:
+
+```sh
+# list pending holds
+curl -s http://<host>:8787/approvals/pending
+
+# approve or deny one, by id
+curl -X POST http://<host>:8787/approvals/<id>/approve -H "Authorization: Bearer <token>"
+curl -X POST http://<host>:8787/approvals/<id>/deny    -H "Authorization: Bearer <token>"
+```
+
+Both routes are gated on the `Approve` capability (granted by the approver role), so with RBAC enabled
+only an authorised human can resolve a hold, and the resolver is attributed on the record. The `acp
+approve` / `acp deny` / `acp approvals` CLI commands are **retired**; resolve holds from the console or
+these routes.
+
+### Where a hold lives
+
+There are two approval stores, and it matters how they are wired:
+
+- **Control-plane store** (`acp-server --approvals`): the holds the console inbox and the
+  `/approvals/*` routes see.
+- **Agent-local store** (`acp-agent mcp --approvals`, default `<ledger>.approvals`): where a workstation
+  proxy keeps its own holds.
+
+Wiring the two together: start the proxy with `--approvals-url <control-plane>` and each new step-up hold
+is **registered with the control plane** (`POST /approvals/register`), so a field hold raised at a
+workstation shows up in the console **Approvals** inbox straight away. A background reconciler then polls
+`GET /approvals/:id/status` and, when an operator approves or denies from the console (`POST
+/approvals/:id/approve` or `.../deny`), applies that decision back to the proxy's local store, so the
+agent's re-issue is released or blocked accordingly. Without `--approvals-url` a workstation hold stays
+proxy-local and must be resolved where the proxy keeps it; for the self-contained quickstart proxy that
+is the `<ledger>.approvals` file beside the ledger.
+
+
+## Cross-node trajectory: one session, one authority
+
+A `TrajectoryMonitor` lives in the enforcement point's own memory, so it sees only the actions that pass through that process. In a single-node deployment, or when a session is pinned to one enforcement point (in stdio mode the child's stdio is owned by one proxy, so this holds structurally), that is the whole session and the toxic-combination and velocity rules are complete.
+
+When traffic for one session is fanned across several horizontally-scaled enforcement points, each process would otherwise keep an independent trajectory, and a toxic combination split across two nodes (the `db.read` on node A, the `net.send` on node B) would slip past both. There are two supported answers:
+
+- **Session affinity (recommended for low latency).** Route all of a session's traffic to the same enforcement point. Then the local in-memory monitor is complete and there is no extra round-trip on the hot path. This is the default posture and is structural in stdio mode.
+- **A shared trajectory authority.** Start the control plane with `--trajectory-policy <file>` (the same toxic-combination and velocity YAML the proxy loads) and have enforcement points report each governed action to `POST /trajectory/check` with `{session, resource, operation, impact?, ts_ms?}`. The control plane keeps one monitor per session and returns `{allow, reason?}` over the session's full trajectory, so a combination split across nodes is still denied. The trade-off is one control-plane round-trip per governed action, so use this when a session genuinely cannot be pinned to a node.
+
+The endpoint is gated by the report token, so only enrolled enforcement points can call it. With no `--trajectory-policy` set the authority is absent and the call allows, leaving single-node deployments to evaluate trajectory locally as before.

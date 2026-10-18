@@ -1,0 +1,78 @@
+//! varman-cli: `sign-artifact` / `verify-artifact`. A port of Rust `acp-cli`'s
+//! `commands/supplychain.rs` (`cmd_sign_artifact` / `cmd_verify_artifact`),
+//! offline Ed25519 over a file's bytes via `sign.ky`.
+//!
+//! The keyfile holds a 32-byte Ed25519 seed as 64 hex chars (the Rust CLI read
+//! 32 raw bytes; here the seam crosses as hex, matching the rest of the trust
+//! core). `sign-artifact` writes `<file>.sig` (128-hex signature) and
+//! `<keyfile>.pub` (64-hex public key) and prints the public key.
+//! `verify-artifact <file> <pub> <sig>` reads the public key and signature as
+//! hex (either inline or from a file) and checks the signature over the bytes.
+
+import string;
+import io.file;
+import sign;
+
+/// The public key and signature (both hex) produced by signing an artifact.
+pub struct SignResult {
+    pub pubHex: string,
+    pub sigHex: string,
+
+    init(pubHex: string, sigHex: string) {
+        self.pubHex = pubHex;
+        self.sigHex = sigHex;
+    }
+}
+
+/// Sign the bytes of `text` (an artifact's contents) with the 64-hex seed.
+/// Returns the public key and the 128-hex signature.
+pub fn signBytes(text: string, seedHex: string): SignResult {
+    let kp = sign.keypairFromSeedHex(seedHex);
+    let sig = sign.signHex(kp.privHex, text as ptr, text.length);
+    return SignResult(kp.pubHex, sig);
+}
+
+/// Verify a 128-hex signature over the bytes of `text` under a 64-hex public key.
+pub fn verifyBytes(text: string, pubHex: string, sigHex: string): bool {
+    return sign.verifyHex(pubHex, text as ptr, text.length, sigHex);
+}
+
+// If `s` looks like a path to an existing file, read and trim it; otherwise treat
+// `s` itself as the hex value. Lets `verify-artifact` take hex inline or as a file.
+fn hexArg(s: string): string {
+    if (File.exists(s)) { return string.trim(File.readText(s)); }
+    return string.trim(s);
+}
+
+/// CLI: `sign-artifact <file> <keyfile>`. Reads the file bytes and the seed,
+/// signs, writes `<file>.sig` and `<keyfile>.pub`, prints the public key.
+pub fn cmdSignArtifact(filePath: string, keyfile: string): int {
+    if (!File.exists(filePath)) { console.log(`varman: cannot read ${filePath}`); return 1; }
+    if (!File.exists(keyfile)) { console.log(`varman: cannot read keyfile ${keyfile}`); return 1; }
+    let data = File.readText(filePath);
+    let seedHex = string.trim(File.readText(keyfile));
+    if (seedHex.length != 64) {
+        console.log("varman: keyfile must hold a 32-byte seed as 64 hex chars");
+        return 2;
+    }
+    let r = signBytes(data, seedHex);
+    File.writeText(`${filePath}.sig`, r.sigHex);
+    File.writeText(`${keyfile}.pub`, r.pubHex);
+    console.log(`signed ${filePath} -> ${filePath}.sig (public key ${keyfile}.pub)`);
+    return 0;
+}
+
+/// CLI: `verify-artifact <file> <pub> <sig>`. `pub`/`sig` may be hex inline or a
+/// path to a hex file. Returns 0 when the signature verifies, else 1.
+pub fn cmdVerifyArtifact(filePath: string, pubArg: string, sigArg: string): int {
+    if (!File.exists(filePath)) { console.log(`varman: cannot read ${filePath}`); return 1; }
+    let data = File.readText(filePath);
+    let pubHex = hexArg(pubArg);
+    let sigHex = hexArg(sigArg);
+    if (verifyBytes(data, pubHex, sigHex)) {
+        console.log(`VERIFIED: ${filePath} signature is valid`);
+        return 0;
+    }
+    console.log(`INVALID: ${filePath} signature does not verify`);
+    return 1;
+}

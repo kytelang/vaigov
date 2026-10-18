@@ -1,0 +1,23 @@
+// GET /alerts -> {"tripped":[...],"healthy":bool}. Spiking event kinds.
+// NOTE: acp tracks spikes in an in-memory window per replica; the Kyte server has
+// no in-process spike tracker yet, so this reports healthy (no tripped kinds).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct AlertsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: AlertsHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("tripped", json.array(list.List<json.JsonValue>()));
+        m.set("healthy", json.bool(true));
+        return Http.okObj(m);
+    }
+}

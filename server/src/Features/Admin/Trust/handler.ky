@@ -1,0 +1,38 @@
+// GET /trust -> the trust summary (product + control posture).
+// GET /verify -> {"ok":bool} verifying the evidence ledger.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct TrustHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: TrustHandler, ctx: routing.Context): response.Response {
+        let controlsMap = Map<string, json.JsonValue>(8, string.hash);
+        controlsMap.set("resource_boundary_authorization", json.bool(true));
+        controlsMap.set("rbac", json.bool(true));
+        controlsMap.set("tamper_evident_evidence", json.bool(true));
+        controlsMap.set("signed_reports", json.bool(true));
+        controlsMap.set("policy_as_data", json.bool(true));
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("product", json.str("Varman (ACP)"));
+        m.set("generated_ms", json.number(Http.nowMs()));
+        m.set("controls", json.object(controlsMap));
+        return Http.okObj(m);
+    }
+}
+
+pub struct VerifyHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: VerifyHandler, ctx: routing.Context): response.Response {
+        let ok = await self.app.trust.store.verify();
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(ok));
+        return Http.okObj(m);
+    }
+}

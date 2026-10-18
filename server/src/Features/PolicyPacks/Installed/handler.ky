@@ -1,0 +1,39 @@
+// GET /policy-packs/installed -> {"installed":[{slug,version,params,status,installed_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Domain.Dtos.PackRows;
+
+pub struct InstalledHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: InstalledHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listInstalled(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 });
+            let m = Map<string, json.JsonValue>(6, string.hash);
+            m.set("slug", json.str(r.slug));
+            m.set("version", json.number(r.version as long));
+            let pv = json.tryParse(r.params_json);
+            m.set("params", if (pv == undefined) (json.object(Map<string, json.JsonValue>(1, string.hash))) else (pv ?? json.null()));
+            m.set("status", json.str(r.status));
+            m.set("installed_ms", json.number(r.installed_ms));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("installed", json.array(arr));
+        return Http.signedObj(self.app, out);
+    }
+}

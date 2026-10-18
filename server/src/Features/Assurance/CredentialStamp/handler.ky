@@ -1,0 +1,38 @@
+// POST /credential/stamp -> issue a signed agent credential binding subject + scopes.
+// acp returns {"ok":true,"credential":{sub,scopes,iat,pubkey,sig}}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct CredentialStampHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: CredentialStampHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditFirewall)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let sub = json.has(body, "sub") ? (json.asString(json.get(body, "sub")) ?? "") : "";
+        let iat = Http.nowMs();
+
+        let claims = Map<string, json.JsonValue>(4, string.hash);
+        claims.set("sub", json.str(sub));
+        if (json.has(body, "scopes")) { claims.set("scopes", json.get(body, "scopes")); } else { claims.set("scopes", json.array(list.List<json.JsonValue>())); }
+        claims.set("iat", json.number(iat));
+        let canon = json.stringify(json.object(claims));
+        let pubk = self.app.trust.keypair.pubHex;
+        let sig = sign.signHex(self.app.trust.keypair.privHex, canon as ptr, canon.length);
+        claims.set("pubkey", json.str(pubk));
+        claims.set("sig", json.str(sig));
+
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("credential", json.object(claims));
+        return Http.okObj(m);
+    }
+}

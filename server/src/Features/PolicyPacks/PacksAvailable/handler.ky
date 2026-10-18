@@ -1,0 +1,35 @@
+// GET /packs/available -> the built-in baseline control packs (is_builtin), the
+// subset an operator can load. Mirrors acp packs_available (which also scopes to
+// the org's enabled acts; that act-scoping is flagged as a follow-up here).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.PacksList.handler;
+import Domain.Dtos.PackRows;
+
+pub struct PacksAvailableHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: PacksAvailableHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listPackArtifacts(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let row = rows.items.getOr(i, PackArtifactRow{ id: "", name: "", tenant_id: "", body: "{}" });
+            if (string.eql(row.tenant_id, "system")) { arr.push(packArtifactJson(row)); }
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("packs", json.array(arr));
+        return Http.okObj(m);
+    }
+}

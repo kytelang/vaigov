@@ -1,0 +1,43 @@
+// GET /artifacts?kind=policy|firewall_config|agent_config|pack -> {"artifacts":[...]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Evidence.Shared.EvidenceRepository;
+import Domain.Dtos.IngestedRow;
+
+pub struct ListArtifactsHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListArtifactsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let kind = ctx.query("kind");
+        if (kind.length == 0) { kind = "policy"; }
+        let rows = await self.repo.listArtifacts(tenant, kind);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let a = rows.items.getOr(i, ArtifactRow{ artifact_id: "", kind: "", name: "", scope: "", active_version: "", baseline_version: "", versions: 0, updated_ms: 0 });
+            i = i + 1;
+            let m = Map<string, json.JsonValue>(8, string.hash);
+            m.set("artifact_id", json.str(a.artifact_id));
+            m.set("kind", json.str(a.kind));
+            m.set("name", json.str(a.name));
+            m.set("scope", json.str(a.scope));
+            m.set("active_version", json.str(a.active_version));
+            m.set("baseline_version", json.str(a.baseline_version));
+            m.set("versions", json.number(a.versions));
+            m.set("updated_ms", json.number(a.updated_ms));
+            arr.push(json.object(m));
+        }
+        let out = Map<string, json.JsonValue>(1, string.hash);
+        out.set("artifacts", json.array(arr));
+        return Http.okObj(out);
+    }
+}

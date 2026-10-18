@@ -1,0 +1,41 @@
+// POST /grc/{id}/status {status} -> {"ok":true,"id","status"}. Re-signs the record
+// with the new status so the verify-on-read in GET /grc stays valid (acp A4).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+import Features.Grc.AssessGrc.handler;
+import Domain.Dtos.GrcRow;
+
+pub struct StatusGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: StatusGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+        let status = string.trim(grcsign.grcStr(body, "status"));
+        if (status.length == 0) { return grcErr("status is required"); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let recs = await self.repo.get(id);
+        if (recs.items.size() == 0) { return grcErr("no such record"); }
+        let rec = recs.items.getOr(0, GrcRow{ id: "", kind: "", subject: "", title: "", status: "", body: "{}", operator: "", created_ms: 0, pubkey_hex: "", sig_hex: "", linked_refs: "[]", answers_json: "{}", assignee: "", due_ms: 0, stage: "", tenant: "" });
+        if (!string.eql(rec.tenant, tenant)) { return grcErr("no such record"); }
+        let doc = grcsign.grcDoc(rec.id, rec.kind, rec.subject, rec.title, status, rec.body);
+        let sig = grcsign.grcSignHex(self.app.trust.keypair.privHex, doc);
+        await self.repo.updateSigned(id, status, rec.body, status, self.app.trust.keypair.pubHex, sig);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("status", json.str(status));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,147 @@
+// Ticketing view as KYX (full parity with acp/console TicketingView.vue): the
+// automation rules (New rule modal + per-row enable/disable + delete) and the
+// raised tickets table. The modal's target fields switch on the connector
+// (webhook / servicenow / jira). Datastar forms post to /console/ticketing/*.
+import list;
+import string;
+import Domain.Dtos.TicketRuleRow;
+
+fn jsq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "'", "\\'"); }
+
+fn connectorChip(c: string): Html {
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{c}</span>;
+}
+fn onOffBadge(enabled: int): Html {
+    if (enabled != 0) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">on</span>; }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-muted">off</span>;
+}
+fn ruleMatchText(r: TicketRuleRow): string {
+    let p = if (r.match_verdict.length > 0) (r.match_verdict) else ("any verdict");
+    if (r.match_control.length > 0) { p = string.concat(p, string.concat(" · control~", r.match_control)); }
+    if (r.match_resource.length > 0) { p = string.concat(p, string.concat(" · resource=", r.match_resource)); }
+    return p;
+}
+
+fn ruleRow(r: TicketRuleRow): Html {
+    let toggleExpr = "$tkId='" + jsq(r.id) + "'; @post('/console/ticketing/toggle')";
+    let delExpr = "$tkId='" + jsq(r.id) + "'; @post('/console/ticketing/delete')";
+    let toggleLabel = if (r.enabled != 0) ("Disable") else ("Enable");
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 text-sm text-txt">{r.name}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{ruleMatchText(r)}</td>
+        <td class="py-2 pr-4">{connectorChip(r.connector)}</td>
+        <td class="py-2 pr-4 text-xs">{`${r.throttle_sec}s`}</td>
+        <td class="py-2 pr-4">{onOffBadge(r.enabled)}</td>
+        <td class="py-2 pr-4 text-right whitespace-nowrap">
+            <button class="text-xs text-dim hover:text-txt mr-3" data-on:click={toggleExpr}>{toggleLabel}</button>
+            <button class="text-xs text-bad hover:underline" data-on:click={delExpr}>Delete</button>
+        </td>
+    </tr>;
+}
+
+fn ticketStatusBadge(s: string): Html {
+    if (string.eql(s, "open")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{s}</span>; }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{s}</span>;
+}
+fn ticketRow(t: TicketRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 whitespace-nowrap text-dim text-xs">{if (t.last_sent_ms > 0) { `${t.last_sent_ms}`; } else { <span>-</span>; }}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{t.title}</td>
+        <td class="py-2 pr-4">{connectorChip(t.connector)}</td>
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{if (t.external_id.length > 0) { t.external_id; } else { <span>-</span>; }}</td>
+        <td class="py-2 pr-4 text-sm">{`${t.hits}`}</td>
+        <td class="py-2 pr-4">{ticketStatusBadge(t.status)}</td>
+    </tr>;
+}
+
+fn tkInput(labelText: string, bind: string, placeholder: string): Html {
+    return <label class="text-xs text-dim">{labelText}
+        <input type="text" data-bind={bind} class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder={placeholder} />
+    </label>;
+}
+
+pub fn ticketingPanel(rules: list.List<TicketRuleRow>, tickets: list.List<TicketRow>): Html {
+    return <div id="ticketing" class="grid gap-4">
+        <div data-show="$tkErr != ''" class="text-bad text-sm" data-text="$tkErr"></div>
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line flex items-center gap-3">
+                <div>
+                    <h2 class="font-semibold text-txt">Automation rules</h2>
+                    <p class="text-xs text-dim">Raise a ticket when OPA pushes a matching decision.</p>
+                </div>
+                <div class="ml-auto">
+                    <button class="rounded-lg bg-accent text-white px-3.5 py-1.5 text-sm font-medium hover:opacity-90"
+                        data-on:click="$tkName=''; $tkVerdict='deny'; $tkControl=''; $tkResource=''; $tkConnector='webhook'; $tkThrottle='3600'; $tkUrl=''; $tkInstance=''; $tkTable='incident'; $tkBase=''; $tkProject='GOV'; $tkLabel='varman'; $tkErr=''; $tkModal='open'">New rule</button>
+                </div>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                        <th class="py-2 pr-4">Name</th><th class="py-2 pr-4">Match</th><th class="py-2 pr-4">Connector</th><th class="py-2 pr-4">Throttle</th><th class="py-2 pr-4">Enabled</th><th class="py-2 pr-4"></th>
+                    </tr></thead>
+                    <tbody>
+                        {for (i in 0..rules.size()) { ruleRow(rules.at(i)); }}
+                        {if (rules.size() == 0) {
+                            <tr><td colspan="6" class="py-8 text-center text-dim">No automation rules. Add one to turn matching decisions into tickets.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Raised tickets</h2>
+                <p class="text-xs text-dim">Tickets opened by automation, newest first.</p>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                        <th class="py-2 pr-4">When</th><th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Connector</th><th class="py-2 pr-4">External ID</th><th class="py-2 pr-4">Hits</th><th class="py-2 pr-4">Status</th>
+                    </tr></thead>
+                    <tbody>
+                        {for (i in 0..tickets.size()) { ticketRow(tickets.at(i)); }}
+                        {if (tickets.size() == 0) { <tr><td colspan="6" class="py-8 text-center text-dim">No tickets raised yet.</td></tr>; }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div data-show="$tkModal === 'open'" class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-panel border border-line rounded-2xl p-6 w-full max-w-lg">
+                <h3 class="font-semibold text-txt">New automation rule</h3>
+                <div class="grid sm:grid-cols-2 gap-3 mt-4">
+                    {tkInput("Name", "tkName", "e.g. notify on deny")}
+                    <label class="text-xs text-dim">Match verdict
+                        <select data-bind="tkVerdict" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="deny">deny</option><option value="allow">allow</option><option value="step_up">step_up</option><option value="shadow">shadow</option><option value="">any</option>
+                        </select>
+                    </label>
+                    {tkInput("Match control (optional)", "tkControl", "e.g. eu-ai-act:art-9")}
+                    {tkInput("Match resource (optional)", "tkResource", "e.g. api.openai.com")}
+                    <label class="text-xs text-dim">Connector
+                        <select data-bind="tkConnector" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="webhook">webhook</option><option value="servicenow">servicenow</option><option value="jira">jira</option>
+                        </select>
+                    </label>
+                    {tkInput("Throttle (seconds)", "tkThrottle", "3600")}
+                    <div class="sm:col-span-2 grid gap-3" data-show="$tkConnector === 'webhook'">
+                        {tkInput("Webhook URL", "tkUrl", "https://hooks.example.com/...")}
+                    </div>
+                    <div class="sm:col-span-2 grid sm:grid-cols-2 gap-3" data-show="$tkConnector === 'servicenow'">
+                        {tkInput("Instance", "tkInstance", "dev12345.service-now.com")}
+                        {tkInput("Table", "tkTable", "incident")}
+                    </div>
+                    <div class="sm:col-span-2 grid sm:grid-cols-3 gap-3" data-show="$tkConnector === 'jira'">
+                        {tkInput("Base URL", "tkBase", "https://org.atlassian.net")}
+                        {tkInput("Project key", "tkProject", "GOV")}
+                        {tkInput("Label", "tkLabel", "varman")}
+                    </div>
+                    <div class="col-span-full flex justify-end gap-2 pt-1">
+                        <button class="rounded-lg border border-line2 px-4 py-2 text-sm hover:bg-panel2" data-on:click="$tkModal=''">Cancel</button>
+                        <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90" data-on:click="@post('/console/ticketing/save')">Add rule</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>;
+}

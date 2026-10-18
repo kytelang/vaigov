@@ -1,0 +1,41 @@
+// POST /ai-endpoints {host, port?=443, note?} -> {"ok":true,"id":"ep-<hex6>"} (EditPolicy).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Endpoints.Shared.EndpointRepository;
+
+// Shared {"ok":false,"error":msg} reply (200), reused by the update handler.
+pub fn endpointOkFalse(msg: string): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return Http.okObj(m);
+}
+
+pub struct CreateEndpointHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateEndpointHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let host = string.trim(json.asString(json.get(body, "host")) ?? "");
+        if (host.length == 0) { return endpointOkFalse("host is required"); }
+        let port = (json.asNumber(json.get(body, "port")) ?? 443) as int;
+        let note = json.asString(json.get(body, "note")) ?? "";
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let id = string.concat("ep-", random.randomHex(6));
+        await self.repo.add(id, tenant, host, port, note, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

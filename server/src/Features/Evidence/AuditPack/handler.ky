@@ -1,0 +1,29 @@
+// GET /audit/pack -> a JSON summary of the central evidence for an auditor.
+// acp (assurance.rs) streams a signed archive for a [from,to] window; the signed
+// archive bytes are a later core wave. Here we return the summary counts. FLAGGED.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Evidence.Shared.EvidenceRepository;
+
+pub struct AuditPackHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: AuditPackHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.Export)) { return Http.forbidden(); }
+        let ingested = await self.repo.countIngested();
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("ingested_evidence", json.number(ingested));
+        m.set("pubkey_hex", json.str(self.app.trust.keypair.pubHex));
+        m.set("note", json.str("summary only; the signed archive bytes are a later core wave"));
+        return Http.okObj(m);
+    }
+}

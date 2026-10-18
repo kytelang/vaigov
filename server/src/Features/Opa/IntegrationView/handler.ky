@@ -1,0 +1,26 @@
+// GET /integration/view -> the OPA integration screen as a Datastar fragment.
+// Reuses the same computation as GET /integration (JSON), rendered as HTML.
+import web.routing;
+import web.response;
+import string;
+import ds_response;
+import Features.Opa.Shared.bundle;
+import Features.Opa.views.integration;
+import Shared.AppContext;
+
+pub struct IntegrationViewHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: IntegrationViewHandler, ctx: Context): Response {
+        let tenant = self.app.trustCfg.tenant;
+        let regoSrc = activeRego(self.app);
+        let rev = revision(regoSrc);
+        let shortRev = if (rev.length > 12) (string.slice(rev, 0, 12)) else (rev);
+        let ruleCount = `${self.app.trust.rules.size()}`;
+        let yaml = string.concat(string.concat(
+            "services:\n  varman:\n    url: CONTROL_PLANE_URL\n    headers:\n      x-acp-tenant: \"", tenant),
+            "\"\nbundles:\n  acp:\n    service: varman\n    resource: /v1/bundles/policy\n    polling:\n      min_delay_seconds: 20\n      max_delay_seconds: 60\ndecision_logs:\n  service: varman\n  reporting:\n    min_delay_seconds: 5\n    max_delay_seconds: 15\n");
+        return await ds_response.patch(integration.integrationPanel(tenant, ruleCount, shortRev, "/v1/bundles/policy", "/logs", yaml, "open"));
+    }
+}

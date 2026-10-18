@@ -1,0 +1,91 @@
+//! The trust-core runtime state: the pieces that are not (yet) Postgres-backed.
+//!
+//! The RFC 6962 verifiable evidence ledger, the Ed25519 tree-head/bundle signing
+//! key, the active UI-authored policy rule set, the observed-decision read-side,
+//! and the onboarded Entra tenant bindings. These come straight from the
+//! `varman-core` trust package (hashing/merkle/sign/ledger/store) and are held in
+//! memory, reactor-confined (single-reactor model, no locks). The governed-resource
+//! registries (agents, apps, models, ...) live in Postgres via the feature
+//! repositories; this is only the trust spine the policy/evidence path needs.
+
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import store;
+import Shared.Auth;
+import Shared.AppConfig;
+
+/// One observed decision: the read-side record the console Decisions screen and
+/// the compliance coverage matrix draw from. The self-describing decision our
+/// compiled Rego returns ({verdict, rule, controls}) plus the request fields.
+pub class DecisionEntry {
+    pub decisionId: string,
+    pub verdict: string,
+    pub ruleId: string,
+    pub controls: List<string>,
+    pub resource: string,
+    pub operation: string,
+    pub subject: string,
+    pub tenant: string,
+    pub tsMs: long,
+
+    init(decisionId: string, verdict: string, ruleId: string, controls: List<string>, resource: string, operation: string, subject: string, tenant: string, tsMs: long) {
+        self.decisionId = decisionId;
+        self.verdict = verdict;
+        self.ruleId = ruleId;
+        self.controls = controls;
+        self.resource = resource;
+        self.operation = operation;
+        self.subject = subject;
+        self.tenant = tenant;
+        self.tsMs = tsMs;
+    }
+
+    pub fn toJson(self: DecisionEntry): json.JsonValue {
+        let m = Map<string, json.JsonValue>(16, string.hash);
+        m.set("decision_id", json.str(self.decisionId));
+        m.set("verdict", json.str(self.verdict));
+        m.set("rule", json.str(self.ruleId));
+        let cs = List<json.JsonValue>();
+        let i = 0;
+        while (i < self.controls.size()) { cs.push(json.str(self.controls.at(i))); i = i + 1; }
+        m.set("controls", json.array(cs));
+        m.set("resource", json.str(self.resource));
+        m.set("operation", json.str(self.operation));
+        m.set("subject", json.str(self.subject));
+        m.set("tenant", json.str(self.tenant));
+        m.set("ts_ms", json.number(self.tsMs));
+        return json.object(m);
+    }
+}
+
+/// The in-memory trust spine, built once from `TrustConfig`.
+pub class TrustState {
+    pub keypair: sign.KeyPair,
+    pub store: store.Store,
+    pub rules: List<json.JsonValue>,
+    pub decisions: List<DecisionEntry>,
+    pub entraBindings: Map<string, Auth.EntraBinding>,
+    /// The dev-auth mock issuer (EdDSA), matching acp's `--dev-auth` MockEntra:
+    /// `GET /auth/dev-token` issues with it and `Http.requireCap` verifies against
+    /// its JWKS, so bearer-token RBAC works end to end for the console + CLI.
+    pub mockEntra: Auth.MockEntra,
+    pub seq: long,
+
+    init(cfg: AppConfig.TrustConfig) {
+        let kp = sign.keypairFromSeedHex(cfg.seedHex);
+        self.keypair = kp;
+        self.store = store.newMemStore(kp.privHex, kp.pubHex);
+        self.rules = List<json.JsonValue>();
+        self.decisions = List<DecisionEntry>();
+        self.entraBindings = Map<string, Auth.EntraBinding>(8, string.hash);
+        self.mockEntra = Auth.MockEntra("common", "api://varman", cfg.seedHex);
+        self.seq = 0;
+    }
+
+    pub fn setRules(self: TrustState, rules: List<json.JsonValue>): void { self.rules = rules; }
+    pub fn addDecision(self: TrustState, d: DecisionEntry): void { self.decisions.push(d); }
+    pub fn upsertBinding(self: TrustState, b: Auth.EntraBinding): void { self.entraBindings.set(b.tid, b); }
+}

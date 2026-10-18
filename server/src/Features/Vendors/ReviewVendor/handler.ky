@@ -1,0 +1,35 @@
+// POST /vendors/{id}/review {review_interval_ms?} -> {"ok":true,"id","review_due_ms"}
+//   or {"ok":false,"error":"no such vendor"}. Mirrors acp vendor_review.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Vendors.Shared.VendorRepository;
+import Features.Apps.CreateApp.handler;
+
+pub struct ReviewVendorHandler impl RouteHandler {
+    repo: VendorRepository,
+    app: AppContext,
+    init(repo: VendorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ReviewVendorHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterApp)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let defaultInterval: long = 7776000000;
+        let interval = json.asNumber(json.get(body, "review_interval_ms")) ?? defaultInterval;
+        let reviewDue = Http.nowMs() + interval;
+        let updated = await self.repo.setReview(id, tenant, reviewDue);
+        if (!updated) { return okFalse("no such vendor"); }
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("review_due_ms", json.number(reviewDue));
+        return Http.okObj(m);
+    }
+}

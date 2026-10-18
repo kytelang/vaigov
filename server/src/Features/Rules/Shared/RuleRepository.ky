@@ -1,0 +1,88 @@
+// RuleRepository: the `policy_rules` + `rule_controls` tables in the shared `acp`
+// Postgres db. SQL mirrors acp-server store.rs (add_rule/update_rule/delete_rule/
+// set_rule_controls/list_rules) exactly.
+import list;
+import string;
+import data.db;
+import data.repository;
+import crypto.random;
+import Shared.Db;
+import Domain.Dtos.RuleListRow;
+
+pub struct RuleRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: RuleRepository, tenant: string): Rows<RuleListRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<RuleListRow>(conn, "policy_rules").query(
+            "SELECT rule_id, name, description, subject_json, resource, operation, condition_json, match_json, approver_group, verdict, obligations_json, enabled, priority, updated_ms FROM policy_rules WHERE tenant_id = $1 ORDER BY priority, name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn controlsFor(self: RuleRepository, ruleId: string): Rows<RuleControlRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(ruleId));
+        let r = await Repository<RuleControlRow>(conn, "rule_controls").query(
+            "SELECT rc.item_id, c.control_id, a.slug FROM rule_controls rc JOIN conformance_checklist c ON c.item_id = rc.item_id JOIN acts a ON a.act_id = c.act_id WHERE rc.rule_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Returns the generated rule id.
+    pub async fn add(self: RuleRepository, tenant: string, name: string, description: string, subjectJson: string, resource: string, operation: string, conditionJson: string, matchJson: string, approverGroup: string, verdict: string, obligationsJson: string, enabled: bool, priority: int, nowMs: long): string {
+        let ruleId = string.concat("rule-", random.randomHex(6));
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(ruleId)); p.push(db.dbText(tenant)); p.push(db.dbText(name)); p.push(db.dbText(description));
+        p.push(db.dbText(subjectJson)); p.push(db.dbText(resource)); p.push(db.dbText(operation)); p.push(db.dbText(conditionJson));
+        p.push(db.dbText(matchJson)); p.push(db.dbText(approverGroup)); p.push(db.dbText(verdict)); p.push(db.dbText(obligationsJson));
+        p.push(db.dbInt(if (enabled) 1 else 0)); p.push(db.dbInt(priority)); p.push(db.dbLong(nowMs)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO policy_rules (rule_id, tenant_id, name, description, subject_json, resource, operation, condition_json, match_json, approver_group, verdict, obligations_json, enabled, priority, created_ms, updated_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)", p);
+        self.db.pool.release(conn);
+        return ruleId;
+    }
+
+    pub async fn update(self: RuleRepository, ruleId: string, tenant: string, name: string, description: string, subjectJson: string, resource: string, operation: string, conditionJson: string, matchJson: string, approverGroup: string, verdict: string, obligationsJson: string, enabled: bool, priority: int, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(description)); p.push(db.dbText(subjectJson)); p.push(db.dbText(resource));
+        p.push(db.dbText(operation)); p.push(db.dbText(conditionJson)); p.push(db.dbText(matchJson)); p.push(db.dbText(approverGroup));
+        p.push(db.dbText(verdict)); p.push(db.dbText(obligationsJson)); p.push(db.dbInt(if (enabled) 1 else 0)); p.push(db.dbInt(priority));
+        p.push(db.dbLong(nowMs)); p.push(db.dbText(ruleId)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE policy_rules SET name=$1, description=$2, subject_json=$3, resource=$4, operation=$5, condition_json=$6, match_json=$7, approver_group=$8, verdict=$9, obligations_json=$10, enabled=$11, priority=$12, updated_ms=$13 WHERE rule_id=$14 AND tenant_id=$15", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: RuleRepository, ruleId: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(ruleId)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM policy_rules WHERE rule_id=$1 AND tenant_id=$2", p);
+        self.db.pool.release(conn);
+    }
+
+    // Replace the controls a rule satisfies (delete then insert), in a transaction.
+    pub async fn setControls(self: RuleRepository, ruleId: string, itemIds: list.List<string>): int {
+        let conn = await self.db.pool.acquire();
+        let _b = await conn.begin();
+        let dp = list.List<DbValue>();
+        dp.push(db.dbText(ruleId));
+        let _d = await conn.exec("DELETE FROM rule_controls WHERE rule_id = $1", dp);
+        let i = 0;
+        while (i < itemIds.size()) {
+            let rcId = string.concat("rc-", random.randomHex(6));
+            let ip = list.List<DbValue>();
+            ip.push(db.dbText(rcId)); ip.push(db.dbText(ruleId)); ip.push(db.dbText(itemIds.at(i)));
+            let _ins = await conn.exec("INSERT INTO rule_controls (id, rule_id, item_id, relation) VALUES ($1, $2, $3, 'satisfies') ON CONFLICT DO NOTHING", ip);
+            i = i + 1;
+        }
+        let _c = await conn.commit();
+        self.db.pool.release(conn);
+        return itemIds.size();
+    }
+}

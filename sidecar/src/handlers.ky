@@ -1,0 +1,107 @@
+//! The sidecar's HTTP route handlers.
+//!
+//! Each is a plain `RouteHandler` struct holding a reference to the shared
+//! `SidecarState`. Together they expose the neutral contract: health, the cached
+//! policy (bundle + rego), the governed endpoint registry, and the inbound
+//! violation/log ingest.
+
+import state;
+import envoy;
+import violation;
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import list;
+
+/// GET /healthz -> operational snapshot (revision, cp_ok, pending, ...).
+pub struct HealthzHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: HealthzHandler, ctx: routing.Context): response.Response {
+        let r = response.Response(Status.Ok, self.st.healthJson());
+        r.headers.set("Content-Type", "application/json");
+        return r;
+    }
+}
+
+/// GET /policy/bundle -> the raw gzip tar bundle, or 503 if none synced yet.
+pub struct PolicyBundleHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: PolicyBundleHandler, ctx: routing.Context): response.Response {
+        if (!self.st.haveBundle) {
+            return response.Response(Status.ServiceUnavailable, "no policy synced yet");
+        }
+        let r = response.Response(Status.Ok, self.st.bundleGz);
+        r.headers.set("Content-Type", "application/gzip");
+        return r;
+    }
+}
+
+/// GET /policy/rego -> the policy source text, or 503 if none synced yet.
+pub struct PolicyRegoHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: PolicyRegoHandler, ctx: routing.Context): response.Response {
+        if (self.st.rego.length == 0) {
+            return response.Response(Status.ServiceUnavailable, "no policy synced yet");
+        }
+        let r = response.Response(Status.Ok, self.st.rego);
+        r.headers.set("Content-Type", "text/plain");
+        return r;
+    }
+}
+
+/// Serialises the cached endpoint registry as a JSON array.
+pub fn endpointsJson(eps: list.List<envoy.Endpoint>): string {
+    let parts = list.List<string>();
+    let i = 0;
+    while (i < eps.size()) {
+        let e = eps.get(i) ?? envoy.Endpoint("", 443, false);
+        let en = if (e.enabled) "true" else "false";
+        parts.push("{\"host\":\"" + state.jsonEscape(e.host) + "\",\"port\":" + `${e.port}` + ",\"enabled\":" + en + "}");
+        i = i + 1;
+    }
+    return "[" + string.join(parts, ",") + "]";
+}
+
+/// GET /ai-endpoints -> {"endpoints":[...]} from the cached registry.
+pub struct AiEndpointsHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: AiEndpointsHandler, ctx: routing.Context): response.Response {
+        let r = response.Response(Status.Ok, "{\"endpoints\":" + endpointsJson(self.st.endpoints) + "}");
+        r.headers.set("Content-Type", "application/json");
+        return r;
+    }
+}
+
+/// POST /violations (and /logs): persist every record to the durable queue
+/// FIRST, then acknowledge. The flush to the control plane happens in the
+/// background loop; the ack does not wait on it (store-and-forward).
+pub struct IngestHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: IngestHandler, ctx: routing.Context): response.Response {
+        let ce = ctx.request.getHeader("content-encoding") ?? "";
+        let items = state.normalize(ce, ctx.request.body);
+        let i = 0;
+        while (i < items.size()) {
+            // Parse each decision-log record into a structured, signed violation
+            // and durably store it BEFORE acking (store-and-forward durability).
+            let v = violation.parseDecision(items.get(i) ?? "", self.st.cfg.tenant, self.st.cfg.prompt_redact);
+            v.capturedMs = state.nowMs();
+            let _stored = self.st.recordViolation(v);
+            i = i + 1;
+        }
+        let r = response.Response(Status.Ok, "{\"ok\":true,\"captured\":" + `${items.size()}` + "}");
+        r.headers.set("Content-Type", "application/json");
+        return r;
+    }
+}

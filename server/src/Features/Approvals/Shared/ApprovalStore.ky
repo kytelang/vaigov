@@ -1,0 +1,131 @@
+// Durable approval queue (the step-up holds a PEP registers and a console operator
+// resolves), backed by the shared Postgres control-plane db (`approvals` table,
+// migration v1002). This replaces the earlier in-memory store so holds and
+// decisions SURVIVE a restart, which a governance product's human-in-the-loop
+// requires. Interface is unchanged (request / resolve / get / listPending) except
+// the methods are now `async` (they do DB I/O); every caller is an `async fn serve`
+// handler that awaits them. TTL expiry is applied on read, exactly as before, and
+// persisted so an expired hold stays expired.
+import list;
+import string;
+import datetime;
+import data.db;
+import data.repository;
+import Shared.Db;
+
+fn approvalNowMs(): long { return datetime.nowNs() / 1000000; }
+
+// The record the handlers read. Unchanged from the in-memory version.
+pub class ApprovalRecord {
+    pub id: string,
+    pub session: string,
+    pub principal: string,
+    pub tool: string,
+    pub argHash: string,
+    pub presented: string,
+    pub state: string,
+    pub approver: string,
+    pub createdMs: long,
+    pub expiresMs: long,
+
+    init(id: string, session: string, principal: string, tool: string, argHash: string, presented: string, state: string, approver: string, createdMs: long, expiresMs: long) {
+        self.id = id;
+        self.session = session;
+        self.principal = principal;
+        self.tool = tool;
+        self.argHash = argHash;
+        self.presented = presented;
+        self.state = state;
+        self.approver = approver;
+        self.createdMs = createdMs;
+        self.expiresMs = expiresMs;
+    }
+}
+
+// ORM row DTO; field names match the SELECT column list.
+@serializable pub struct ApprovalRow {
+    pub id: string,
+    pub session: string,
+    pub principal: string,
+    pub tool: string,
+    pub arg_hash: string,
+    pub presented: string,
+    pub state: string,
+    pub approver: string,
+    pub created_ms: long,
+    pub expires_ms: long,
+}
+
+fn rowToRecord(r: ApprovalRow): ApprovalRecord {
+    return ApprovalRecord(r.id, r.session, r.principal, r.tool, r.arg_hash, r.presented, r.state, r.approver, r.created_ms, r.expires_ms);
+}
+
+pub class ApprovalStore {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    // Register a hold. Idempotent: returns true only if newly created (a repeat
+    // id from a retrying PEP is a no-op that returns false, matching the prior
+    // semantics). INSERT ... ON CONFLICT DO NOTHING plus a pre-check so the caller
+    // learns whether this call created the row.
+    pub async fn request(self: ApprovalStore, id: string, session: string, principal: string, tool: string, argHash: string, presented: string, ttlMs: long): bool {
+        let conn = await self.db.pool.acquire();
+        let ep = list.List<DbValue>();
+        ep.push(db.dbText(id));
+        let existing = await Repository<ApprovalRow>(conn, "approvals").query(
+            "SELECT id, session, principal, tool, arg_hash, presented, state, approver, created_ms, expires_ms FROM approvals WHERE id = $1", ep);
+        if (existing.items.size() > 0) { self.db.pool.release(conn); return false; }
+        let now = approvalNowMs();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(session)); p.push(db.dbText(principal)); p.push(db.dbText(tool));
+        p.push(db.dbText(argHash)); p.push(db.dbText(presented)); p.push(db.dbText("pending")); p.push(db.dbText(""));
+        p.push(db.dbLong(now)); p.push(db.dbLong(now + ttlMs));
+        let _r = await conn.exec("INSERT INTO approvals (id, session, principal, tool, arg_hash, presented, state, approver, created_ms, expires_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING", p);
+        self.db.pool.release(conn);
+        return true;
+    }
+
+    // The console operator's decision. Only a still-pending hold is resolved, so a
+    // late approve/deny of an already-expired or already-resolved hold is a no-op.
+    pub async fn resolve(self: ApprovalStore, id: string, approve: bool, actor: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(if (approve) ("approved") else ("denied"))); p.push(db.dbText(actor)); p.push(db.dbText(id));
+        let _r = await conn.exec("UPDATE approvals SET state = $1, approver = $2 WHERE id = $3 AND state = 'pending'", p);
+        self.db.pool.release(conn);
+    }
+
+    // The current record, applying (and persisting) TTL expiry to a still-pending hold.
+    pub async fn get(self: ApprovalStore, id: string): ApprovalRecord | undefined {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id));
+        let r = await Repository<ApprovalRow>(conn, "approvals").query(
+            "SELECT id, session, principal, tool, arg_hash, presented, state, approver, created_ms, expires_ms FROM approvals WHERE id = $1", p);
+        if (r.items.size() == 0) { self.db.pool.release(conn); return undefined; }
+        let rec = rowToRecord(r.items.at(0));
+        if (string.eql(rec.state, "pending") && approvalNowMs() > rec.expiresMs) {
+            rec.state = "expired";
+            let up = list.List<DbValue>();
+            up.push(db.dbText(id));
+            let _u = await conn.exec("UPDATE approvals SET state = 'expired' WHERE id = $1 AND state = 'pending'", up);
+        }
+        self.db.pool.release(conn);
+        return rec;
+    }
+
+    // Still-pending, unexpired holds (the inbox / console poll).
+    pub async fn listPending(self: ApprovalStore): List<ApprovalRecord> {
+        let conn = await self.db.pool.acquire();
+        let now = approvalNowMs();
+        let p = list.List<DbValue>();
+        p.push(db.dbLong(now));
+        let r = await Repository<ApprovalRow>(conn, "approvals").query(
+            "SELECT id, session, principal, tool, arg_hash, presented, state, approver, created_ms, expires_ms FROM approvals WHERE state = 'pending' AND expires_ms >= $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        let out = List<ApprovalRecord>();
+        let i = 0;
+        while (i < r.items.size()) { out.push(rowToRecord(r.items.at(i))); i = i + 1; }
+        return out;
+    }
+}

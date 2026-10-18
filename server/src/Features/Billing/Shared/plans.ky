@@ -1,0 +1,52 @@
+// The SaaS plan catalogue. Plans are product configuration, not tenant data, so
+// they live in code (a tenant's chosen plan + usage live in the DB). Quota is
+// governed decisions per month; -1 means unlimited.
+import list;
+import string;
+
+pub class Plan {
+    pub slug: string,
+    pub name: string,
+    pub blurb: string,
+    pub priceCents: int,
+    pub interval: string,
+    pub quota: long,
+    init(slug: string, name: string, blurb: string, priceCents: int, interval: string, quota: long) {
+        self.slug = slug; self.name = name; self.blurb = blurb;
+        self.priceCents = priceCents; self.interval = interval; self.quota = quota;
+    }
+}
+
+pub fn catalogue(): list.List<Plan> {
+    let l = list.List<Plan>();
+    l.push(Plan("free", "Free", "Get started governing a single workload.", 0, "month", 1000 as long));
+    l.push(Plan("pro", "Pro", "For teams putting AI into production.", 4900, "month", 100000 as long));
+    l.push(Plan("enterprise", "Enterprise", "Unlimited scale, SSO and the compliance module.", 0, "month", -1 as long));
+    return l;
+}
+
+pub fn bySlug(slug: string): Plan {
+    let c = catalogue();
+    let i = 0;
+    while (i < c.size()) {
+        let p = c.at(i);
+        if (string.eql(p.slug, slug)) { return p; }
+        i = i + 1;
+    }
+    return c.at(0);
+}
+
+/// "$49 / month", or "Free", or "Custom" for the unlimited/zero-price enterprise.
+pub fn priceLabel(p: Plan): string {
+    if (p.priceCents == 0 && p.quota < 0) { return "Custom"; }
+    if (p.priceCents == 0) { return "Free"; }
+    let dollars = p.priceCents / 100;
+    let cents = p.priceCents % 100;
+    let centsStr = if (cents == 0) ("") else ("." + `${cents}`);
+    return "$" + `${dollars}` + centsStr + " / " + p.interval;
+}
+
+pub fn quotaLabel(p: Plan): string {
+    if (p.quota < 0) { return "Unlimited"; }
+    return `${p.quota}` + " decisions / month";
+}

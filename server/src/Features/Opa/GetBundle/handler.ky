@@ -1,0 +1,44 @@
+// GET /v1/bundles/{name} -> the gzipped tar OPA bundle (policy.rego + .manifest)
+// compiled from the tenant's `policy_rules` in the shared acp db, matching
+// acp-server's bundle_get fall-through (list_rules -> compile_rules, default
+// "allow"). Tenant from the x-acp-tenant header.
+import string;
+import web.routing;
+import web.response;
+import web.status;
+import Features.Opa.Shared.bundle;
+import Shared.AppContext;
+import Shared.Http;
+
+// The bearer token value, used as the tenant id when no x-acp-tenant header is
+// present (acp's resolution fallback), or undefined when there is no bearer.
+fn bearerTenant(ctx: routing.Context): string | undefined {
+    let authz = ctx.request.getHeader("authorization");
+    if (authz == undefined) { return undefined; }
+    let h = authz ?? "";
+    if (!string.startsWith(h, "Bearer ")) { return undefined; }
+    let tok = string.trim(string.slice(h, 7, h.length));
+    if (tok.length == 0) { return undefined; }
+    return tok;
+}
+
+pub struct BundleHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: BundleHandler, ctx: routing.Context): response.Response {
+        // Tenant resolution order matches acp (handlers/opa.rs): the explicit
+        // x-acp-tenant header wins, then the bearer-token value as the tenant id
+        // (a sidecar may authenticate as its tenant and set no header), then the
+        // configured default tenant.
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? bearerTenant(ctx) ?? self.app.trustCfg.tenant;
+        let regoSrc = await activeRegoDb(self.app, tenant);
+        let rev = revision(regoSrc);
+        let gz = buildBundle(rev, regoSrc);
+        let r = response.Response(Status.Ok, gz);
+        r.headers.set("Content-Type", "application/gzip");
+        r.headers.set("Content-Disposition", "attachment; filename=bundle.tar.gz");
+        // Detached signature so the edge sidecar can verify before enforcing (R5+R4).
+        return Http.signConfig(self.app, r);
+    }
+}

@@ -1,0 +1,138 @@
+// GET /billing/view -> the Billing + usage console screen.
+// POST /console/billing/select -> switch plan (local; Stripe checkout is wired via
+// the stripe client package). Both render the #billing fragment.
+import ds_response;
+import list;
+import string;
+import map;
+import datetime;
+import env;
+import serde.json;
+import stripe;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Billing.Shared.BillingRepository;
+import Features.Billing.Shared.plans;
+import Features.Billing.views.billing;
+import Domain.Dtos.BillingRows;
+
+fn envOr(name: string, fallback: string): string {
+    let v = env.get(name);
+    if (v.length > 0) { return v; }
+    return fallback;
+}
+fn jsonStr(body: string, key: string): string {
+    let v = json.tryParse(body);
+    if (v == undefined) { return ""; }
+    let o = v ?? json.null();
+    if (o.kind != 5) { return ""; }
+    return json.asString(json.get(o, key)) ?? "";
+}
+
+fn blTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+fn blSig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+
+fn defaultSub(): SubscriptionRow {
+    return SubscriptionRow{ tenant_id: "", plan_slug: "free", status: "active", stripe_customer_id: "", stripe_subscription_id: "", current_period_end_ms: 0, created_ms: 0, updated_ms: 0 };
+}
+
+// Assemble the panel from the subscription, this month's usage, and the catalogue.
+async fn renderBilling(repo: BillingRepository, app: AppContext, tenant: string, nowMs: long, signals: string, viaConsole: bool): Response {
+    await repo.ensure(tenant, nowMs);
+    let subRows = await repo.getSubscription(tenant);
+    let sub = subRows.items.getOr(0, defaultSub());
+    let current = plans.bySlug(sub.plan_slug);
+    let period = datetime.format(nowMs / 1000, "%Y%m");
+    let usageRows = await repo.getUsage(tenant, period);
+    let used = if (usageRows.items.size() > 0) (usageRows.items.getOr(0, UsageRow{ period: "", decisions_count: 0, updated_ms: 0 }).decisions_count) else (0 as long);
+    let recent = (await repo.recentUsage(tenant, 12 as long)).items;
+    let cat = plans.catalogue();
+    let panel = billing.billingPanel(current, sub.status, used, recent, cat);
+    if (viaConsole) { return await ConsoleDs.patchAndSignals(panel, signals); }
+    return await ds_response.patch(panel);
+}
+
+pub struct BillingViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: BillingRepository,
+    init(app: AppContext) { self.app = app; self.repo = BillingRepository(app.db); }
+    async fn serve(self: BillingViewHandler, ctx: routing.Context): Response {
+        return await renderBilling(self.repo, self.app, blTenant(self.app, ctx), Http.nowMs(), "{}", false);
+    }
+}
+
+pub struct BillingSelectHandler impl RouteHandler {
+    app: AppContext,
+    repo: BillingRepository,
+    init(app: AppContext) { self.app = app; self.repo = BillingRepository(app.db); }
+    async fn serve(self: BillingSelectHandler, ctx: routing.Context): Response {
+        let tenant = blTenant(self.app, ctx);
+        let now = Http.nowMs();
+        let body = Http.bodyJson(ctx);
+        let slug = blSig(body, "blPlan");
+        if (slug.length == 0) { slug = "free"; }
+        let plan = plans.bySlug(slug);
+        let key = env.get("STRIPE_SECRET_KEY");
+        // A paid plan with Stripe configured goes to Checkout: create the session,
+        // mark the subscription pending, and hand the hosted-checkout URL to the
+        // browser via $blCheckout. The /stripe/webhook confirms it active.
+        if (plan.priceCents > 0 && key.length > 0) {
+            let s = stripe.Stripe(key);
+            let priceId = env.get("STRIPE_PRICE_" + string.toUpperCase(plan.slug));
+            let success = envOr("STRIPE_SUCCESS_URL", "https://localhost/#billing");
+            let cancel = envOr("STRIPE_CANCEL_URL", "https://localhost/#pricing");
+            let sess = s.createCheckoutSession("", priceId, success, cancel, tenant);
+            if (sess.ok) {
+                let url = jsonStr(sess.body, "url");
+                await self.repo.setPlan(tenant, plan.slug, "pending", "", "", 0 as long, now);
+                return await renderBilling(self.repo, self.app, tenant, now,
+                    "{\"blCheckout\":\"" + url + "\",\"blMsg\":\"Complete checkout to activate " + plan.name + ".\",\"blPlan\":\"\"}", true);
+            }
+            // Checkout creation failed: report it, do not change the plan.
+            return await renderBilling(self.repo, self.app, tenant, now,
+                "{\"blMsg\":\"Could not start checkout (Stripe error).\",\"blPlan\":\"\"}", true);
+        }
+        // Free / Enterprise, or Stripe not configured: switch locally.
+        await self.repo.setPlan(tenant, plan.slug, "active", "", "", 0 as long, now);
+        let msg = "Switched to the " + plan.name + " plan.";
+        return await renderBilling(self.repo, self.app, tenant, now, "{\"blMsg\":\"" + msg + "\",\"blPlan\":\"\"}", true);
+    }
+}
+
+// POST /stripe/webhook -> confirm a checkout as active. Stripe echoes the tenant
+// we passed as client_reference_id, so we flip that subscription from pending to
+// active and record the Stripe customer/subscription ids. NOTE: Stripe-Signature
+// HMAC verification is a follow-up; configure a reverse-proxy allowlist or add the
+// signature check before exposing this publicly.
+pub struct StripeWebhookHandler impl RouteHandler {
+    app: AppContext,
+    repo: BillingRepository,
+    init(app: AppContext) { self.app = app; self.repo = BillingRepository(app.db); }
+    async fn serve(self: StripeWebhookHandler, ctx: routing.Context): Response {
+        let body = Http.bodyJson(ctx);
+        let kind = if (body.kind == 5) (json.asString(json.get(body, "type")) ?? "") else ("");
+        if (string.eql(kind, "checkout.session.completed")) {
+            let data = json.get(body, "data");
+            let obj = if (data.kind == 5) (json.get(data, "object")) else (json.null());
+            if (obj.kind == 5) {
+                let tenant = json.asString(json.get(obj, "client_reference_id")) ?? "";
+                let cust = json.asString(json.get(obj, "customer")) ?? "";
+                let sub = json.asString(json.get(obj, "subscription")) ?? "";
+                if (tenant.length > 0) {
+                    let subRows = await self.repo.getSubscription(tenant);
+                    let slug = subRows.items.getOr(0, defaultSub()).plan_slug;
+                    if (slug.length == 0) { slug = "pro"; }
+                    await self.repo.setPlan(tenant, slug, "active", cust, sub, 0 as long, Http.nowMs());
+                }
+            }
+        }
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("received", json.bool(true));
+        return Http.okObj(m);
+    }
+}

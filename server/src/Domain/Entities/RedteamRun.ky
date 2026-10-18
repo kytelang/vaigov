@@ -1,0 +1,14 @@
+// Persistence entity: one row of the `redteam_runs` table — a recorded adversarial
+// probe run against the active policy. Named RedteamRun (not Run/Firewall*) to keep
+// the global type name unique. Persistence-agnostic; the DTO is derived from it.
+@serializable
+pub struct RedteamRun {
+    pub id: string,
+    pub target: string,
+    pub status: string,
+    pub total: int,
+    pub passed: int,
+    pub failed: int,
+    pub created_ms: long,
+    pub tenant: string,
+}

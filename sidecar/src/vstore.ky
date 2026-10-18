@@ -1,0 +1,308 @@
+//! The sidecar's structured, signed violation store (design-refinements R1).
+//!
+//! This supersedes the opaque forwarding queue. It is an append-only log of
+//! fully-serialised signed records, plus an in-memory index for the console to
+//! query, plus a flush cursor so records can be shipped to the control plane
+//! without being deleted (local history survives the flush, which the opaque
+//! queue did not keep).
+//!
+//! Durability contract, unchanged in spirit from the old queue: a record is
+//! framed and appended to disk BEFORE the ingest endpoint acks. Framing is
+//! length-prefixed (`<ascii-len>\n<body>`) so a body may contain any bytes; a
+//! torn trailing frame from a crash is discarded on reload and every earlier
+//! record survives.
+//!
+//! The flush cursor (how many leading records the control plane has confirmed)
+//! is persisted as a separate tiny file, so a restart resumes shipping from the
+//! right place without re-sending confirmed records or losing unconfirmed ones.
+//!
+//! The signed flat-file log is the source of truth. On top of it an embedded
+//! SQLite read model (the pure-Kyte `sqlite` FFI driver, no server process) is
+//! mirrored for the console's indexed queries; it is opened with `openReadModel`
+//! and is entirely optional: if it cannot be opened, `dbReady` stays false and
+//! every query falls back to the in-memory scan, and the durability contract
+//! never depends on it. SQLite is embedded in-process (a single `.idx.db` file),
+//! so there is still no separate database server at the edge.
+
+import violation;
+import io.file;
+import string;
+import list;
+import sqlite;
+
+/// A durable, signed violation store backed by the file at `logPath`, with its
+/// flush cursor at `cursorPath`.
+pub class VioStore {
+    pub logPath: string,
+    pub cursorPath: string,
+    pub items: list.List<violation.Violation>,
+    pub flushedCount: int,
+    pub lastSigHex: string,
+    // A derived SQLite read model for the console's indexed queries. The flat-file
+    // log above stays the signed, tamper-evident source of truth; this is only a
+    // searchable mirror. `dbReady` is false until `openReadModel` succeeds, and
+    // every query falls back to the in-memory scan when it is false.
+    pub db: sqlite.Db,
+    pub dbReady: bool,
+
+    init(logPath: string, cursorPath: string) {
+        self.logPath = logPath;
+        self.cursorPath = cursorPath;
+        self.items = list.List<violation.Violation>();
+        self.flushedCount = 0;
+        self.lastSigHex = "";
+        self.db = sqlite.Db(0 as ptr, false);
+        self.dbReady = false;
+    }
+
+    /// Opens the SQLite read model at `dbPath` and mirrors the current records
+    /// into it. Additive and fail-safe: if the database cannot be opened or the
+    /// schema cannot be created, `dbReady` stays false and every query uses the
+    /// in-memory index instead, so the sidecar still works with no SQLite at all.
+    pub fn openReadModel(self: VioStore, dbPath: string): void {
+        let d = sqlite.open(dbPath);
+        if (!d.ok) { return; }
+        let made = d.exec("CREATE TABLE IF NOT EXISTS vio(id INTEGER PRIMARY KEY, captured_ms INTEGER, verdict TEXT, endpoint_host TEXT, system_id TEXT, ticket_number TEXT, body TEXT)");
+        if (!made) { d.close(); return; }
+        let _ = d.exec("CREATE INDEX IF NOT EXISTS vio_captured ON vio(captured_ms)");
+        let _ = d.exec("CREATE INDEX IF NOT EXISTS vio_verdict ON vio(verdict)");
+        self.db = d;
+        self.dbReady = true;
+        self.reindexAll();
+    }
+
+    /// Mirrors one record into the read model (no-op when the DB is not ready).
+    /// The full signed JSON is stored in `body` so a query can reconstruct the
+    /// exact record; the other columns are just indexed filter keys.
+    fn mirror(self: VioStore, v: violation.Violation): void {
+        if (!self.dbReady) { return; }
+        let st = self.db.prepare("INSERT OR REPLACE INTO vio(id, captured_ms, verdict, endpoint_host, system_id, ticket_number, body) VALUES(?, ?, ?, ?, ?, ?, ?)");
+        st.bindLong(1, v.id);
+        st.bindLong(2, v.capturedMs);
+        st.bindText(3, v.verdict);
+        st.bindText(4, v.endpointHost);
+        st.bindText(5, v.systemId);
+        st.bindText(6, v.ticketNumber);
+        st.bindText(7, violation.toJson(v));
+        let _ = st.step();
+        st.finalize();
+    }
+
+    /// Rebuilds the whole read model from the in-memory records (no-op when the
+    /// DB is not ready). Called after a load or an open so the two agree.
+    fn reindexAll(self: VioStore): void {
+        if (!self.dbReady) { return; }
+        let _ = self.db.exec("DELETE FROM vio");
+        let i = 0;
+        while (i < self.items.size()) {
+            self.mirror(self.items.get(i) ?? violation.Violation());
+            i = i + 1;
+        }
+    }
+
+    /// The next monotonic id: one past the highest stored id.
+    fn nextId(self: VioStore): long {
+        return (self.items.size() as long) + 1;
+    }
+
+    /// Signs and durably appends a violation. Assigns its id and chain link,
+    /// writes it to the log (durable before return), and indexes it in memory.
+    /// Returns the stored record (now carrying id/sig).
+    pub fn append(self: VioStore, v: violation.Violation, privHex: string): violation.Violation {
+        v.id = self.nextId();
+        violation.signInto(v, privHex, self.lastSigHex);
+        self.lastSigHex = v.sigHex;
+        let body = violation.toJson(v);
+        File.appendText(self.logPath, `${body.length}\n` + body);
+        self.items.push(v);
+        self.mirror(v);
+        return v;
+    }
+
+    /// Rebuilds the in-memory index from the log at boot, restoring the chain
+    /// head and the flush cursor. A torn trailing frame is ignored.
+    pub fn loadFromDisk(self: VioStore): void {
+        self.items = list.List<violation.Violation>();
+        self.lastSigHex = "";
+        if (File.exists(self.logPath)) {
+            let data = File.readText(self.logPath);
+            let n = data.length;
+            let pos = 0;
+            while (pos < n) {
+                let nl = pos;
+                while (nl < n && data[nl] != 10) { nl = nl + 1; }
+                if (nl >= n) { break; }
+                let len = string.parseInt(string.slice(data, pos, nl)) ?? -1;
+                if (len < 0) { break; }
+                let bodyStart = nl + 1;
+                let bodyEnd = bodyStart + len;
+                if (bodyEnd > n) { break; }
+                let rec = violation.fromJson(string.slice(data, bodyStart, bodyEnd));
+                self.items.push(rec);
+                self.lastSigHex = rec.sigHex;
+                pos = bodyEnd;
+            }
+        }
+        self.flushedCount = self.readCursor();
+        if (self.flushedCount > self.items.size()) { self.flushedCount = self.items.size(); }
+        self.reindexAll();
+    }
+
+    fn readCursor(self: VioStore): int {
+        if (!File.exists(self.cursorPath)) { return 0; }
+        let t = string.trim(File.readText(self.cursorPath));
+        return string.parseInt(t) ?? 0;
+    }
+
+    fn writeCursor(self: VioStore): void {
+        File.writeText(self.cursorPath, `${self.flushedCount}`);
+    }
+
+    /// The count of records not yet confirmed by the control plane.
+    pub fn pendingCount(self: VioStore): int {
+        return self.items.size() - self.flushedCount;
+    }
+
+    /// The total number of stored records (the local history depth).
+    pub fn total(self: VioStore): int {
+        return self.items.size();
+    }
+
+    /// Up to `limit` records from the front of the unflushed region, as their
+    /// stored JSON strings, for shipping to the control plane.
+    pub fn unflushedBatchJson(self: VioStore, limit: int): list.List<string> {
+        let out = list.List<string>();
+        let i = self.flushedCount;
+        let taken = 0;
+        while (i < self.items.size() && taken < limit) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            out.push(violation.toJson(rec));
+            i = i + 1;
+            taken = taken + 1;
+        }
+        return out;
+    }
+
+    /// Advances the flush cursor by `n` confirmed records and marks them
+    /// confirmed in memory. Persists the cursor.
+    pub fn markFlushed(self: VioStore, n: int): void {
+        let end = self.flushedCount + n;
+        if (end > self.items.size()) { end = self.items.size(); }
+        let i = self.flushedCount;
+        while (i < end) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            rec.flushState = "confirmed";
+            i = i + 1;
+        }
+        self.flushedCount = end;
+        self.writeCursor();
+    }
+
+    /// Rewrites the whole log from the in-memory records. Used after mutating
+    /// mutable fields (ticket number/status) that lie OUTSIDE the signed core, so
+    /// the signatures and chain are unaffected. Framing is re-applied per record.
+    pub fn rewriteAll(self: VioStore): void {
+        let sb = "";
+        let i = 0;
+        while (i < self.items.size()) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            let body = violation.toJson(rec);
+            sb = sb + `${body.length}\n` + body;
+            i = i + 1;
+        }
+        File.writeText(self.logPath, sb);
+        self.reindexAll();
+    }
+
+    /// The most recent `limit` records (newest first), optionally filtered by
+    /// verdict and/or host substring. Used by the console Violations screen.
+    pub fn recent(self: VioStore, limit: int, verdict: string, host: string): list.List<violation.Violation> {
+        if (self.dbReady) { return self.recentSql(limit, verdict, host); }
+        let out = list.List<violation.Violation>();
+        let i = self.items.size() - 1;
+        while (i >= 0 && out.size() < limit) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            let vOk = string.eql(verdict, "") || string.eql(rec.verdict, verdict);
+            let hOk = string.eql(host, "") || string.contains(rec.endpointHost, host);
+            if (vOk && hOk) { out.push(rec); }
+            i = i - 1;
+        }
+        return out;
+    }
+
+    /// The SQLite-backed path for `recent`: an indexed query newest-first with
+    /// optional verdict equality and host-substring filters, reconstructing each
+    /// matched record from its stored signed JSON. Used when `dbReady`.
+    fn recentSql(self: VioStore, limit: int, verdict: string, host: string): list.List<violation.Violation> {
+        let out = list.List<violation.Violation>();
+        let sql = "SELECT body FROM vio WHERE 1=1";
+        if (!string.eql(verdict, "")) { sql = sql + " AND verdict = ?"; }
+        if (!string.eql(host, "")) { sql = sql + " AND endpoint_host LIKE ?"; }
+        sql = sql + " ORDER BY id DESC LIMIT ?";
+        let q = self.db.prepare(sql);
+        let bi = 1;
+        if (!string.eql(verdict, "")) { q.bindText(bi, verdict); bi = bi + 1; }
+        if (!string.eql(host, "")) { q.bindText(bi, "%" + host + "%"); bi = bi + 1; }
+        q.bindLong(bi, limit as long);
+        while (q.step()) {
+            out.push(violation.fromJson(q.columnText(0)));
+        }
+        q.finalize();
+        return out;
+    }
+
+    /// Verifies a record's signature and its chain link under `pubHex`. The
+    /// expected predecessor signature is the sig of the record with id-1 (or ""
+    /// for the first record). Returns true only if both the signature and the
+    /// chain link hold, so a tampered, reordered, or deleted record is detected.
+    pub fn verifyRecord(self: VioStore, v: violation.Violation, pubHex: string): bool {
+        let prev = "";
+        if (v.id > 1) {
+            let idx = (v.id as int) - 2; // id is 1-based and equals index+1
+            if (idx >= 0 && idx < self.items.size()) {
+                prev = (self.items.get(idx) ?? violation.Violation()).sigHex;
+            }
+        }
+        return violation.verify(v, pubHex, prev);
+    }
+
+    /// Walks the whole log verifying every record's signature and chain link
+    /// under `pubHex`. Returns the id of the FIRST record that fails (signature
+    /// forged, reordered, deleted, or chain broken by a second concurrent
+    /// writer), or 0 if the entire chain is intact. Called at startup so a
+    /// corrupted evidence log is surfaced loudly instead of silently extended.
+    pub fn firstBrokenId(self: VioStore, pubHex: string): long {
+        let i = 0;
+        while (i < self.items.size()) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            if (!self.verifyRecord(rec, pubHex)) { return rec.id; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    /// Finds a stored record by id, or undefined.
+    pub fn byId(self: VioStore, id: long): violation.Violation | undefined {
+        let i = 0;
+        while (i < self.items.size()) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            if (rec.id == id) { return rec; }
+            i = i + 1;
+        }
+        return undefined;
+    }
+
+    /// Records that have no ticket yet and whose verdict is in `raiseVerdicts`
+    /// (a comma-joined set like "deny,step_up"). Used by the ticketing loop.
+    pub fn awaitingTicket(self: VioStore, raiseVerdicts: string): list.List<violation.Violation> {
+        let out = list.List<violation.Violation>();
+        let i = 0;
+        while (i < self.items.size()) {
+            let rec = self.items.get(i) ?? violation.Violation();
+            let wants = string.contains(raiseVerdicts, rec.verdict) && !string.eql(rec.verdict, "");
+            if (wants && string.eql(rec.ticketNumber, "")) { out.push(rec); }
+            i = i + 1;
+        }
+        return out;
+    }
+}

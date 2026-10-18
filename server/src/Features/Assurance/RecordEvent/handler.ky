@@ -1,0 +1,30 @@
+// POST /event/{kind} -> {"ok":true,"kind":kind} - a PEP-reported violation event.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.AssuranceRepository;
+import Features.Assurance.Shared.asr;
+
+pub struct RecordEventHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: RecordEventHandler, ctx: routing.Context): response.Response {
+        let kind = ctx.param("kind");
+        let body = Http.bodyJson(ctx);
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let id = string.concat("ve-", random.randomHex(6));
+        await self.repo.addViolation(id, kind, asr.asrBodyStr(body, "proxy"), asr.asrBodyStr(body, "agent"),
+            asr.asrBodyStr(body, "tool"), asr.asrBodyStr(body, "verdict"), asr.asrBodyStr(body, "rule_id"),
+            asr.asrBodyStr(body, "impact"), asr.asrBodyStr(body, "outcome"), Http.nowMs(), tenant);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("kind", json.str(kind));
+        return Http.okObj(m);
+    }
+}

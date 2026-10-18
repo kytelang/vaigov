@@ -1,0 +1,78 @@
+// BillingRepository: the SaaS subscription + usage-metering tables in the shared
+// `acp` Postgres db. A tenant has exactly one subscription row (plan + Stripe
+// ids + period); usage_counters holds one row per (tenant, period) with the
+// governed-decision count fed from the decision-log ingest path.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.BillingRows;
+
+pub struct BillingRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn getSubscription(self: BillingRepository, tenant: string): Rows<SubscriptionRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<SubscriptionRow>(conn, "subscriptions").query(
+            "SELECT tenant_id, plan_slug, status, stripe_customer_id, stripe_subscription_id, current_period_end_ms, created_ms, updated_ms FROM subscriptions WHERE tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Create the default free subscription for a tenant if none exists.
+    pub async fn ensure(self: BillingRepository, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO subscriptions (tenant_id, plan_slug, status, created_ms, updated_ms) VALUES ($1, 'free', 'active', $2, $3) ON CONFLICT (tenant_id) DO NOTHING", p);
+        self.db.pool.release(conn);
+    }
+
+    // Upsert the tenant's plan + Stripe linkage + period end (called on checkout /
+    // plan change and from Stripe webhooks).
+    pub async fn setPlan(self: BillingRepository, tenant: string, planSlug: string, status: string, custId: string, subId: string, periodEndMs: long, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(planSlug)); p.push(db.dbText(status));
+        p.push(db.dbText(custId)); p.push(db.dbText(subId)); p.push(db.dbLong(periodEndMs)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec(
+            "INSERT INTO subscriptions (tenant_id, plan_slug, status, stripe_customer_id, stripe_subscription_id, current_period_end_ms, created_ms, updated_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$7) ON CONFLICT (tenant_id) DO UPDATE SET plan_slug=$2, status=$3, stripe_customer_id=$4, stripe_subscription_id=$5, current_period_end_ms=$6, updated_ms=$7", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn getUsage(self: BillingRepository, tenant: string, period: string): Rows<UsageRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(period));
+        let r = await Repository<UsageRow>(conn, "usage_counters").query(
+            "SELECT period, decisions_count, updated_ms FROM usage_counters WHERE tenant_id = $1 AND period = $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn recentUsage(self: BillingRepository, tenant: string, limit: long): Rows<UsageRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbLong(limit));
+        let r = await Repository<UsageRow>(conn, "usage_counters").query(
+            "SELECT period, decisions_count, updated_ms FROM usage_counters WHERE tenant_id = $1 ORDER BY period DESC LIMIT $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Increment this period's governed-decision count. Fed from the decision-log
+    // ingest path (one call per ingested batch).
+    pub async fn addUsage(self: BillingRepository, tenant: string, period: string, n: long, nowMs: long): void {
+        if (n <= 0) { return; }
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(period)); p.push(db.dbLong(n)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec(
+            "INSERT INTO usage_counters (tenant_id, period, decisions_count, updated_ms) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id, period) DO UPDATE SET decisions_count = usage_counters.decisions_count + $3, updated_ms = $4", p);
+        self.db.pool.release(conn);
+    }
+}

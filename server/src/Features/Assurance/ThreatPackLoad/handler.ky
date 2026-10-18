@@ -1,0 +1,52 @@
+// POST /firewall/threat-pack (EditFirewall) -> verify the signed pack, persist its
+// signatures to firewall_config, and return {"ok":true,"version","count"} or an error.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Assurance.Shared.AssuranceRepository;
+
+pub struct ThreatPackLoadHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: ThreatPackLoadHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditFirewall)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+
+        if (!json.has(body, "pack") || !json.has(body, "signature")) {
+            return Http.badRequest("pack and signature are required");
+        }
+        let pack = json.get(body, "pack");
+        let sig = json.asString(json.get(body, "signature")) ?? "";
+        let pubk = json.asString(json.get(body, "pubkey")) ?? self.app.trust.keypair.pubHex;
+        let canon = json.stringify(pack);
+        if (!sign.verifyHex(pubk, canon as ptr, canon.length, sig)) {
+            return Http.badRequest("signature verification failed");
+        }
+
+        let version = json.asNumber(json.get(pack, "version")) ?? 1;
+        let sigArr = list.List<json.JsonValue>();
+        if (json.has(pack, "signatures")) {
+            let a = json.get(pack, "signatures");
+            let n = json.size(a);
+            let i = 0;
+            while (i < n) { sigArr.push(json.str(json.asString(json.at(a, i)) ?? "")); i = i + 1; }
+        }
+        let sigsJson = json.stringify(json.array(sigArr));
+        await self.repo.setThreatSignatures(tenant, version, sigsJson, Http.nowMs());
+
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("version", json.number(version));
+        m.set("count", json.number(sigArr.size() as long));
+        return Http.okObj(m);
+    }
+}

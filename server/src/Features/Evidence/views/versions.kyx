@@ -1,0 +1,80 @@
+// Policy versions view as KYX (matches acp/console PolicyVersionsView.vue +
+// ArtifactHistory): the compiled policy is a versioned policy_bundle artifact;
+// this shows its history with active / baseline markers. Rollback + download are
+// a follow-up; this renders the live version history.
+import list;
+import string;
+import Domain.Dtos.IngestedRow;
+
+pub class VersionGroup {
+    pub artifactId: string,
+    pub name: string,
+    pub activeVersion: string,
+    pub baselineVersion: string,
+    pub versions: list.List<ArtifactVersionRow>,
+    init(artifactId: string, name: string, activeVersion: string, baselineVersion: string, versions: list.List<ArtifactVersionRow>) {
+        self.artifactId = artifactId; self.name = name; self.activeVersion = activeVersion; self.baselineVersion = baselineVersion; self.versions = versions;
+    }
+}
+
+fn pvJsq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "'", "\\'"); }
+
+fn verStatusBadge(v: ArtifactVersionRow, active: string, baseline: string): Html {
+    if (string.eql(v.version_id, active)) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">active</span>;
+    } else if (string.eql(v.version_id, baseline)) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">baseline</span>;
+    } else {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">{v.status}</span>;
+    }
+}
+
+fn versionRow(artifactId: string, v: ArtifactVersionRow, active: string, baseline: string): Html {
+    let rollback = "$pvArtifact='" + pvJsq(artifactId) + "'; $pvVersion='" + pvJsq(v.version_id) + "'; @post('/console/policy-versions/activate')";
+    let setBase = "$pvArtifact='" + pvJsq(artifactId) + "'; $pvVersion='" + pvJsq(v.version_id) + "'; @post('/console/policy-versions/baseline')";
+    let isActive = string.eql(v.version_id, active);
+    let isBaseline = string.eql(v.version_id, baseline);
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{`v${v.version_no}`}</td>
+        <td class="py-2 pr-4">{verStatusBadge(v, active, baseline)}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{if (v.author.length > 0) { v.author; } else { <span class="text-dim">-</span>; }}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{if (v.note.length > 0) { v.note; } else { <span>-</span>; }}</td>
+        <td class="py-2 pr-4 text-right whitespace-nowrap">
+            {if (!isActive) { <button class="text-xs text-accent hover:underline mr-3" data-on:click={rollback}>Roll back</button>; }}
+            {if (!isBaseline) { <button class="text-xs text-dim hover:text-txt" data-on:click={setBase}>Set baseline</button>; }}
+        </td>
+    </tr>;
+}
+
+fn versionGroupCard(g: VersionGroup): Html {
+    return <div class="bg-panel border border-line rounded-xl">
+        <div class="px-5 py-3 border-b border-line">
+            <h2 class="font-semibold text-txt">{g.name}</h2>
+            <p class="text-xs text-dim">Every compile saves a signed version. Roll back to any version, or mark one as the audit baseline.</p>
+        </div>
+        <div class="px-5 py-4 overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                    <th class="py-2 pr-4">Version</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Author</th><th class="py-2 pr-4">Note</th><th class="py-2 pr-4"></th>
+                </tr></thead>
+                <tbody>
+                    {for (i in 0..g.versions.size()) { versionRow(g.artifactId, g.versions.at(i), g.activeVersion, g.baselineVersion); }}
+                    {if (g.versions.size() == 0) {
+                        <tr><td colspan="5" class="py-8 text-center text-dim">No versions yet. Compile the policy to save the first signed version.</td></tr>;
+                    }}
+                </tbody>
+            </table>
+        </div>
+    </div>;
+}
+
+pub fn versionsPanel(groups: list.List<VersionGroup>): Html {
+    return <div id="versions" data-signals="{pvArtifact: '', pvVersion: ''}" class="grid gap-4">
+        {for (i in 0..groups.size()) { versionGroupCard(groups.at(i)); }}
+        {if (groups.size() == 0) {
+            <div class="bg-panel border border-line rounded-xl px-5 py-10 text-center text-dim">
+                No compiled policy bundle yet. Author rules on the Policy screen and compile to produce the first versioned bundle.
+            </div>;
+        }}
+    </div>;
+}

@@ -1,0 +1,35 @@
+// JSON builders for the models feature: the model object exactly as acp-server
+// serialises its Model struct (plus the `atlas`/`atlas_detail` enrichment the
+// list endpoint adds). NOTE: the scan-findings -> MITRE ATLAS mapping is an
+// acp-core table not yet ported, so atlas/atlas_detail are emitted empty (the
+// keys are present so the shape matches; populated only for "findings:" scans).
+import string;
+import list;
+import map;
+import serde.json;
+import Domain.Dtos.ModelRow;
+
+// A JSON number that may be fractional (json.number builds integers only).
+pub fn jnum(d: double): json.JsonValue {
+    let v = json.tryParse(`${d}`);
+    if (v == undefined) { return json.number(0); }
+    return v ?? json.number(0);
+}
+
+pub fn modelRowJson(m: ModelRow, withAtlas: bool): json.JsonValue {
+    let o = Map<string, json.JsonValue>(16, string.hash);
+    o.set("id", json.str(m.id));
+    o.set("name", json.str(m.name));
+    o.set("provider", json.str(m.provider));
+    o.set("version", json.str(m.version));
+    o.set("card_json", json.str(m.card_json));
+    o.set("scan_status", json.str(m.scan_status));
+    o.set("aibom_json", json.str(m.aibom_json));
+    o.set("tenant", json.str(m.tenant));
+    o.set("created_ms", json.number(m.created_ms));
+    if (withAtlas) {
+        o.set("atlas", json.array(List<json.JsonValue>()));
+        o.set("atlas_detail", json.array(List<json.JsonValue>()));
+    }
+    return json.object(o);
+}

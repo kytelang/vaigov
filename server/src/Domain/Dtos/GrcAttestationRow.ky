@@ -1,0 +1,9 @@
+// A GRC attestation row projection (used by model fairness history).
+@serializable pub struct GrcAttestationRow {
+    pub id: string,
+    pub subject: string,
+    pub title: string,
+    pub status: string,
+    pub body: string,
+    pub created_ms: long,
+}

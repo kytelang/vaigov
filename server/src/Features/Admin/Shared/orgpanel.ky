@@ -1,0 +1,145 @@
+// Shared builder for the Organisation console panel: reads tenant settings + the
+// embedded acts catalogue, groups acts by jurisdiction with the enabled ones
+// marked, and renders the fragment. Used by both the view handler (GET) and the
+// console mutation handlers (toggle-act / save-profile) so they render identically.
+import list;
+import map;
+import string;
+import serde.json;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.views.organisation;
+import Domain.Dtos.AdminRows;
+import controls;
+
+fn jurisdictionOf(slug: string): string {
+    if (string.startsWith(slug, "eu-") || string.eql(slug, "gdpr")) { return "European Union"; }
+    if (string.startsWith(slug, "uk-")) { return "United Kingdom"; }
+    if (string.eql(slug, "colorado-ai-act") || string.eql(slug, "nyc-ll144") || string.eql(slug, "soc-2")) { return "United States"; }
+    if (string.eql(slug, "dpdp-2023")) { return "India"; }
+    if (string.eql(slug, "canada-aida")) { return "Canada"; }
+    if (string.startsWith(slug, "iso-") || string.eql(slug, "nist-ai-rmf")) { return "International standards"; }
+    return "Other";
+}
+
+pub async fn orgPanel(repo: AdminRepository, tenant: string, showAll: bool): Html {
+    let orgName = "";
+    let jurisdiction = "";
+    let onboarded = false;
+    let addressLine1 = "";
+    let addressLine2 = "";
+    let city = "";
+    let postcode = "";
+    let country = "";
+    let contactName = "";
+    let contactEmail = "";
+    let contactPhone = "";
+    let enabled = Map<string, bool>(32, string.hash);
+    let sr = await repo.tenantSettings(tenant);
+    if (sr.items.size() > 0) {
+        let s = sr.items.getOr(0, TenantSettingsRow{ onboarded: 0, jurisdiction: "", enabled_acts: "[]", org_name: "", address_line1: "", address_line2: "", city: "", postcode: "", country: "", contact_name: "", contact_email: "", contact_phone: "", profile_json: "{}" });
+        orgName = s.org_name;
+        jurisdiction = s.jurisdiction;
+        onboarded = s.onboarded != 0;
+        addressLine1 = s.address_line1;
+        addressLine2 = s.address_line2;
+        city = s.city;
+        postcode = s.postcode;
+        country = s.country;
+        contactName = s.contact_name;
+        contactEmail = s.contact_email;
+        contactPhone = s.contact_phone;
+        let ev = json.tryParse(s.enabled_acts);
+        if (ev != undefined) {
+            let ea = json.asArray(ev ?? json.null());
+            if (ea != undefined) {
+                let a = ea ?? list.List<json.JsonValue>();
+                let i = 0;
+                while (i < a.size()) { let sl = json.asString(a.get(i) ?? json.null()) ?? ""; if (sl.length > 0) { enabled.set(sl, true); } i = i + 1; }
+            }
+        }
+    }
+
+    let order = list.List<string>();
+    order.push("European Union"); order.push("United Kingdom"); order.push("United States");
+    order.push("India"); order.push("Canada"); order.push("International standards"); order.push("Other");
+    let buckets = Map<string, list.List<organisation.OrgActItem>>(8, string.hash);
+    let oi = 0;
+    while (oi < order.size()) { buckets.set(order.at(oi), list.List<organisation.OrgActItem>()); oi = oi + 1; }
+
+    // Which acts to show. Like the create-organisation screen, the default view
+    // shows only the acts applicable to the tenant's country (statutory acts for
+    // the jurisdiction + the relevant international standards), plus any act the
+    // tenant has already enabled (so it can be unticked). "Show all" reveals the
+    // full catalogue. An unset country falls back to show-all so the panel is
+    // never blank.
+    let showAllEff = showAll || string.eql(country, "");
+    let applicable = Map<string, bool>(32, string.hash);
+    if (!showAllEff) {
+        let ar = await repo.actsForCountry(country);
+        let ai = 0;
+        while (ai < ar.items.size()) {
+            let pr = ar.items.getOr(ai, ActApplRow{ act_slug: "", applicability: "" });
+            if (pr.act_slug.length > 0) { applicable.set(pr.act_slug, true); }
+            ai = ai + 1;
+        }
+        // keep already-enabled acts visible even if not country-applicable
+        let ek = enabled.keys();
+        let ei = 0;
+        while (ei < ek.size()) { applicable.set(ek.at(ei), true); ei = ei + 1; }
+    }
+
+    let selectedCount = 0;
+    let fws = controls.frameworks();
+    let i = 0;
+    while (i < fws.size()) {
+        let fw = fws.getOr(i, controls.Framework{ slug: "", label: "", version: "", frameworkType: "", effectiveDate: "", recordKeepingReference: "", source: "" });
+        let isEnabled = enabled.get(fw.slug) ?? false;
+        if (isEnabled) { selectedCount = selectedCount + 1; }
+        if (!showAllEff && !(applicable.get(fw.slug) ?? false)) { i = i + 1; continue; }
+        let j = jurisdictionOf(fw.slug);
+        let nctrls = controls.forFramework(fw.slug).size() as int;
+        let b = buckets.get(j) ?? list.List<organisation.OrgActItem>();
+        b.push(organisation.OrgActItem(fw.slug, fw.label, nctrls, isEnabled));
+        i = i + 1;
+    }
+
+    let groups = list.List<organisation.OrgGroup>();
+    let gi = 0;
+    while (gi < order.size()) {
+        let name = order.at(gi);
+        let acts = buckets.get(name) ?? list.List<organisation.OrgActItem>();
+        if (acts.size() > 0) { groups.push(organisation.OrgGroup(name, acts)); }
+        gi = gi + 1;
+    }
+    let profile = organisation.OrgProfile(orgName, jurisdiction, addressLine1, addressLine2, city, postcode, country, contactName, contactEmail, contactPhone);
+    return organisation.organisationPanel(profile, onboarded, selectedCount, groups, country, showAllEff);
+}
+
+// Flip one act slug in the tenant's enabled_acts, preserving name/jurisdiction.
+pub async fn toggleAct(repo: AdminRepository, tenant: string, slug: string, nowMs: long): void {
+    let orgName = "";
+    let jurisdiction = "";
+    let acts = list.List<json.JsonValue>();
+    let present = false;
+    let sr = await repo.tenantSettings(tenant);
+    if (sr.items.size() > 0) {
+        let s = sr.items.getOr(0, TenantSettingsRow{ onboarded: 0, jurisdiction: "", enabled_acts: "[]", org_name: "", address_line1: "", address_line2: "", city: "", postcode: "", country: "", contact_name: "", contact_email: "", contact_phone: "", profile_json: "{}" });
+        orgName = s.org_name;
+        jurisdiction = s.jurisdiction;
+        let ev = json.tryParse(s.enabled_acts);
+        if (ev != undefined) {
+            let ea = json.asArray(ev ?? json.null());
+            if (ea != undefined) {
+                let a = ea ?? list.List<json.JsonValue>();
+                let i = 0;
+                while (i < a.size()) {
+                    let sl = json.asString(a.get(i) ?? json.null()) ?? "";
+                    if (string.eql(sl, slug)) { present = true; } else if (sl.length > 0) { acts.push(json.str(sl)); }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    if (!present) { acts.push(json.str(slug)); }
+    await repo.setTenantSettings(tenant, orgName, jurisdiction, json.stringify(json.array(acts)), nowMs);
+}

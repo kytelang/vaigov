@@ -1,0 +1,57 @@
+// GET /auth/entra/groups -> the signed-in user's Microsoft Entra group
+// memberships, fetched live from Microsoft Graph via the entra-client package
+// (app-only client-credentials token). Used for role mapping. Requires the app
+// registration's credentials in the environment:
+//   ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET
+// When unset, returns {configured:false} so the console can fall back to the
+// token's own group claims.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import env;
+import serde.json;
+import entra;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct EntraGroupsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraGroupsHandler, ctx: routing.Context): response.Response {
+        let p = Http.principalOf(self.app, ctx);
+        if (p == undefined) {
+            let e = Map<string, json.JsonValue>(1, string.hash);
+            e.set("authenticated", json.bool(false));
+            return Http.okObj(e);
+        }
+        let pr = p ?? Auth.AuthPrincipal("", "", "", list.List<string>());
+        let tid = env.get("ENTRA_TENANT_ID");
+        let cid = env.get("ENTRA_CLIENT_ID");
+        let secret = env.get("ENTRA_CLIENT_SECRET");
+        if (tid.length == 0 || cid.length == 0 || secret.length == 0) {
+            let e = Map<string, json.JsonValue>(1, string.hash);
+            e.set("configured", json.bool(false));
+            return Http.okObj(e);
+        }
+        let e = entra.Entra(tid, cid, secret);
+        let tok = e.token();
+        if (!tok.ok) {
+            let m = Map<string, json.JsonValue>(2, string.hash);
+            m.set("configured", json.bool(true));
+            m.set("error", json.str("entra token exchange failed"));
+            return Http.okObj(m);
+        }
+        let gr = e.userGroups(tok.accessToken, pr.oid);
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("configured", json.bool(true));
+        m.set("ok", json.bool(gr.ok));
+        // The Graph memberOf payload (value[] of group objects), passed through.
+        let gv = json.tryParse(gr.body);
+        if (gv != undefined) { m.set("graph", gv ?? json.null()); }
+        return Http.okObj(m);
+    }
+}

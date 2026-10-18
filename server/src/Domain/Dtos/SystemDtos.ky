@@ -1,0 +1,69 @@
+// Row DTOs for the Systems feature, bound from the shared `acp` db. Field names
+// match acp-server's serialized JSON (tenant_id projected AS tenant).
+@serializable pub struct SystemRow {
+    pub id: string,
+    pub name: string,
+    pub purpose: string,
+    pub owner: string,
+    pub lifecycle_state: string,
+    pub risk_tier: string,
+    pub sector: string,
+    pub asset_type: string,
+    pub jurisdictions: string,
+    pub tenant: string,
+    pub created_ms: long,
+    pub updated_ms: long,
+}
+
+@serializable pub struct SystemRoleRow {
+    pub id: string,
+    pub system_id: string,
+    pub role: string,
+    pub jurisdiction: string,
+    pub market_date: string,
+    pub created_ms: long,
+}
+
+@serializable pub struct SoaStoredRow {
+    pub framework: string,
+    pub control_id: string,
+    pub applicable: int,
+    pub justification: string,
+    pub status: string,
+    pub updated_ms: long,
+}
+
+@serializable pub struct SystemEvidenceRow {
+    pub id: string,
+    pub framework: string,
+    pub control_id: string,
+    pub title: string,
+    pub source: string,
+    pub owner: string,
+    pub produced_ms: long,
+    pub valid_until_ms: long,
+}
+
+@serializable pub struct SystemAuditRow {
+    pub id: string,
+    pub action: string,
+    pub actor: string,
+    pub detail: string,
+    pub ts_ms: long,
+}
+
+@serializable pub struct SystemGrcRow {
+    pub id: string,
+    pub kind: string,
+    pub title: string,
+    pub status: string,
+    pub subject: string,
+}
+
+@serializable pub struct SystemPackRow {
+    pub doc_json: string,
+}
+
+@serializable pub struct SystemProbe {
+    pub one: int,
+}

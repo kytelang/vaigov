@@ -1,0 +1,48 @@
+// POST /rules/{id} -> {"ok":true,"rule_id":id} (EditPolicy). Mirrors acp rule_update.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import rego;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.Shared.rulebody;
+import Features.Rules.CreateRule.handler;
+
+pub struct UpdateRuleHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: UpdateRuleHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let verdict = rulebody.ruleNormVerdict(rulebody.ruleBodyStr(body, "verdict"));
+        let enabled = rulebody.ruleBodyBool(body, "enabled", true);
+        let priority = rulebody.ruleBodyInt(body, "priority", 100);
+        if (body.kind == 5 && json.has(body, "match")) {
+            let err = rego.validateMatch(json.get(body, "match"));
+            if (err != undefined) { return ruleOkFalse(err ?? "invalid match"); }
+        }
+        await self.repo.update(id, tenant, rulebody.ruleBodyStr(body, "name"), rulebody.ruleBodyStr(body, "description"),
+            rulebody.ruleBodyJsonStr(body, "subject", "{}"), rulebody.ruleBodyStr(body, "resource"),
+            rulebody.ruleBodyStr(body, "operation"), rulebody.ruleBodyJsonStr(body, "condition", "[]"),
+            rulebody.ruleBodyJsonStr(body, "match", "{}"), rulebody.ruleBodyStr(body, "approver_group"),
+            verdict, rulebody.ruleBodyJsonStr(body, "obligations", "[]"), enabled, priority, Http.nowMs());
+        if (body.kind == 5 && json.has(body, "controls")) {
+            let ids = rulebody.ruleBodyStrArray(body, "controls");
+            let _c = await self.repo.setControls(id, ids);
+        }
+        // NOTE: acp also calls store.mark_rule_customised_if_pack(id) so a pack
+        // upgrade preserves tenant edits; pack-provenance tracking is a later slice.
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("rule_id", json.str(id));
+        return Http.okObj(m);
+    }
+}

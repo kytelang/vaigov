@@ -1,0 +1,18 @@
+// Principals + directory-groups routes (acp-compatible JSON over the shared `acp` db).
+import web.app;
+import Shared.AppContext;
+import Features.Principals.Shared.PrincipalRepository;
+import Features.Principals.ListPrincipals.handler;
+import Features.Principals.RegisterPrincipal.handler;
+import Features.Principals.Groups.handler;
+import Features.Principals.RegisterGroup.handler;
+import Features.Principals.PrincipalGroups.handler;
+
+pub fn registerPrincipals(ctx: AppContext): void {
+    let repo = PrincipalRepository(ctx.db);
+    ctx.app.get("/principals", ListPrincipalsHandler(repo, ctx));
+    ctx.app.post("/principals", RegisterPrincipalHandler(repo, ctx));
+    ctx.app.get("/groups", GroupsHandler(repo, ctx));
+    ctx.app.post("/groups", RegisterGroupHandler(repo, ctx));
+    ctx.app.get("/principal/groups", PrincipalGroupsHandler(ctx));
+}

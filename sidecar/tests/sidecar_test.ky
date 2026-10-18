@@ -1,0 +1,442 @@
+//! Offline gate for varman-sidecar. No live control plane, OPA, or Envoy is
+//! needed: the durable queue, the policy cache, the bundle (un)pack, and the
+//! Envoy config emission are all exercised directly.
+
+import assert;
+import string;
+import list;
+import map;
+import io.file;
+
+import settings;
+import bundle;
+import queue;
+import envoy;
+import state;
+import violation;
+import vstore;
+import handlers;
+import cfrule;
+import cfengine;
+import cfcheck;
+import sysresolve;
+import web.routing;
+import web.request;
+
+// ---------------------------------------------------------------------------
+// Violation queue: durable, survives a reload, never loses a record.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_queue_append_flush_reload(): void {
+    let path = "test_tmp_queue.bin";
+    let q = queue.Queue(path);
+    q.truncate();
+
+    // Append five violations (bodies deliberately contain commas, braces, and a
+    // newline to prove the length-framed store is binary-safe).
+    q.append("{\"id\":1,\"msg\":\"a,b\"}");
+    q.append("{\"id\":2,\"nested\":{\"x\":1}}");
+    q.append("{\"id\":3,\"text\":\"line1\nline2\"}");
+    q.append("{\"id\":4}");
+    q.append("{\"id\":5}");
+    assert.equalInt(q.count(), 5);
+
+    // A flush confirms the first three; they are removed, the rest stay in order.
+    let batch = q.batch(3);
+    assert.equalInt(batch.size(), 3);
+    assert.equalStr(batch.get(0) ?? "", "{\"id\":1,\"msg\":\"a,b\"}");
+    assert.equalStr(batch.get(2) ?? "", "{\"id\":3,\"text\":\"line1\nline2\"}");
+    q.removeConfirmed(3);
+    assert.equalInt(q.count(), 2);
+
+    // Reopen from disk (simulated restart): the unconfirmed records survive.
+    let q2 = queue.Queue(path);
+    let all = q2.readAll();
+    assert.equalInt(all.size(), 2);
+    assert.equalStr(all.get(0) ?? "", "{\"id\":4}");
+    assert.equalStr(all.get(1) ?? "", "{\"id\":5}");
+
+    // Nothing is lost across further appends.
+    q2.append("{\"id\":6}");
+    assert.equalInt(queue.Queue(path).count(), 3);
+
+    File.remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// Bundle: gzip/tar pack and unpack round-trips to the expected rego + revision.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_bundle_roundtrip(): void {
+    let rego = "package authz\n\ndefault allow = false\nallow { input.user == \"admin\" }\n";
+    let gz = bundle.buildBundle("rev-2026-10-08-01", rego);
+    assert.isTrue(gz.length > 0);
+    // Gzip magic bytes.
+    assert.equalInt(gz[0], 0x1f);
+    assert.equalInt(gz[1], 0x8b);
+
+    let (rev, out) = bundle.unpack(gz);
+    assert.equalStr(rev, "rev-2026-10-08-01");
+    assert.equalStr(out, rego);
+}
+
+// ---------------------------------------------------------------------------
+// Policy cache: /policy/bundle, /policy/rego, /healthz serve the cached values,
+// last-good is kept on CP failure, and the bundle survives a reload from disk.
+// ---------------------------------------------------------------------------
+
+fn testConfig(): settings.Config {
+    let c = settings.fromYaml(
+        "control_plane: \"http://cp.example:8787/\"\n" +
+        "tenant: \"acme\"\n" +
+        "bundle_name: \"policy\"\n" +
+        "cache_path: \"test_tmp_bundle.tar.gz\"\n" +
+        "store_path: \"test_tmp_state_queue.bin\"\n");
+    return c;
+}
+
+fn emptyCtx(): routing.Context {
+    return routing.Context(request.Request.empty(), Map<string, string>(1, string.hash));
+}
+
+@test
+fn test_config_from_yaml(): void {
+    let c = testConfig();
+    // Trailing slash trimmed; values bound; untouched keys keep their defaults.
+    assert.equalStr(c.control_plane, "http://cp.example:8787");
+    assert.equalStr(c.tenant, "acme");
+    assert.equalStr(c.bundle_name, "policy");
+    assert.equalInt(c.poll_secs, 30);
+    assert.equalStr(c.opa_addr, "127.0.0.1:9191");
+}
+
+@test
+fn test_cache_serves_and_survives_cp_failure(): void {
+    let cfg = testConfig();
+    File.remove(cfg.cache_path);
+    let st = state.SidecarState(cfg);
+
+    let rego = "package authz\nallow { true }\n";
+    let gz = bundle.buildBundle("rev-A", rego);
+    let changed = st.setBundle(gz);
+    assert.isTrue(changed);
+    assert.equalStr(st.revision, "rev-A");
+    assert.equalStr(st.rego, rego);
+    assert.isTrue(st.haveBundle);
+    assert.isTrue(st.cpOk);
+
+    // /policy/rego returns the cached rego.
+    let rego_resp = handlers.PolicyRegoHandler(st).serve(emptyCtx());
+    assert.equalInt(rego_resp.status.toCode(), 200);
+    assert.equalStr(rego_resp.body, rego);
+
+    // /policy/bundle returns the cached gzip bytes unchanged.
+    let bundle_resp = handlers.PolicyBundleHandler(st).serve(emptyCtx());
+    assert.equalInt(bundle_resp.status.toCode(), 200);
+    assert.equalInt(bundle_resp.body.length, gz.length);
+
+    // /healthz reports the revision and a healthy control plane.
+    let health_resp = handlers.HealthzHandler(st).serve(emptyCtx());
+    assert.equalInt(health_resp.status.toCode(), 200);
+    assert.contains(health_resp.body, "\"revision\":\"rev-A\"");
+    assert.contains(health_resp.body, "\"cp_ok\":true");
+
+    // Simulate a control-plane failure: last-good policy is still served.
+    st.markError("control plane returned 503");
+    assert.isFalse(st.cpOk);
+    assert.equalStr(st.revision, "rev-A");
+    let rego_resp2 = handlers.PolicyRegoHandler(st).serve(emptyCtx());
+    assert.equalInt(rego_resp2.status.toCode(), 200);
+    assert.equalStr(rego_resp2.body, rego);
+    let health_resp2 = handlers.HealthzHandler(st).serve(emptyCtx());
+    assert.contains(health_resp2.body, "\"cp_ok\":false");
+    assert.contains(health_resp2.body, "\"revision\":\"rev-A\"");
+
+    // Reload from disk (simulated restart with the CP down at boot): the
+    // last-good bundle persisted to cache_path is recovered.
+    let st2 = state.SidecarState(cfg);
+    assert.isFalse(st2.haveBundle);
+    let loaded = st2.loadFromDisk();
+    assert.isTrue(loaded);
+    assert.equalStr(st2.revision, "rev-A");
+    assert.equalStr(st2.rego, rego);
+
+    File.remove(cfg.cache_path);
+}
+
+@test
+fn test_policy_endpoints_before_sync_are_unavailable(): void {
+    let cfg = testConfig();
+    File.remove(cfg.cache_path);
+    let st = state.SidecarState(cfg);
+    // Nothing synced yet: policy endpoints report 503.
+    assert.equalInt(handlers.PolicyRegoHandler(st).serve(emptyCtx()).status.toCode(), 503);
+    assert.equalInt(handlers.PolicyBundleHandler(st).serve(emptyCtx()).status.toCode(), 503);
+}
+
+// ---------------------------------------------------------------------------
+// Ingest handler: parses each record into a structured, signed violation,
+// durably stores it, and acks with the captured count (R1 + R4).
+// ---------------------------------------------------------------------------
+
+@test
+fn test_ingest_persists_signs_and_acks(): void {
+    let cfg = testConfig();
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+    let st = state.SidecarState(cfg);
+
+    let ctx = emptyCtx();
+    ctx.request.body = "[{\"decision_id\":\"a\",\"result\":{\"verdict\":\"deny\"}},{\"decision_id\":\"b\",\"result\":{\"verdict\":\"deny\"}},{\"decision_id\":\"c\",\"result\":{\"verdict\":\"deny\"}}]";
+    let resp = handlers.IngestHandler(st).serve(ctx);
+    assert.equalInt(resp.status.toCode(), 200);
+    assert.contains(resp.body, "\"captured\":3");
+    assert.equalInt(st.vs.total(), 3);
+
+    // Every stored record is signed and verifies against the chain.
+    let recs = st.vs.recent(10, "", "");
+    let i = 0;
+    while (i < recs.size()) {
+        let r = recs.get(i) ?? violation.Violation();
+        assert.isTrue(st.vs.verifyRecord(r, st.pubHex));
+        i = i + 1;
+    }
+
+    // Reload from disk rebuilds the history and the chain head intact.
+    let st2 = state.SidecarState(cfg);
+    st2.vs.loadFromDisk();
+    assert.equalInt(st2.vs.total(), 3);
+    let r2 = st2.vs.byId(3) ?? violation.Violation();
+    assert.isTrue(st2.vs.verifyRecord(r2, st2.pubHex));
+
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+}
+
+// The SQLite read model mirrors the signed log and answers `recent` with an
+// indexed query; the flat-file log stays the source of truth. A record fetched
+// back through the SQL path still verifies against the chain (so `body` round-
+// trips exactly), and the verdict filter is applied in SQL.
+@test
+fn test_sqlite_read_model(): void {
+    let cfg = testConfig();
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+    File.remove(cfg.vstore_path + ".idx.db");
+    let st = state.SidecarState(cfg);
+    st.vs.openReadModel(cfg.vstore_path + ".idx.db");
+    assert.isTrue(st.vs.dbReady);
+
+    let ctx = emptyCtx();
+    ctx.request.body = "[{\"decision_id\":\"a\",\"result\":{\"verdict\":\"deny\"}},{\"decision_id\":\"b\",\"result\":{\"verdict\":\"shadow\"}},{\"decision_id\":\"c\",\"result\":{\"verdict\":\"deny\"}}]";
+    let _ = handlers.IngestHandler(st).serve(ctx);
+    assert.equalInt(st.vs.total(), 3);
+
+    // The SQL path (dbReady) returns all three newest-first and each reconstructs
+    // from its stored body well enough to verify against the chain.
+    let all = st.vs.recent(10, "", "");
+    assert.equalInt(all.size(), 3);
+    let r0 = all.get(0) ?? violation.Violation();
+    assert.isTrue(st.vs.verifyRecord(r0, st.pubHex));
+
+    // The verdict filter is applied in SQL: two deny, no "allow".
+    assert.equalInt(st.vs.recent(10, "deny", "").size(), 2);
+    assert.equalInt(st.vs.recent(10, "allow", "").size(), 0);
+
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+    File.remove(cfg.vstore_path + ".idx.db");
+}
+
+// ---------------------------------------------------------------------------
+// Content firewall: the deterministic engine blocks what it should and lets
+// benign traffic through (false-positive guard).
+// ---------------------------------------------------------------------------
+
+@test
+fn test_router_matches_cf_check_subpaths(): void {
+    let r = routing.Router();
+    r.__addRoute("POST", "/cf/check", "0");
+    r.__addRoute("POST", "/cf/check/{a}", "1");
+    r.__addRoute("POST", "/cf/check/{a}/{b}", "2");
+    assert.isTrue(r.resolve("POST", "/cf/check").matched);
+    assert.isTrue(r.resolve("POST", "/cf/check/post").matched);
+    assert.isTrue(r.resolve("POST", "/cf/check/v1/messages").matched);
+}
+
+@test
+fn test_cf_engine_blocks_and_allows(): void {
+    let rulesJson = "[" +
+        "{\"id\":\"r-secret\",\"name\":\"Secret in prompt\",\"kind\":\"secret\",\"pattern\":\"any\",\"action\":\"block\",\"severity\":\"high\"}," +
+        "{\"id\":\"r-card\",\"name\":\"Credit card\",\"kind\":\"pii\",\"pattern\":\"card\",\"action\":\"block\"}," +
+        "{\"id\":\"r-inj\",\"name\":\"Injection\",\"kind\":\"substr\",\"pattern\":\"ignore all previous instructions\",\"action\":\"block\"}," +
+        "{\"id\":\"r-topic\",\"name\":\"Topic trial\",\"kind\":\"substr\",\"pattern\":\"insider trading\",\"action\":\"shadow\"}" +
+        "]";
+    let set = cfengine.compileAll(cfrule.parseSet(rulesJson));
+    assert.equalInt(set.size(), 4);
+
+    // benign -> allow
+    assert.isTrue(string.eql(cfengine.evaluate(set, "what is the weather in London today").decision, "allow"));
+    // known key prefix -> deny
+    assert.isTrue(string.eql(cfengine.evaluate(set, "my key is sk-ABCDEF1234567890 ok").decision, "deny"));
+    // Luhn-valid card -> deny
+    assert.isTrue(string.eql(cfengine.evaluate(set, "card 4111 1111 1111 1111 please").decision, "deny"));
+    // injection substring -> deny
+    assert.isTrue(string.eql(cfengine.evaluate(set, "please IGNORE ALL PREVIOUS INSTRUCTIONS now").decision, "deny"));
+    // shadow rule -> shadow (recorded, not blocked)
+    assert.isTrue(string.eql(cfengine.evaluate(set, "tips on insider trading").decision, "shadow"));
+}
+
+// ---------------------------------------------------------------------------
+// Content firewall: the /cf/check handler blocks a deny, allows benign, and
+// records a signed, verifiable violation on a block.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_cf_check_blocks_and_records(): void {
+    let cfg = testConfig();
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+    let st = state.SidecarState(cfg);
+    st.setContentRules("[{\"id\":\"r1\",\"name\":\"Secret\",\"kind\":\"secret\",\"pattern\":\"any\",\"action\":\"block\"}]");
+
+    // benign -> 200, no record
+    let okCtx = emptyCtx();
+    okCtx.request.body = "summarise this report";
+    assert.equalInt(cfcheck.CheckHandler(st).serve(okCtx).status.toCode(), 200);
+    assert.equalInt(st.vs.total(), 0);
+
+    // secret -> 403, one signed+verifiable record
+    let badCtx = emptyCtx();
+    badCtx.request.body = "here is my token sk-ABCDEF1234567890";
+    assert.equalInt(cfcheck.CheckHandler(st).serve(badCtx).status.toCode(), 403);
+    assert.equalInt(st.vs.total(), 1);
+    let rec = st.vs.byId(1) ?? violation.Violation();
+    assert.isTrue(string.eql(rec.ruleRegoPath, "content-firewall"));
+    assert.isTrue(string.eql(rec.verdict, "deny"));
+    assert.isTrue(st.vs.verifyRecord(rec, st.pubHex));
+
+    // Regression: a content-firewall record has endpointPort=0, which must
+    // round-trip losslessly. A reloaded record MUST still verify (the signed
+    // evidence chain has to survive a restart). Previously fromJson remapped
+    // port 0 -> 443, changing the canonical bytes and breaking the signature.
+    let st2 = state.SidecarState(cfg);
+    st2.vs.loadFromDisk();
+    assert.equalInt(st2.vs.total(), 1);
+    let rec2 = st2.vs.byId(1) ?? violation.Violation();
+    assert.equalInt(rec2.endpointPort, 0);
+    assert.isTrue(st2.vs.verifyRecord(rec2, st2.pubHex));
+    assert.isTrue(st2.vs.firstBrokenId(st2.pubHex) == (0 as long));
+
+    File.remove(cfg.vstore_path);
+    File.remove(cfg.vcursor_path);
+}
+
+// ---------------------------------------------------------------------------
+// AI-system attribution: the resolver prefers the explicit egress tag, falls
+// back to the published principal map, and leaves an unknown caller
+// unattributed. The resolved system id lives in the violation's signed core, so
+// it signs, verifies, and round-trips through toJson/fromJson unchanged.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_attribution_resolve_and_signed_core(): void {
+    // 1. explicit egress tag always wins
+    let empty = sysresolve.SystemMap();
+    assert.equalStr(sysresolve.resolve("hr-copilot", "svc-x", empty), "hr-copilot");
+
+    // 2. no tag -> map the authenticated principal
+    let sm = sysresolve.loadJson("{\"sig\":\"\",\"entries\":[{\"principal\":\"svc-x\",\"system_id\":\"billing-bot\"}]}");
+    assert.equalInt(sm.size(), 1);
+    assert.equalStr(sysresolve.resolve("", "svc-x", sm), "billing-bot");
+
+    // 3. no tag, unmapped principal -> unattributed
+    assert.equalStr(sysresolve.resolve("", "svc-unknown", sm), "");
+
+    // 4. attribution is in the signed core: sign, verify, round-trip.
+    let cfg = testConfig();
+    let st = state.SidecarState(cfg);
+    let v = violation.Violation();
+    v.id = 1 as long;
+    v.tenant = "acme";
+    v.verdict = "deny";
+    v.ruleRegoPath = "content-firewall";
+    v.systemId = "hr-copilot";
+    violation.signInto(v, st.privHex, "");
+    assert.isTrue(violation.verify(v, st.pubHex, ""));
+
+    let v2 = violation.fromJson(violation.toJson(v));
+    assert.equalStr(v2.systemId, "hr-copilot");
+    assert.isTrue(violation.verify(v2, st.pubHex, ""));
+
+    // 5. tamper check: changing the attribution breaks the signature.
+    v2.systemId = "finance-bot";
+    assert.isTrue(!violation.verify(v2, st.pubHex, ""));
+}
+
+// ---------------------------------------------------------------------------
+// Envoy config emission: a listener with one bump chain per host, the ext_authz
+// cluster, and a default splice chain.
+// ---------------------------------------------------------------------------
+
+fn sampleEndpoints(): list.List<envoy.Endpoint> {
+    let eps = list.List<envoy.Endpoint>();
+    eps.push(envoy.Endpoint("api.openai.com", 443, true));
+    eps.push(envoy.Endpoint("api.anthropic.com", 443, true));
+    eps.push(envoy.Endpoint("disabled.example.com", 443, false));
+    return eps;
+}
+
+@test
+fn test_envoy_lds_has_bump_chain_per_host_and_splice_default(): void {
+    let eps = sampleEndpoints();
+    let lds = envoy.emitLds("envoy/certs", "0.0.0.0:10000", "127.0.0.1:8899", eps);
+
+    // The listener with the TLS inspector.
+    assert.contains(lds, "name: ingress");
+    assert.contains(lds, "envoy.filters.listener.tls_inspector");
+
+    // The content-firewall ext_authz HTTP filter is wired into the bump chain.
+    assert.contains(lds, "path_prefix: \"/cf/check\"");
+    assert.contains(lds, "cluster: content");
+
+    // One bump filter chain per ENABLED host (the disabled one is excluded).
+    assert.contains(lds, "server_names: [\"api.openai.com\"]");
+    assert.contains(lds, "server_names: [\"api.anthropic.com\"]");
+    assert.isFalse(string.contains(lds, "disabled.example.com"));
+    assert.contains(lds, "stat_prefix: bump_api_openai_com");
+    assert.contains(lds, "route: { cluster: upstream_api_openai_com");
+
+    // ext_authz to the OPA cluster in each bump chain.
+    assert.contains(lds, "envoy.filters.http.ext_authz");
+    assert.contains(lds, "cluster_name: opa");
+
+    // The default splice chain for unregistered hosts.
+    assert.contains(lds, "envoy.filters.network.sni_dynamic_forward_proxy");
+    assert.contains(lds, "stat_prefix: splice");
+    assert.contains(lds, "cluster: dyn_forward");
+}
+
+@test
+fn test_envoy_cds_has_opa_splice_and_upstreams(): void {
+    let eps = sampleEndpoints();
+    let cds = envoy.emitCds("127.0.0.1:9191", "127.0.0.1:8899", eps);
+
+    assert.contains(cds, "name: opa");
+    assert.contains(cds, "port_value: 9191");
+    assert.contains(cds, "name: content");   // content-firewall inspector cluster
+    assert.contains(cds, "name: dyn_forward");
+    assert.contains(cds, "name: upstream_api_openai_com");
+    assert.contains(cds, "name: upstream_api_anthropic_com");
+    assert.contains(cds, "sni: api.openai.com");
+    assert.isFalse(string.contains(cds, "disabled.example.com"));
+}
+
+@test
+fn test_envoy_signature_reflects_enabled_set(): void {
+    let eps = sampleEndpoints();
+    // Sorted, enabled only.
+    assert.equalStr(envoy.signature(eps), "api.anthropic.com:443,api.openai.com:443");
+}

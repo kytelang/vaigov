@@ -1,0 +1,31 @@
+// Row DTOs for the grc feature over the shared `acp` db. Field names/order mirror
+// the acp GrcRecord struct (tenant_id is projected AS tenant).
+@serializable pub struct GrcRow {
+    pub id: string,
+    pub kind: string,
+    pub subject: string,
+    pub title: string,
+    pub status: string,
+    pub body: string,
+    pub operator: string,
+    pub created_ms: long,
+    pub pubkey_hex: string,
+    pub sig_hex: string,
+    pub linked_refs: string,
+    pub answers_json: string,
+    pub assignee: string,
+    pub due_ms: long,
+    pub stage: string,
+    pub tenant: string,
+}
+
+@serializable pub struct GrcCommentRow {
+    pub id: string,
+    pub author: string,
+    pub body: string,
+    pub created_ms: long,
+}
+
+@serializable pub struct GrcProbeRow {
+    pub one: int,
+}

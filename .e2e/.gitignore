@@ -1,0 +1,17 @@
+# Generated / secret local test artifacts — never version-controlled.
+*.crt
+*.csr
+*.ext
+*.key
+*.srl
+*.log
+*.out
+sidecar-bin
+sidecar-bin.new
+violations
+violations.cur
+cfrules.json
+mitm.log
+varman-sidecar-bundle.tar.gz
+varman-sidecar-endpoints.json
+varman-sidecar-packs.json

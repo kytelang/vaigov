@@ -1,0 +1,229 @@
+//! RFC 6962-style verifiable log (Certificate Transparency Merkle tree).
+//!
+//! A faithful port of Rust `acp-core`'s `merkle.rs`. Domain separation follows
+//! RFC 6962: leaf hashes are prefixed `0x00` and internal node hashes `0x01`
+//! (both live in `core.hashing`). This module adds the tree shape: the Merkle
+//! Tree Hash recursion with its `splitPoint` (largest power of two strictly
+//! below `n`), inclusion (audit) proofs, and consistency proofs (the
+//! append-only guarantee), plus their verifiers.
+//!
+//! Hashes are carried as 64-char lowercase hex `string`s throughout, so the
+//! whole tree is plain `List<string>` data with no manual memory management.
+//! The empty string `""` is used as the internal "no hash" / reconstruction
+//! failure sentinel, which is unambiguous because a real hash is always 64
+//! characters.
+//!
+//! The Rust original keeps an incremental O(log n) frontier inside `MerkleLog`
+//! so a fresh tree head can be signed on every append without an O(n) recompute.
+//! That optimisation is deliberately omitted here: correctness comes first, so
+//! `root()` recomputes `rootOf` of the stored leaves. The frontier is a pure
+//! performance concern and reproduces exactly this `rootOf`, so adding it later
+//! changes nothing observable.
+
+import list;
+import string;
+import hashing;
+
+/// Largest power of two strictly less than `n` (requires `n >= 2`).
+/// Matches `merkle::split_point`.
+pub fn splitPoint(n: int): int {
+    let k = 1;
+    while ((k << 1) < n) { k = k << 1; }
+    return k;
+}
+
+/// Merkle Tree Hash of a list of leaf hashes (RFC 6962 MTH). Matches
+/// `merkle::root_of`:
+///   MTH({})      = SHA-256("")
+///   MTH({d0})    = d0
+///   MTH(d0..dn)  = node(MTH(d0..dk), MTH(dk..dn)), k = splitPoint(n)
+pub fn rootOf(leaves: List<string>): string {
+    let n = leaves.size();
+    if (n == 0) { return hashing.emptyRootHex(); }
+    if (n == 1) { return leaves.at(0); }
+    let k = splitPoint(n);
+    let left = rootOf(leaves.slice(0, k));
+    let right = rootOf(leaves.slice(k, n));
+    return hashing.nodeHashHex(left, right);
+}
+
+/// RFC 6962 audit PATH for `index` within `leaves`. Matches `merkle::path`.
+fn path(index: int, leaves: List<string>): List<string> {
+    let n = leaves.size();
+    if (n <= 1) { return List<string>(); }
+    let k = splitPoint(n);
+    if (index < k) {
+        let p = path(index, leaves.slice(0, k));
+        p.push(rootOf(leaves.slice(k, n)));
+        return p;
+    }
+    let p = path(index - k, leaves.slice(k, n));
+    p.push(rootOf(leaves.slice(0, k)));
+    return p;
+}
+
+/// RFC 6962 consistency sub-proof. Matches `merkle::subproof`. `b` carries the
+/// "this is the complete first subtree" flag (its root is omitted when `b`).
+fn subproof(m: int, leaves: List<string>, b: bool): List<string> {
+    let n = leaves.size();
+    if (m == n) {
+        let r = List<string>();
+        if (!b) { r.push(rootOf(leaves)); }
+        return r;
+    }
+    let k = splitPoint(n);
+    if (m <= k) {
+        let p = subproof(m, leaves.slice(0, k), b);
+        p.push(rootOf(leaves.slice(k, n)));
+        return p;
+    }
+    let p = subproof(m - k, leaves.slice(k, n), false);
+    p.push(rootOf(leaves.slice(0, k)));
+    return p;
+}
+
+/// Reconstructs the root implied by `leaf` at `index` in a tree of `size` using
+/// `proof`. Returns `""` on any inconsistency (the Rust `Option::None`).
+/// Matches `merkle::reconstruct`.
+fn reconstruct(leaf: string, index: int, size: int, proof: List<string>): string {
+    if (size == 1) {
+        if (index == 0 && proof.size() == 0) { return leaf; }
+        return "";
+    }
+    if (proof.size() == 0) { return ""; }
+    let top = proof.at(proof.size() - 1);
+    let rest = proof.slice(0, proof.size() - 1);
+    let k = splitPoint(size);
+    if (index < k) {
+        let left = reconstruct(leaf, index, k, rest);
+        if (string.eql(left, "")) { return ""; }
+        return hashing.nodeHashHex(left, top);
+    }
+    let right = reconstruct(leaf, index - k, size - k, rest);
+    if (string.eql(right, "")) { return ""; }
+    return hashing.nodeHashHex(top, right);
+}
+
+/// Verifies an inclusion proof: does `leafHex` at `index` in a tree of
+/// `treeSize` leaves reconstruct to `rootHex`? Matches `merkle::verify_inclusion`.
+pub fn verifyInclusion(leafHex: string, index: int, treeSize: int, proof: List<string>, rootHex: string): bool {
+    if (index < 0 || index >= treeSize) { return false; }
+    let h = reconstruct(leafHex, index, treeSize, proof);
+    if (string.eql(h, "")) { return false; }
+    return string.eql(h, rootHex);
+}
+
+/// Verifies a consistency proof between an earlier tree of `m` leaves (root
+/// `firstRootHex`) and a later tree of `n` leaves (root `secondRootHex`). Proves
+/// the first `m` leaves were neither altered nor reordered (append-only).
+/// Matches `merkle::verify_consistency`.
+pub fn verifyConsistency(m: int, firstRootHex: string, n: int, secondRootHex: string, proof: List<string>): bool {
+    if (m == 0) { return true; }
+    if (m == n) { return proof.size() == 0 && string.eql(firstRootHex, secondRootHex); }
+    if (m > n) { return false; }
+
+    let fnr = m - 1;
+    let sn = n - 1;
+    while ((fnr & 1) == 1) { fnr = fnr >> 1; sn = sn >> 1; }
+
+    let pos = 0;
+    let plen = proof.size();
+
+    let fr = "";
+    let sr = "";
+    if (fnr != 0) {
+        if (pos >= plen) { return false; }
+        let seed = proof.at(pos);
+        pos = pos + 1;
+        fr = seed;
+        sr = seed;
+    } else {
+        fr = firstRootHex;
+        sr = firstRootHex;
+    }
+
+    while (fnr != 0) {
+        if ((fnr & 1) == 1 || fnr == sn) {
+            if (pos >= plen) { return false; }
+            let c = proof.at(pos);
+            pos = pos + 1;
+            fr = hashing.nodeHashHex(c, fr);
+            sr = hashing.nodeHashHex(c, sr);
+            while (fnr != 0 && (fnr & 1) == 0) { fnr = fnr >> 1; sn = sn >> 1; }
+        } else {
+            if (pos >= plen) { return false; }
+            let c = proof.at(pos);
+            pos = pos + 1;
+            sr = hashing.nodeHashHex(sr, c);
+        }
+        fnr = fnr >> 1;
+        sn = sn >> 1;
+    }
+
+    while (sn != 0) {
+        if (pos >= plen) { return false; }
+        let c = proof.at(pos);
+        pos = pos + 1;
+        sr = hashing.nodeHashHex(sr, c);
+        sn = sn >> 1;
+    }
+
+    return string.eql(fr, firstRootHex) && string.eql(sr, secondRootHex) && pos == plen;
+}
+
+/// An append-only log of leaf hashes (hex). Matches `merkle::MerkleLog`, minus
+/// the incremental frontier (see the module header): `root()` recomputes the
+/// RFC 6962 MTH from the stored leaves.
+pub struct MerkleLog {
+    /// The leaf hashes in append order, each a 64-char lowercase hex string.
+    pub leaves: List<string>,
+
+    /// Creates an empty log.
+    init() {
+        self.leaves = List<string>();
+    }
+
+    /// Appends an already-computed leaf hash; returns its 0-based index.
+    pub fn appendHashHex(self: MerkleLog, hex: string): int {
+        self.leaves.push(hex);
+        return self.leaves.size() - 1;
+    }
+
+    /// Appends raw record bytes (hashed with the RFC 6962 leaf rule); returns the
+    /// 0-based leaf index.
+    pub fn append(self: MerkleLog, dataPtr: ptr, len: int): int {
+        return self.appendHashHex(hashing.leafHashHex(dataPtr, len));
+    }
+
+    /// Current number of leaves.
+    pub fn size(self: MerkleLog): int {
+        return self.leaves.size();
+    }
+
+    /// Current RFC 6962 root hash (hex).
+    pub fn root(self: MerkleLog): string {
+        return rootOf(self.leaves);
+    }
+
+    /// The leaf hash at `index`, or `undefined` if out of range.
+    pub fn leafAt(self: MerkleLog, i: int): string | undefined {
+        if (i < 0 || i >= self.leaves.size()) { return undefined; }
+        return self.leaves.at(i);
+    }
+
+    /// Inclusion (audit) proof for `index` in the current tree, or `undefined`
+    /// if the index is out of range.
+    pub fn inclusionProof(self: MerkleLog, i: int): List<string> | undefined {
+        if (i < 0 || i >= self.leaves.size()) { return undefined; }
+        return path(i, self.leaves);
+    }
+
+    /// Consistency proof from an earlier size `m` to the current size, or
+    /// `undefined` if `m` is 0 or larger than the current size.
+    pub fn consistencyProof(self: MerkleLog, m: int): List<string> | undefined {
+        let n = self.leaves.size();
+        if (m == 0 || m > n) { return undefined; }
+        if (m == n) { return List<string>(); }
+        return subproof(m, self.leaves, true);
+    }
+}

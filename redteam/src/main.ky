@@ -1,0 +1,102 @@
+//! varman-redteam (`varman-redteam`): adversarially test whether the deployed
+//! policy still blocks what it must. A port of Rust `acp-redteam`.
+//!
+//! Usage:
+//!   varman-redteam policy --server <url> [--tenant <t>] [--corpus <file>] [--json]
+//!   varman-redteam edge --target <gateway-url> [--host <host>] [--ca <pem>] [--corpus <file>] [--json]
+//!
+//! `policy` mode drives the control plane's own evaluator via POST /policy/test,
+//! so it tests the real compiled policy with no edge running. `edge` mode sends
+//! each prompt THROUGH the Envoy gateway and checks the real HTTP verdict. A
+//! variant the policy fails to deny when it should is a bypass, and the tool
+//! exits non-zero, so it drops into CI as a guard against a policy regression.
+
+import env;
+import string;
+import list;
+import redteam;
+
+extern("c") fn kyte_exit(code: int): void;
+
+fn usage(): void {
+    console.log("usage:");
+    console.log("  varman-redteam policy --server <url> [--tenant <t>] [--corpus <file>] [--json]");
+    console.log("  varman-redteam edge --target <gateway-url> [--host <registered-host>] [--ca <pem>] [--corpus <file>] [--json]");
+}
+
+// Returns the value following `flag` in `args` starting at `from`, or `dflt`.
+fn flagValue(args: List<string>, from: int, flag: string, dflt: string): string {
+    let i = from;
+    while (i < args.size()) {
+        let a = args.get(i) ?? "";
+        if (string.eql(a, flag)) {
+            if (i + 1 < args.size()) { return args.get(i + 1) ?? dflt; }
+            return dflt;
+        }
+        i = i + 1;
+    }
+    return dflt;
+}
+
+fn hasFlag(args: List<string>, from: int, flag: string): bool {
+    let i = from;
+    while (i < args.size()) {
+        if (string.eql(args.get(i) ?? "", flag)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn main(): void {
+    let args = env.args();
+
+    // Locate the mode token (`policy` / `edge`); the program name may or may not
+    // be present as argv[0], so scan rather than assume a fixed index.
+    let mode = "";
+    let modeIdx = -1;
+    let i = 0;
+    while (i < args.size()) {
+        let a = args.get(i) ?? "";
+        if (string.eql(a, "policy") || string.eql(a, "edge")) { mode = a; modeIdx = i; break; }
+        i = i + 1;
+    }
+    if (string.len(mode) == 0) {
+        usage();
+        kyte_exit(2);
+        return;
+    }
+
+    let flagsFrom = modeIdx + 1;
+    let corpusPath = flagValue(args, flagsFrom, "--corpus", "");
+    let asJson = hasFlag(args, flagsFrom, "--json");
+
+    let corpus = redteam.defaultCorpus();
+    if (string.len(corpusPath) > 0) {
+        corpus = redteam.loadCorpus(corpusPath);
+        if (corpus.size() == 0) {
+            console.log("cannot read corpus " + corpusPath);
+            kyte_exit(2);
+            return;
+        }
+    }
+
+    if (string.eql(mode, "edge")) {
+        let target = flagValue(args, flagsFrom, "--target", "");
+        if (string.len(target) == 0) {
+            console.log("edge mode needs --target <gateway-url>");
+            kyte_exit(2);
+            return;
+        }
+        let host = flagValue(args, flagsFrom, "--host", "");
+        let ca = flagValue(args, flagsFrom, "--ca", "");
+        let code = redteam.runEdge(target, host, ca, corpus, asJson);
+        kyte_exit(code);
+        return;
+    }
+
+    // policy mode
+    let server = flagValue(args, flagsFrom, "--server", "http://127.0.0.1:8787");
+    let tenant = flagValue(args, flagsFrom, "--tenant", "default");
+    let code = redteam.runPolicy(server, tenant, corpus, asJson);
+    kyte_exit(code);
+}

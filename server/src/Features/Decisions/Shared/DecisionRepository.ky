@@ -1,0 +1,92 @@
+// DecisionRepository: the `decisions` table (OPA decision-log sink + read side) plus
+// the coverage-matrix reads over policy_rules / rule_controls / conformance_checklist /
+// acts / tenant_settings in the shared `acp` Postgres db. SQL mirrors acp-server store.rs.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.DecisionDtos;
+
+pub struct DecisionRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    // GET /decisions: recent decisions (acp list_decisions, limit 500).
+    pub async fn list(self: DecisionRepository, tenant: string, limit: long): Rows<DecisionRaw> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbLong(limit));
+        let r = await Repository<DecisionRaw>(conn, "decisions").query(
+            "SELECT decision_id, ts_ms, ts_text, verdict, rule_id, controls_json, obligations_json, resource, operation, subject, bundle_revision FROM decisions WHERE tenant_id = $1 ORDER BY ts_ms DESC, created_ms DESC LIMIT $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // POST /logs: land one decision (idempotent by decision_id).
+    pub async fn record(self: DecisionRepository, decisionId: string, tenant: string, tsMs: long, tsText: string, verdict: string, ruleId: string, controlsJson: string, obligationsJson: string, resource: string, operation: string, subject: string, bundleRevision: string, inputJson: string, createdMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(decisionId)); p.push(db.dbText(tenant)); p.push(db.dbLong(tsMs)); p.push(db.dbText(tsText));
+        p.push(db.dbText(verdict)); p.push(db.dbText(ruleId)); p.push(db.dbText(controlsJson)); p.push(db.dbText(obligationsJson));
+        p.push(db.dbText(resource)); p.push(db.dbText(operation)); p.push(db.dbText(subject)); p.push(db.dbText(bundleRevision));
+        p.push(db.dbText(inputJson)); p.push(db.dbLong(createdMs));
+        let _r = await conn.exec("INSERT INTO decisions (decision_id, tenant_id, ts_ms, ts_text, verdict, rule_id, controls_json, obligations_json, resource, operation, subject, bundle_revision, input_json, created_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (decision_id) DO NOTHING", p);
+        self.db.pool.release(conn);
+    }
+
+    // GET /compliance/decision-summary.
+    pub async fn verdictCounts(self: DecisionRepository, tenant: string): Rows<VerdictCountRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<VerdictCountRow>(conn, "decisions").query(
+            "SELECT verdict, COUNT(*) AS n FROM decisions WHERE tenant_id = $1 GROUP BY verdict", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Raw (controls_json, verdict) over all tenant decisions, for control counts.
+    pub async fn controlsVerdicts(self: DecisionRepository, tenant: string): Rows<CtrlVerdictRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<CtrlVerdictRow>(conn, "decisions").query(
+            "SELECT controls_json, verdict FROM decisions WHERE tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // tenant_settings onboarded + enabled_acts (coverage control universe).
+    pub async fn settings(self: DecisionRepository, tenant: string): Rows<SettingsRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<SettingsRow>(conn, "tenant_settings").query(
+            "SELECT onboarded, enabled_acts FROM tenant_settings WHERE tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Enforceable controls for an act slug (acp load_controls_for_framework shape).
+    pub async fn controlsForSlug(self: DecisionRepository, slug: string): Rows<CoverageCtrlRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(slug));
+        let r = await Repository<CoverageCtrlRow>(conn, "conformance_checklist").query(
+            "SELECT c.control_id AS control_id, c.title AS title, c.obligation_type AS obligation_type FROM conformance_checklist c JOIN acts a ON a.act_id = c.act_id WHERE a.slug = $1 ORDER BY c.ordinal", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Rule -> control tags for the tenant (key act:control_id -> rule_ids).
+    pub async fn ruleControlTags(self: DecisionRepository, tenant: string): Rows<RuleCtrlRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<RuleCtrlRow>(conn, "rule_controls").query(
+            "SELECT rc.rule_id AS rule_id, c.control_id AS control_id, a.slug AS slug FROM rule_controls rc JOIN policy_rules pr ON pr.rule_id = rc.rule_id JOIN conformance_checklist c ON c.item_id = rc.item_id JOIN acts a ON a.act_id = c.act_id WHERE pr.tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+}

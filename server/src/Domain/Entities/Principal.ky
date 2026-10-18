@@ -1,0 +1,12 @@
+// Persistence entity: one row of the `principals` table (users / service
+// identities surfaced from the IdP, with their group memberships). Named
+// PrincipalRow (not Principal) to avoid a global type-name clash with the
+// varman-core `types.Principal` decision subject. Snake_case matches the columns.
+@serializable
+pub struct PrincipalRow {
+    pub id: string,
+    pub display: string,
+    pub source: string,
+    pub groups_json: string,
+    pub created_ms: long,
+}

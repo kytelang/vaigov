@@ -1,0 +1,52 @@
+// POST /delegation/verify -> intersect a delegation chain's scopes and report whether
+// the requested action is permitted. acp returns {"ok":true,"effective_scopes":[...],"permits":bool}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import set;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct DelegationVerifyHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: DelegationVerifyHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        // effective scopes = intersection of each hop's scopes along the chain.
+        let effective = Set<string>(16, string.hash);
+        let first = true;
+        if (json.has(body, "chain")) {
+            let chain = json.get(body, "chain");
+            let n = json.size(chain);
+            let i = 0;
+            while (i < n) {
+                let hop = json.at(chain, i);
+                let hopScopes = Set<string>(16, string.hash);
+                if (json.has(hop, "scopes")) {
+                    let sc = json.get(hop, "scopes");
+                    let j = 0;
+                    while (j < json.size(sc)) { hopScopes.add(json.asString(json.at(sc, j)) ?? ""); j = j + 1; }
+                }
+                if (first) { effective = hopScopes; first = false; }
+                else { effective = effective.intersection(hopScopes); }
+                i = i + 1;
+            }
+        }
+        let requested = "";
+        if (json.has(body, "action")) { requested = json.asString(json.get(body, "action")) ?? ""; }
+        let permits = effective.has(requested) || effective.has("*");
+
+        let scopeList = effective.toList();
+        let arr = list.List<json.JsonValue>();
+        let a = 0;
+        while (a < scopeList.size()) { arr.push(json.str(scopeList.at(a))); a = a + 1; }
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("effective_scopes", json.array(arr));
+        m.set("permits", json.bool(permits));
+        return Http.okObj(m);
+    }
+}

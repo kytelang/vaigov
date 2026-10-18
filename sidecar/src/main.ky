@@ -1,0 +1,159 @@
+//! varman-sidecar: the firewall-agnostic edge agent (acp-sidecar port).
+//!
+//! Two jobs over a neutral HTTP contract (header `x-acp-tenant` + optional
+//! bearer): outbound policy sync (poll the control plane, cache the OPA bundle
+//! in memory and on disk, serve it locally, keep serving last-good when the CP
+//! is down) and inbound violation relay (persist each POSTed violation to a
+//! local durable queue FIRST, ack immediately, then flush batches to the CP in
+//! the background). It also generates Envoy config and mints per-host certs.
+//!
+//! HTTP surface: GET /healthz, /policy/bundle, /policy/rego, /ai-endpoints;
+//! POST /violations, /logs.
+//!
+//! It runs on the framework reactor: `app.run(port)` owns the accept loop +
+//! connection lifecycle (TLS, timeouts, ARC-safe per-conn serving), and the two
+//! background loops are started on that same reactor via `app.onStart`. No
+//! hand-rolled socket/poll loop.
+
+import settings;
+import state;
+import handlers;
+import console;
+import cfcheck;
+import ticketing;
+import sync;
+import web.app;
+import net.aio;
+import net.poller;
+import net.eventedio;
+import os.sys;
+import string;
+
+/// Builds the app, registers the routes, loads last-good policy from disk, wires
+/// the background sync/flush loops onto the reactor, and serves via `app.run`.
+fn main(): void {
+    let cfg = settings.load();
+    let st = state.SidecarState(cfg);
+
+    // Serve the last-good bundle even if the control plane is down at boot.
+    if (st.loadFromDisk()) {
+        console.log("loaded last-good policy from disk, revision " + st.revision);
+    }
+
+    // Open the SQLite read model (a searchable mirror of the signed log; the
+    // flat-file log stays the source of truth). Opened before the load so the
+    // rebuild below also populates the index. Fail-safe: if SQLite is absent the
+    // store falls back to the in-memory scan.
+    st.vs.openReadModel(cfg.vstore_path + ".idx.db");
+    if (st.vs.dbReady) { console.log("violation read model: SQLite index ready"); }
+
+    // Rebuild the signed violation history (R1) so the console shows past
+    // records and the flush resumes from the right cursor across restarts.
+    st.vs.loadFromDisk();
+    console.log("violation store: " + `${st.vs.total()}` + " records, " + `${st.vs.pendingCount()}` + " pending flush");
+    // Tamper/corruption self-check (R4): verify the whole signed chain at boot.
+    // A non-zero result means the evidence log was forged, reordered, or
+    // (most commonly) corrupted by a second concurrent writer on the same file.
+    let broken = st.vs.firstBrokenId(st.pubHex);
+    if (broken > 0) {
+        console.log("WARNING: violation evidence chain breaks at id " + `${broken}` + " (tamper or concurrent-writer corruption); records from there are UNVERIFIABLE");
+    } else if (st.vs.total() > 0) {
+        console.log("violation evidence chain verified intact (" + `${st.vs.total()}` + " records)");
+    }
+
+    // R5: restore last-good endpoint registry and installed packs from disk so a
+    // cold start with the control plane down still renders Envoy and shows what
+    // is enforced.
+    if (st.loadEndpointsFromDisk()) {
+        console.log("loaded last-good endpoint registry from disk (" + `${st.endpoints.size()}` + " endpoints)");
+        if (!string.eql(cfg.envoy_dir, "")) { st.renderEnvoy(); }
+    }
+    st.loadPacksFromDisk();
+    st.loadContentRulesFromDisk();
+    if (st.cfg.content_firewall) {
+        console.log("content firewall ON, " + `${st.cfRuleCount()}` + " active rule(s)");
+    }
+    if (string.eql(cfg.signing_seed, "")) {
+        console.log("WARNING: no signing_seed configured; using a dev key. Set signing_seed in production.");
+    }
+
+    let application = app.App();
+    application.get("/healthz", handlers.HealthzHandler(st));
+    application.get("/policy/bundle", handlers.PolicyBundleHandler(st));
+    application.get("/policy/rego", handlers.PolicyRegoHandler(st));
+    application.get("/ai-endpoints", handlers.AiEndpointsHandler(st));
+    application.post("/violations", handlers.IngestHandler(st));
+    application.post("/logs", handlers.IngestHandler(st));
+
+    // Content firewall (F1): Envoy ext_authz HTTP check over the request body.
+    // Envoy's ext_authz prepends path_prefix (/cf/check) to the ORIGINAL request
+    // path, and the router has no catch-all, so register the handler for the
+    // prefix plus a few trailing-segment depths to cover real API paths
+    // (/post -> /cf/check/post ; /v1/messages -> /cf/check/v1/messages ; etc).
+    application.post("/cf/check", cfcheck.CheckHandler(st));
+    application.post("/cf/check/{a}", cfcheck.CheckHandler(st));
+    application.post("/cf/check/{a}/{b}", cfcheck.CheckHandler(st));
+    application.post("/cf/check/{a}/{b}/{c}", cfcheck.CheckHandler(st));
+    application.post("/cf/check/{a}/{b}/{c}/{d}", cfcheck.CheckHandler(st));
+
+    // Operator console (R2): loopback/operator-network facing, not the proxy port.
+    application.get("/console", console.ConsoleHandler(st));
+    application.get("/console/violations.json", console.ViolationsJsonHandler(st));
+    application.get("/console/violation/{id}", console.ViolationDetailHandler(st));
+    application.get("/console/policy.json", console.PolicyJsonHandler(st));
+
+    // Background loops on the server reactor (started after it is current).
+    application.onStart(() => startLoops(st));
+
+    let (host, port) = portOf(cfg.listen);
+    console.log("varman-sidecar listening on " + `${port}` + ", control plane " + cfg.control_plane);
+    application.run(port);
+}
+
+/// The listen port parsed out of a `host:port` string (default 8899).
+fn portOf(listen: string): (string, int) {
+    let idx = string.lastIndexOf(listen, ":");
+    if (idx < 0) { return (listen, 8899); }
+    let h = string.slice(listen, 0, idx);
+    let p = string.parseInt(string.slice(listen, idx + 1, listen.length)) ?? 8899;
+    return (h, p);
+}
+
+/// Starts the two background loops as coroutines on the current (server) reactor.
+/// Called from the `onStart` task after `run` has made its reactor current.
+fn startLoops(st: state.SidecarState): void {
+    coroStart(pollLoop(st));
+    coroStart(flushLoop(st));
+    coroStart(ticketLoop(st));
+}
+
+/// Background policy + endpoint + packs poll loop.
+async fn pollLoop(st: state.SidecarState): void {
+    while (true) {
+        sync.syncOnce(st);
+        sync.syncEndpoints(st);
+        sync.syncPacks(st);
+        sync.syncContentRules(st);
+        let secs = if (st.cfg.poll_secs < 5) 5 else st.cfg.poll_secs;
+        await aio.delay(secs * 1000);
+    }
+}
+
+/// Background ticketing loop (R3): raise tickets for violations awaiting one.
+async fn ticketLoop(st: state.SidecarState): void {
+    while (true) {
+        let n = ticketing.raiseOnce(st);
+        if (n > 0) { console.log("raised " + `${n}` + " ticket(s)"); }
+        let secs = if (st.cfg.flush_secs < 2) 2 else st.cfg.flush_secs;
+        await aio.delay(secs * 1000);
+    }
+}
+
+/// Background store-and-forward flush loop.
+async fn flushLoop(st: state.SidecarState): void {
+    while (true) {
+        sync.flushOnce(st);
+        let secs = if (st.cfg.flush_secs < 2) 2 else st.cfg.flush_secs;
+        await aio.delay(secs * 1000);
+    }
+}

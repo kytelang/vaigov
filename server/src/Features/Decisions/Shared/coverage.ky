@@ -1,0 +1,136 @@
+// Shared coverage-matrix projection: the single source of truth for both the
+// machine JSON endpoint (/compliance/coverage) and the console hypermedia view
+// (/coverage/view). Mirrors acp's coverage_matrix: for each ENFORCEABLE control
+// in the tenant's enabled acts, whether a policy rule tags it (authored) and
+// whether decisions have exercised it (observed), with a per-control status of
+// enforced | authored | gap.
+//
+// View-model types are CLASSES (reference semantics) so the row list carries its
+// owned `rules` container without value-struct copy/ARC subtleties.
+import string;
+import list;
+import map;
+import serde.json;
+import Features.Decisions.Shared.DecisionRepository;
+import Domain.Dtos.DecisionDtos;
+
+pub class CoverageRow {
+    pub act: string,
+    pub controlId: string,
+    pub title: string,
+    pub obligationType: string,
+    pub rules: list.List<string>,
+    pub decisions: long,
+    pub denies: long,
+    pub status: string,
+    init(act: string, controlId: string, title: string, obligationType: string, rules: list.List<string>, decisions: long, denies: long, status: string) {
+        self.act = act; self.controlId = controlId; self.title = title; self.obligationType = obligationType;
+        self.rules = rules; self.decisions = decisions; self.denies = denies; self.status = status;
+    }
+}
+
+pub class CoverageData {
+    pub rows: list.List<CoverageRow>,
+    pub authored: long,
+    pub observed: long,
+    pub gap: long,
+    pub total: long,
+    init(rows: list.List<CoverageRow>, authored: long, observed: long, gap: long, total: long) {
+        self.rows = rows; self.authored = authored; self.observed = observed; self.gap = gap; self.total = total;
+    }
+}
+
+// The EU-AI-Act-style obligation types that are actually enforceable at the proxy
+// (and therefore count toward coverage). Advisory/informational controls do not.
+pub fn enforceable(ot: string): bool {
+    return string.eql(ot, "technical") || string.eql(ot, "prohibition") || string.eql(ot, "oversight")
+        || string.eql(ot, "record-keeping") || string.eql(ot, "transparency");
+}
+
+pub async fn computeCoverage(repo: DecisionRepository, tenant: string): CoverageData {
+    // ruled: "slug:control_id" -> [rule_ids]
+    let ruled = Map<string, list.List<string>>(64, string.hash);
+    let rcRows = await repo.ruleControlTags(tenant);
+    let i = 0;
+    while (i < rcRows.items.size()) {
+        let rc = rcRows.items.getOr(i, RuleCtrlRow{ rule_id: "", control_id: "", slug: "" });
+        let key = string.concat(string.concat(rc.slug, ":"), rc.control_id);
+        let existing = ruled.get(key);
+        if (existing == undefined) { let l = list.List<string>(); l.push(rc.rule_id); ruled.set(key, l); }
+        else { (existing ?? list.List<string>()).push(rc.rule_id); }
+        i = i + 1;
+    }
+
+    // seen/deny: "slug:control_id" -> counts, from each decision's controls_json (array of keys).
+    let seenN = Map<string, long>(64, string.hash);
+    let denyN = Map<string, long>(64, string.hash);
+    let dv = await repo.controlsVerdicts(tenant);
+    let j = 0;
+    while (j < dv.items.size()) {
+        let row = dv.items.getOr(j, CtrlVerdictRow{ controls_json: "[]", verdict: "" });
+        let isDeny = string.eql(row.verdict, "deny");
+        let parsed = json.tryParse(row.controls_json);
+        if (parsed != undefined) {
+            let arr = json.asArray(parsed ?? json.null());
+            if (arr != undefined) {
+                let k = 0;
+                let a = arr ?? list.List<json.JsonValue>();
+                while (k < a.size()) {
+                    let key = json.asString(a.get(k) ?? json.null()) ?? "";
+                    if (key.length > 0) {
+                        seenN.set(key, (seenN.get(key) ?? 0) + 1);
+                        if (isDeny) { denyN.set(key, (denyN.get(key) ?? 0) + 1); }
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+
+    // enabled acts from tenant_settings (only when onboarded).
+    let slugs = list.List<string>();
+    let sr = await repo.settings(tenant);
+    if (sr.items.size() > 0) {
+        let s = sr.items.getOr(0, SettingsRow{ onboarded: 0, enabled_acts: "[]" });
+        if (s.onboarded != 0) {
+            let ev = json.tryParse(s.enabled_acts);
+            if (ev != undefined) {
+                let ea = json.asArray(ev ?? json.null());
+                if (ea != undefined) {
+                    let m = 0; let arr = ea ?? list.List<json.JsonValue>();
+                    while (m < arr.size()) { let sl = json.asString(arr.get(m) ?? json.null()) ?? ""; if (sl.length > 0) { slugs.push(sl); } m = m + 1; }
+                }
+            }
+        }
+    }
+
+    let rows = list.List<CoverageRow>();
+    let authored: long = 0; let observed: long = 0; let gap: long = 0;
+    let si = 0;
+    while (si < slugs.size()) {
+        let slug = slugs.at(si);
+        let ctrls = await repo.controlsForSlug(slug);
+        let ci = 0;
+        while (ci < ctrls.items.size()) {
+            let c = ctrls.items.getOr(ci, CoverageCtrlRow{ control_id: "", title: "", obligation_type: "" });
+            if (enforceable(c.obligation_type)) {
+                let key = string.concat(string.concat(slug, ":"), c.control_id);
+                let ruleIds = ruled.get(key) ?? list.List<string>();
+                let sN = seenN.get(key) ?? 0;
+                let dN = denyN.get(key) ?? 0;
+                let hasRule = ruleIds.size() > 0;
+                let hasObs = sN > 0;
+                let status = if (hasRule) (if (hasObs) ("enforced") else ("authored")) else ("gap");
+                if (hasRule) { authored = authored + 1; }
+                if (hasObs) { observed = observed + 1; }
+                if (!hasRule) { gap = gap + 1; }
+                rows.push(CoverageRow(slug, c.control_id, c.title, c.obligation_type, ruleIds, sN, dN, status));
+            }
+            ci = ci + 1;
+        }
+        si = si + 1;
+    }
+
+    return CoverageData(rows, authored, observed, gap, rows.size() as long);
+}

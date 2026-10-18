@@ -1,0 +1,63 @@
+// GET /rules -> {"rules":[{rule_id,name,description,subject,resource,operation,
+// condition,match,approver_group,verdict,obligations,enabled,priority,controls:[
+// {item_id,control_id,act}]}]}. Byte-matches acp store.list_rules.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.Shared.rulebody;
+import Domain.Dtos.RuleListRow;
+
+pub struct ListRulesHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListRulesHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let out = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, RuleListRow{ rule_id: "", name: "", description: "", subject_json: "{}", resource: "", operation: "", condition_json: "[]", match_json: "{}", approver_group: "", verdict: "deny", obligations_json: "[]", enabled: 1, priority: 100, updated_ms: 0 });
+            // Controls this rule satisfies.
+            let cRows = await self.repo.controlsFor(r.rule_id);
+            let controls = list.List<json.JsonValue>();
+            let k = 0;
+            while (k < cRows.items.size()) {
+                let c = cRows.items.getOr(k, RuleControlRow{ item_id: "", control_id: "", slug: "" });
+                let cm = Map<string, json.JsonValue>(4, string.hash);
+                cm.set("item_id", json.str(c.item_id));
+                cm.set("control_id", json.str(c.control_id));
+                cm.set("act", json.str(c.slug));
+                controls.push(json.object(cm));
+                k = k + 1;
+            }
+            let m = Map<string, json.JsonValue>(16, string.hash);
+            m.set("rule_id", json.str(r.rule_id));
+            m.set("name", json.str(r.name));
+            m.set("description", json.str(r.description));
+            m.set("subject", rulebody.ruleParse(r.subject_json, 5));
+            m.set("resource", json.str(r.resource));
+            m.set("operation", json.str(r.operation));
+            m.set("condition", rulebody.ruleParse(r.condition_json, 4));
+            m.set("match", rulebody.ruleParse(r.match_json, 5));
+            m.set("approver_group", json.str(r.approver_group));
+            m.set("verdict", json.str(r.verdict));
+            m.set("obligations", rulebody.ruleParse(r.obligations_json, 4));
+            m.set("enabled", json.bool(r.enabled != 0));
+            m.set("priority", json.number(r.priority as long));
+            m.set("controls", json.array(controls));
+            out.push(json.object(m));
+            i = i + 1;
+        }
+        let top = Map<string, json.JsonValue>(2, string.hash);
+        top.set("rules", json.array(out));
+        return Http.okObj(top);
+    }
+}

@@ -1,0 +1,38 @@
+// GET /groups -> {"groups":[...]} the registered directory groups (from control_state
+// groupreg:*). acp also unions SCIM-directory groups; this dev build has no SCIM
+// directory, so only the registered groups are returned (noted).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Principals.Shared.PrincipalRepository;
+import Domain.Dtos.PrincipalListRow;
+
+pub struct GroupsHandler impl RouteHandler {
+    repo: PrincipalRepository,
+    app: AppContext,
+    init(repo: PrincipalRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: GroupsHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.listStatePrefix("groupreg:");
+        let seen = Map<string, bool>(16, string.hash);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let kv = rows.items.getOr(i, KvRow{ k: "", v: "" });
+            let v = string.trim(kv.v);
+            if (v.length > 0 && seen.get(v) == undefined) {
+                seen.set(v, true);
+                arr.push(json.str(v));
+            }
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("groups", json.array(arr));
+        return Http.okObj(m);
+    }
+}

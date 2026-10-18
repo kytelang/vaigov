@@ -1,0 +1,30 @@
+// GET /tenants -> {"tenants":[...]} (at least ["default"]).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+
+pub struct TenantsListHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: TenantsListHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.tenants();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(json.str((rows.items.getOr(i, TenantIdRow{ tenant_id: "" })).tenant_id));
+            i = i + 1;
+        }
+        if (arr.size() == 0) { arr.push(json.str("default")); }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("tenants", json.array(arr));
+        return Http.okObj(m);
+    }
+}

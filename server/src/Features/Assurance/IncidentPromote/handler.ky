@@ -1,0 +1,36 @@
+// POST /incident/promote -> promote a violation into a GRC incident record.
+// acp returns {"ok":true,"id":"inc-..."}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Assurance.Shared.AssuranceRepository;
+import Features.Assurance.Shared.asr;
+
+pub struct IncidentPromoteHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: IncidentPromoteHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditFirewall)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let title = asr.asrBodyStr(body, "title");
+        if (title == "") { title = "Promoted incident"; }
+        let id = string.concat("inc-", random.randomHex(6));
+        let doc = json.stringify(body);
+        let pubk = self.app.trust.keypair.pubHex;
+        let sig = sign.signHex(self.app.trust.keypair.privHex, doc as ptr, doc.length);
+        await self.repo.addIncident(id, title, "open", doc, "", Http.nowMs(), pubk, sig, tenant);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

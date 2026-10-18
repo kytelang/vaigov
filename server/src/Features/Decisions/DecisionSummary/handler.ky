@@ -1,0 +1,31 @@
+// GET /compliance/decision-summary -> {"verdicts":{verdict:count,...}}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Decisions.Shared.DecisionRepository;
+import Domain.Dtos.DecisionDtos;
+
+pub struct DecisionSummaryHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); }
+
+    async fn serve(self: DecisionSummaryHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.verdictCounts(tenant);
+        let vm = Map<string, json.JsonValue>(8, string.hash);
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, VerdictCountRow{ verdict: "", n: 0 });
+            vm.set(r.verdict, json.number(r.n));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("verdicts", json.object(vm));
+        return Http.okObj(m);
+    }
+}

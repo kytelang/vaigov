@@ -1,0 +1,43 @@
+// GET /redteam/runs -> {"runs":[{id,status,created_ms,verified,catch_rate,attacks,caught,fpr,min_catch}]}
+// from grc_records attestations, verify-on-read.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.AssuranceRepository;
+import Domain.Dtos.ViolationRow;
+
+pub struct RedteamRunsHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: RedteamRunsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listRedteam(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, RedteamAttestRow{ id: "", status: "", created_ms: 0, body: "{}", pubkey_hex: "", sig_hex: "" });
+            let verified = r.sig_hex.length > 0 && sign.verifyHex(r.pubkey_hex, r.body as ptr, r.body.length, r.sig_hex);
+            let b = json.tryParse(r.body) ?? json.null();
+            let m = Map<string, json.JsonValue>(10, string.hash);
+            m.set("id", json.str(r.id)); m.set("status", json.str(r.status));
+            m.set("created_ms", json.number(r.created_ms)); m.set("verified", json.bool(verified));
+            if (json.has(b, "catch_rate")) { m.set("catch_rate", json.get(b, "catch_rate")); }
+            if (json.has(b, "attacks")) { m.set("attacks", json.get(b, "attacks")); }
+            if (json.has(b, "caught")) { m.set("caught", json.get(b, "caught")); }
+            if (json.has(b, "fpr")) { m.set("fpr", json.get(b, "fpr")); }
+            if (json.has(b, "min_catch")) { m.set("min_catch", json.get(b, "min_catch")); }
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("runs", json.array(arr));
+        return Http.okObj(out);
+    }
+}

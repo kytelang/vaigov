@@ -1,0 +1,55 @@
+// POST /rules -> {"ok":true,"rule_id":"rule-..."} (EditPolicy). Mirrors acp rule_create.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.Shared.rulebody;
+
+pub fn ruleOkFalse(msg: string): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return Http.okObj(m);
+}
+
+pub struct CreateRuleHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateRuleHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let name = rulebody.ruleBodyStr(body, "name");
+        if (string.trim(name).length == 0) { return ruleOkFalse("name is required"); }
+        let verdict = rulebody.ruleNormVerdict(rulebody.ruleBodyStr(body, "verdict"));
+        let enabled = rulebody.ruleBodyBool(body, "enabled", true);
+        let priority = rulebody.ruleBodyInt(body, "priority", 100);
+        if (body.kind == 5 && json.has(body, "match")) {
+            let err = rego.validateMatch(json.get(body, "match"));
+            if (err != undefined) { return ruleOkFalse(err ?? "invalid match"); }
+        }
+        let ruleId = await self.repo.add(tenant, name, rulebody.ruleBodyStr(body, "description"),
+            rulebody.ruleBodyJsonStr(body, "subject", "{}"), rulebody.ruleBodyStr(body, "resource"),
+            rulebody.ruleBodyStr(body, "operation"), rulebody.ruleBodyJsonStr(body, "condition", "[]"),
+            rulebody.ruleBodyJsonStr(body, "match", "{}"), rulebody.ruleBodyStr(body, "approver_group"),
+            verdict, rulebody.ruleBodyJsonStr(body, "obligations", "[]"), enabled, priority, Http.nowMs());
+        // Optional control tags on create.
+        if (body.kind == 5 && json.has(body, "controls")) {
+            let ids = rulebody.ruleBodyStrArray(body, "controls");
+            let _c = await self.repo.setControls(ruleId, ids);
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("rule_id", json.str(ruleId));
+        return Http.okObj(m);
+    }
+}

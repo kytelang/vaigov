@@ -1,0 +1,28 @@
+// GET /policy/lint -> {findings:[...]} heuristic checks over the tenant's rules.
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Features.Policy.Shared.policyrules;
+import Features.Rules.Shared.RuleRepository;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct LintHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: LintHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let findings = rego.lint(rules);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("findings", json.array(findings));
+        return Http.okObj(m);
+    }
+}

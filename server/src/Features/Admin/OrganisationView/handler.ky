@@ -1,0 +1,23 @@
+// GET /organisation/view -> the Organisation hypermedia view (Datastar fragment),
+// matching acp/console OrganisationView.vue. Delegates to the shared panel builder
+// (Admin/Shared/orgpanel.ky), which the mutation handlers also use.
+import ds_response;
+import string;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Shared.orgpanel;
+
+pub struct OrganisationViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: AdminRepository,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+
+    async fn serve(self: OrganisationViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let showAll = string.eql(ctx.query("all"), "1");
+        let panel = await orgpanel.orgPanel(self.repo, tenant, showAll);
+        return await ds_response.patch(panel);
+    }
+}

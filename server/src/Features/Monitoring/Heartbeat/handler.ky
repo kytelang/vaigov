@@ -1,0 +1,26 @@
+// POST /heartbeat/{proxy} -> {"ok":true,"proxy":proxy}. An enrolled proxy's
+// dead-man's-switch heartbeat, persisted in control_state (liveness:<proxy>).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Monitoring.Shared.MonitorRepository;
+
+pub struct HeartbeatHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: HeartbeatHandler, ctx: routing.Context): response.Response {
+        let proxy = ctx.param("proxy");
+        let ts = Http.nowMs();
+        await self.repo.putState(string.concat("liveness:", proxy), `${ts}`, ts);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("proxy", json.str(proxy));
+        return Http.okObj(m);
+    }
+}

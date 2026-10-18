@@ -1,0 +1,33 @@
+// GET /auth/entra/whoami -> the caller's resolved identity, or unauthenticated.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct EntraWhoamiHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraWhoamiHandler, ctx: routing.Context): response.Response {
+        let p = Http.principalOf(self.app, ctx);
+        if (p == undefined) {
+            let e = Map<string, json.JsonValue>(1, string.hash);
+            e.set("authenticated", json.bool(false));
+            return Http.okObj(e);
+        }
+        let pr = p ?? Auth.AuthPrincipal("", "", "", list.List<string>());
+        let tenantId = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let m = Map<string, json.JsonValue>(5, string.hash);
+        m.set("authenticated", json.bool(true));
+        m.set("oid", json.str(pr.oid));
+        m.set("username", json.str(pr.username));
+        m.set("entra_tid", json.str(pr.tenant));
+        m.set("tenant_id", json.str(tenantId));
+        return Http.okObj(m);
+    }
+}

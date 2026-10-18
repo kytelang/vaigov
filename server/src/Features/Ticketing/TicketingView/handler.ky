@@ -1,0 +1,22 @@
+// GET /ticketing/view -> the Ticketing hypermedia view (Datastar fragment),
+// matching acp/console TicketingView.vue. Reads the tenant's automation rules and
+// raised tickets from the shared TicketRepository.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Ticketing.Shared.TicketRepository;
+import Features.Ticketing.views.ticketing;
+
+pub struct TicketingViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: TicketRepository,
+    init(app: AppContext) { self.app = app; self.repo = TicketRepository(app.db); }
+
+    async fn serve(self: TicketingViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rules = await self.repo.listRules(tenant);
+        let tickets = await self.repo.listTickets(tenant);
+        return await ds_response.patch(ticketing.ticketingPanel(rules.items, tickets.items));
+    }
+}

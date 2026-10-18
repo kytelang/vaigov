@@ -1,0 +1,187 @@
+## Transparent interception on :443. Upstreams resolve via 8.8.8.8 (c-ares), so the
+## /etc/hosts redirect of the hostnames to 127.0.0.1 never loops. Any client that
+## trusts the demo CA and resolves these hosts to localhost is inspected.
+static_resources:
+  listeners:
+  - name: ingress443
+    address: { socket_address: { address: 0.0.0.0, port_value: 443 } }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector }
+    filter_chains:
+    - filter_chain_match: { server_names: ["api.anthropic.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.anthropic.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.anthropic.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: t_api_anthropic_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: api.anthropic.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: anthropic, host_rewrite_literal: api.anthropic.com, timeout: 120s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - filter_chain_match: { server_names: ["api.openai.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.openai.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.openai.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: t_api_openai_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: api.openai.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: openai, host_rewrite_literal: api.openai.com, timeout: 120s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - filter_chain_match: { server_names: ["generativelanguage.googleapis.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/generativelanguage.googleapis.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/generativelanguage.googleapis.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: t_generativelanguage_googleapis_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: generativelanguage.googleapis.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: gemini, host_rewrite_literal: generativelanguage.googleapis.com, timeout: 120s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: content
+    connect_timeout: 2s
+    type: STATIC
+    load_assignment:
+      cluster_name: content
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8899 } } }
+  - name: anthropic
+    connect_timeout: 10s
+    type: STATIC
+    load_assignment:
+      cluster_name: anthropic
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: 160.79.104.10, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: api.anthropic.com
+  - name: openai
+    connect_timeout: 10s
+    type: STATIC
+    load_assignment:
+      cluster_name: openai
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: 172.66.0.243, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: api.openai.com
+  - name: gemini
+    connect_timeout: 10s
+    type: STATIC
+    load_assignment:
+      cluster_name: gemini
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: 172.217.114.4, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: generativelanguage.googleapis.com
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9902 } }

@@ -1,0 +1,5 @@
+// A one-column projection for `... RETURNING id` inserts across features.
+@serializable
+pub struct IdRow {
+    pub id: string,
+}

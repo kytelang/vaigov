@@ -1,0 +1,21 @@
+// GET /decisions/view -> the Decisions audit-trail hypermedia view (Datastar
+// fragment), matching acp/console DecisionsView.vue. Reads the most recent
+// decisions OPA pushed back (the decision-log sink) from the shared repository.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Decisions.Shared.DecisionRepository;
+import Features.Decisions.views.decisions;
+
+pub struct DecisionsViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); }
+
+    async fn serve(self: DecisionsViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rs = await self.repo.list(tenant, 200);
+        return await ds_response.patch(decisions.decisionsPanel(rs.items));
+    }
+}

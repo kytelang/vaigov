@@ -1,0 +1,37 @@
+// POST /principals {id, display?, source?, groups?} -> {"ok":true,"id":...}. Mirrors
+// acp principal_register (upsert by id).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Principals.Shared.PrincipalRepository;
+import Features.Apps.CreateApp.handler;
+
+pub struct RegisterPrincipalHandler impl RouteHandler {
+    repo: PrincipalRepository,
+    app: AppContext,
+    init(repo: PrincipalRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RegisterPrincipalHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterAgent)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let id = string.trim(bodyStr(body, "id"));
+        if (id.length == 0) { return okFalse("id is required"); }
+        let d = bodyStr(body, "display");
+        let display = if (d.length > 0) (d) else (id);
+        let s = bodyStr(body, "source");
+        let source = if (s.length > 0) (s) else ("sso");
+        let groupsJson = if (json.has(body, "groups")) (json.stringify(json.get(body, "groups"))) else ("[]");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.upsert(id, display, source, groupsJson, tenant, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,91 @@
+// First-party console mutation handlers for the AI systems screen (back the
+// Datastar forms in views/systems.kyx). Read posted signals, mutate via the
+// shared SystemRepository, return the refreshed #systems fragment + close modal.
+// Trusted /console/* (no bearer); the machine /systems JSON API keeps requireCap.
+import web.routing;
+import web.response;
+import string;
+import list;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.views.systems;
+import Domain.Dtos.SystemDtos;
+
+fn sysTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+
+fn sig(body: json.JsonValue, key: string): string {
+    return string.trim(json.asString(json.get(body, key)) ?? "");
+}
+
+// "UK, EU" -> ["UK","EU"] as a JSON string (what the jurisdictions column stores).
+fn jurJson(csv: string): string {
+    let parts = string.split(csv, ",");
+    let arr = list.List<json.JsonValue>();
+    let i = 0;
+    while (i < parts.size()) {
+        let t = string.trim(parts.getOr(i, ""));
+        if (t.length > 0) { arr.push(json.str(t)); }
+        i = i + 1;
+    }
+    return json.stringify(json.array(arr));
+}
+
+pub struct SystemsSaveHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SystemsSaveHandler, ctx: routing.Context): Response {
+        let tenant = sysTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = sig(body, "sysName");
+        if (name.length == 0) {
+            let rows = await self.repo.listSystems(tenant);
+            return await ConsoleDs.patchAndSignals(systems.systemsPanel(rows.items), "{\"sysErr\":\"Name is required.\"}");
+        }
+        let owner = sig(body, "sysOwner");
+        let tier = sig(body, "sysTier"); if (tier.length == 0) { tier = "high"; }
+        let sector = sig(body, "sysSector");
+        let purpose = sig(body, "sysPurpose");
+        let jur = jurJson(sig(body, "sysJur"));
+        let id = sig(body, "sysId");
+        let now = Http.nowMs();
+        if (id.length == 0) {
+            let newId = string.concat("sys-", random.randomHex(6));
+            await self.repo.addSystem(newId, name, purpose, owner, "development", tier, sector, "", jur, tenant, now);
+            await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), newId, "system-created", "system", name, tenant, now);
+        } else {
+            let cur = await self.repo.getSystem(id, tenant);
+            let life = "development";
+            if (cur.items.size() > 0) {
+                life = cur.items.getOr(0, SystemRow{ id:"", name:"", purpose:"", owner:"", lifecycle_state:"development", risk_tier:"", sector:"", asset_type:"", jurisdictions:"[]", tenant:"", created_ms:0, updated_ms:0 }).lifecycle_state;
+            }
+            await self.repo.updateSystem(id, name, purpose, owner, life, tier, sector, "", jur, tenant, now);
+            await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "system-updated", "system", name, tenant, now);
+        }
+        let rows = await self.repo.listSystems(tenant);
+        return await ConsoleDs.patchAndSignals(systems.systemsPanel(rows.items),
+            "{\"sysModal\":\"\",\"sysErr\":\"\",\"sysId\":\"\",\"sysName\":\"\",\"sysOwner\":\"\",\"sysTier\":\"high\",\"sysSector\":\"\",\"sysJur\":\"\",\"sysPurpose\":\"\"}");
+    }
+}
+
+pub struct SystemsDeleteHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SystemsDeleteHandler, ctx: routing.Context): Response {
+        let tenant = sysTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "sysId");
+        if (id.length > 0) { await self.repo.deleteSystem(id, tenant); }
+        let rows = await self.repo.listSystems(tenant);
+        return await ConsoleDs.patchAndSignals(systems.systemsPanel(rows.items), "{\"sysModal\":\"\",\"sysErr\":\"\"}");
+    }
+}

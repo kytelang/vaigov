@@ -1,0 +1,43 @@
+// GET /tenant/settings -> the tenant settings object, or {onboarded:false,enabled_acts:[]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+
+pub struct TenantSettingsGetHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: TenantSettingsGetHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.tenantSettings(tenant);
+        if (rows.items.size() == 0) {
+            let m = Map<string, json.JsonValue>(2, string.hash);
+            m.set("onboarded", json.bool(false));
+            m.set("enabled_acts", json.array(list.List<json.JsonValue>()));
+            return Http.okObj(m);
+        }
+        let s = rows.items.getOr(0, TenantSettingsRow{ onboarded: 0, jurisdiction: "", enabled_acts: "[]", org_name: "", address_line1: "", address_line2: "", city: "", postcode: "", country: "", contact_name: "", contact_email: "", contact_phone: "", profile_json: "{}" });
+        let m = Map<string, json.JsonValue>(16, string.hash);
+        m.set("onboarded", json.bool(s.onboarded != 0));
+        m.set("jurisdiction", json.str(s.jurisdiction));
+        m.set("enabled_acts", json.tryParse(s.enabled_acts) ?? json.array(list.List<json.JsonValue>()));
+        m.set("org_name", json.str(s.org_name));
+        m.set("address_line1", json.str(s.address_line1));
+        m.set("address_line2", json.str(s.address_line2));
+        m.set("city", json.str(s.city));
+        m.set("postcode", json.str(s.postcode));
+        m.set("country", json.str(s.country));
+        m.set("contact_name", json.str(s.contact_name));
+        m.set("contact_email", json.str(s.contact_email));
+        m.set("contact_phone", json.str(s.contact_phone));
+        m.set("profile", json.tryParse(s.profile_json) ?? json.object(Map<string, json.JsonValue>(1, string.hash)));
+        return Http.okObj(m);
+    }
+}

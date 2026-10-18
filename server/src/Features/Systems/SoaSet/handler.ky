@@ -1,0 +1,57 @@
+// POST /systems/{id}/soa/{framework} {entries:[{control_id,applicable,justification,status,evidence_refs}]} -> {"ok":true,"saved":n}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+
+pub struct SoaSetHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SoaSetHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let framework = ctx.param("framework");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str(string.concat(string.concat("unknown system '", id), "'")));
+            return Http.okObj(e);
+        }
+        let body = Http.bodyJson(ctx);
+        let entries = if (body.kind == 5 && json.has(body, "entries")) (json.asArray(json.get(body, "entries"))) else (undefined);
+        let saved = 0;
+        let now = Http.nowMs();
+        if (entries != undefined) {
+            let arr = entries ?? list_empty();
+            let i = 0;
+            while (i < arr.size()) {
+                let e = arr.at(i);
+                let cid = string.trim(json.asString(json.get(e, "control_id")) ?? "");
+                if (cid.length > 0) {
+                    let applicable = if ((json.asBool(json.get(e, "applicable")) ?? true)) (1) else (0);
+                    let justification = json.asString(json.get(e, "justification")) ?? "";
+                    let status = json.asString(json.get(e, "status")) ?? "planned";
+                    let evidence = if (json.has(e, "evidence_refs")) (json.stringify(json.get(e, "evidence_refs"))) else ("[]");
+                    await self.repo.setSoa(string.concat("soa-", random.randomHex(6)), id, framework, cid, applicable, justification, status, evidence, tenant, now);
+                    saved = saved + 1;
+                }
+                i = i + 1;
+            }
+        }
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "soa-updated", "system", framework, tenant, now);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true)); m.set("saved", json.number(saved as long));
+        return Http.okObj(m);
+    }
+}
+
+fn list_empty(): List<json.JsonValue> { return List<json.JsonValue>(); }

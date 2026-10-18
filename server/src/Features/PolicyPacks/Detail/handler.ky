@@ -1,0 +1,29 @@
+// GET /policy-packs/{slug} -> the full pack (parameters + rule templates), or 404.
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+
+pub struct DetailHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DetailHandler, ctx: routing.Context): response.Response {
+        let slug = ctx.param("slug");
+        let p = packdata.findPack(slug);
+        if (p == undefined) {
+            let m = Map<string, json.JsonValue>(2, string.hash);
+            m.set("ok", json.bool(false));
+            m.set("error", json.str("unknown pack"));
+            return Http.jsonStatus(Status.NotFound, json.stringify(json.object(m)));
+        }
+        return Http.jsonResp(json.stringify(p ?? json.null()));
+    }
+}

@@ -1,0 +1,612 @@
+//! Control-plane authentication and authorisation: the security-critical core.
+//!
+//! A faithful port of the spine of Rust `acp-server`'s `auth.rs` plus the
+//! `acp-core` `auth.rs` capability model. Three pieces are implemented in full,
+//! with their Rust unit tests reproduced in `tests/server_test.ky`:
+//!
+//!   1. a stateless, HMAC-SHA256-signed session cookie (HttpOnly / Secure /
+//!      SameSite), with a rolling idle timeout and a fixed absolute expiry;
+//!   2. capability RBAC: an Entra app role maps to a set of capabilities, an
+//!      unknown role grants nothing (fail-closed);
+//!   3. `resolveMt`, the multi-tenant isolation gate that replaces the spoofable
+//!      `x-acp-tenant` header: the UNVERIFIED `tid` in a bearer token is read
+//!      only to pick which onboarded binding to verify against, then the token is
+//!      fully verified against that binding's issuer + JWKS before any claim is
+//!      trusted. An un-onboarded tenant is rejected; a forged `tid` signed with a
+//!      different key cannot borrow another tenant's binding.
+//!
+//! What is a TODO stub here (a later slice): the full BFF/PKCE browser login
+//! flow, the live Entra OIDC discovery + JWKS-over-HTTP fetch with kid-refresh,
+//! and the RS256 verifier. The JWT path implemented here is the EdDSA one (a real
+//! JOSE algorithm), which is exactly what the Rust `MockEntra` issues and what
+//! makes the whole verify-and-authorise path exercisable offline; an RS256 key is
+//! simply another JWKS entry once an RSA verifier is linked, with nothing above
+//! the JWKS seam changing.
+
+import string;
+import list;
+import map;
+import bytes;
+import serde.json;
+import crypto.base64;
+import crypto.mac.hmac;
+import crypto.ecc.ed25519;
+import crypto.rsa;
+import crypto.hash.sha256;
+import hashing;
+
+// --- capabilities and roles (port of acp-core auth.rs Capability / roles) ----
+
+/// The capabilities the control plane gates on. Roles map to these; the
+/// enforcement path checks a capability, never a role directly.
+pub enum Capability {
+    EditPolicy,
+    Approve,
+    Export,
+    SeeArgs,
+    RegisterApp,
+    RegisterAgent,
+    EditGrc,
+    EditFirewall,
+    BreakGlass,
+
+    /// A stable integer code, used for set membership (Kyte enums are compared by
+    /// value; a code keeps the role->capability tables compact).
+    pub fn code(self: Capability): int {
+        switch (self) {
+            case Capability.EditPolicy: { return 0; }
+            case Capability.Approve: { return 1; }
+            case Capability.Export: { return 2; }
+            case Capability.SeeArgs: { return 3; }
+            case Capability.RegisterApp: { return 4; }
+            case Capability.RegisterAgent: { return 5; }
+            case Capability.EditGrc: { return 6; }
+            case Capability.EditFirewall: { return 7; }
+            case Capability.BreakGlass: { return 8; }
+            default: { return 0 - 1; }
+        }
+    }
+}
+
+/// The capability codes an Entra app role grants. An unknown role grants nothing
+/// (fail-closed). Mirrors `AuthPrincipal::capabilities` and `role_catalogue`.
+pub fn roleCaps(role: string): List<int> {
+    let out = List<int>();
+    if (string.eql(role, "PolicyAdmin")) { out.push(Capability.EditPolicy.code()); }
+    else if (string.eql(role, "AppRegistrar")) {
+        out.push(Capability.RegisterApp.code());
+        out.push(Capability.RegisterAgent.code());
+    }
+    else if (string.eql(role, "GrcAuthor")) { out.push(Capability.EditGrc.code()); }
+    else if (string.eql(role, "FirewallAdmin")) { out.push(Capability.EditFirewall.code()); }
+    else if (string.eql(role, "Approver")) { out.push(Capability.Approve.code()); }
+    else if (string.eql(role, "Auditor")) { out.push(Capability.Export.code()); }
+    else if (string.eql(role, "SecurityOfficer")) { out.push(Capability.SeeArgs.code()); }
+    else if (string.eql(role, "BreakGlassOperator")) { out.push(Capability.BreakGlass.code()); }
+    return out;
+}
+
+/// The authenticated caller. Carries the Entra object id, tenant (`tid`), and
+/// app roles, exactly like the Rust `AuthPrincipal`.
+pub class AuthPrincipal {
+    pub oid: string,
+    pub username: string,
+    pub tenant: string,
+    pub roles: List<string>,
+
+    init(oid: string, username: string, tenant: string, roles: List<string>) {
+        self.oid = oid;
+        self.username = username;
+        self.tenant = tenant;
+        self.roles = roles;
+    }
+
+    /// Whether this principal holds `cap`, by folding every role's grants.
+    pub fn can(self: AuthPrincipal, cap: Capability): bool {
+        let want = cap.code();
+        let i = 0;
+        while (i < self.roles.size()) {
+            let caps = roleCaps(self.roles.at(i));
+            let j = 0;
+            while (j < caps.size()) {
+                if (caps.at(j) == want) { return true; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+// --- session cookies (stateless, HMAC-SHA256 signed) -------------------------
+
+/// A server-side login session. The browser holds only the signed cookie; there
+/// is no server-side session table (the cookie is self-contained). `issuedMs` is
+/// the rolling-idle anchor (refreshed on each `roll`); `absoluteExpiryMs` is
+/// fixed at login. A port of the Rust `Session`.
+pub class Session {
+    pub oid: string,
+    pub username: string,
+    pub entraTid: string,
+    pub tenantId: string,
+    pub roles: List<string>,
+    pub issuedMs: long,
+    pub absoluteExpiryMs: long,
+
+    init(oid: string, username: string, entraTid: string, tenantId: string, roles: List<string>, issuedMs: long, absoluteExpiryMs: long) {
+        self.oid = oid;
+        self.username = username;
+        self.entraTid = entraTid;
+        self.tenantId = tenantId;
+        self.roles = roles;
+        self.issuedMs = issuedMs;
+        self.absoluteExpiryMs = absoluteExpiryMs;
+    }
+
+    /// The acp-core-equivalent principal recorded in the session, so capability
+    /// checks work the same whether the caller came by cookie or by bearer token.
+    pub fn principal(self: Session): AuthPrincipal {
+        return AuthPrincipal(self.oid, self.username, self.entraTid, self.roles);
+    }
+}
+
+fn rolesToJson(roles: List<string>): json.JsonValue {
+    let arr = List<json.JsonValue>();
+    let i = 0;
+    while (i < roles.size()) { arr.push(json.str(roles.at(i))); i = i + 1; }
+    return json.array(arr);
+}
+
+fn rolesFromJson(v: json.JsonValue): List<string> {
+    let out = List<string>();
+    let arr = json.asArray(v);
+    if (arr != undefined) {
+        let i = 0;
+        while (i < arr.size()) {
+            let s = json.asString(arr.at(i));
+            if (s != undefined) { out.push(s); }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// The canonical JSON payload of a session (the HMAC commits to exactly this).
+fn sessionPayload(sess: Session): string {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("oid", json.str(sess.oid));
+    m.set("username", json.str(sess.username));
+    m.set("tid", json.str(sess.entraTid));
+    m.set("tenant", json.str(sess.tenantId));
+    m.set("roles", rolesToJson(sess.roles));
+    m.set("iat", json.number(sess.issuedMs));
+    m.set("exp", json.number(sess.absoluteExpiryMs));
+    return json.stringify(json.object(m));
+}
+
+/// Signs a session into a cookie value: `base64url(payload).hmacHex`, where the
+/// HMAC-SHA256 is taken over the base64url payload under the server session key.
+/// Stateless: everything needed to re-derive and authorise the session is inside.
+pub fn signSession(sessionKeyHex: string, sess: Session): string {
+    let payload = base64.encodeUrl(sessionPayload(sess));
+    let mac = hmac.hmacSha256Hex(sessionKeyHex, payload);
+    return string.concat(string.concat(payload, "."), mac);
+}
+
+/// Verifies and decodes a session cookie. Returns the `Session` only when the
+/// HMAC checks (in constant time) AND the rolling idle window and absolute expiry
+/// both hold at `nowMs`; otherwise `undefined`. `idleMs` is the rolling idle
+/// timeout. A tampered payload changes the HMAC and is rejected.
+pub fn verifySession(sessionKeyHex: string, cookie: string, nowMs: long, idleMs: long): Session | undefined {
+    let dot = string.lastIndexOf(cookie, ".");
+    if (dot <= 0 || dot >= cookie.length - 1) { return undefined; }
+    let payloadB64 = string.slice(cookie, 0, dot);
+    let mac = string.slice(cookie, dot + 1, cookie.length);
+    // Independent, fail-closed, constant-time MAC check before trusting anything.
+    if (!hmac.verifyHmacSha256Hex(sessionKeyHex, payloadB64, mac)) { return undefined; }
+
+    let payload = base64.decode(payloadB64);
+    let v = json.tryParse(payload);
+    if (v == undefined) { return undefined; }
+    let doc = v ?? json.null();
+    if (doc.kind != 5) { return undefined; }
+
+    let issued = json.asNumber(json.get(doc, "iat")) ?? 0;
+    let absExp = json.asNumber(json.get(doc, "exp")) ?? 0;
+    // Absolute expiry: a session cannot live past its hard cap however active.
+    if (nowMs >= absExp) { return undefined; }
+    // Rolling idle: too long since the last activity (last re-sign) rejects.
+    if (nowMs - issued >= idleMs) { return undefined; }
+
+    return Session(
+        json.asString(json.get(doc, "oid")) ?? "",
+        json.asString(json.get(doc, "username")) ?? "",
+        json.asString(json.get(doc, "tid")) ?? "",
+        json.asString(json.get(doc, "tenant")) ?? "",
+        rolesFromJson(json.get(doc, "roles")),
+        issued,
+        absExp);
+}
+
+/// Re-anchors the rolling idle window to `nowMs` (keeping the absolute expiry),
+/// the value the server writes back on each authenticated request so an active
+/// session does not idle out. Mirrors the rolling-cookie refresh.
+pub fn roll(sess: Session, nowMs: long): Session {
+    return Session(sess.oid, sess.username, sess.entraTid, sess.tenantId, sess.roles, nowMs, sess.absoluteExpiryMs);
+}
+
+/// The hardened `Set-Cookie` header value for a signed session: HttpOnly (no JS
+/// access), Secure (HTTPS only), SameSite=Lax (CSRF resistance), Path=/.
+pub fn sessionCookieHeader(name: string, value: string): string {
+    return string.concat(string.concat(name, "="), string.concat(value, "; HttpOnly; Secure; SameSite=Lax; Path=/"));
+}
+
+// --- multi-tenant JWT verification (EdDSA JOSE; the offline Entra path) -------
+
+/// A JWT verification failure, distinguished so the multi-tenant resolver can act
+/// on an unknown signing key (a kid roll) differently from a bad token. Mirrors
+/// the Rust `AuthError`.
+pub enum AuthError {
+    Malformed,
+    UnknownKey,
+    AlgMismatch,
+    BadSignature,
+    WrongIssuer,
+    WrongAudience,
+    Expired,
+    NotYetValid,
+    None,
+
+    pub fn message(self: AuthError): string {
+        switch (self) {
+            case AuthError.Malformed: { return "malformed token"; }
+            case AuthError.UnknownKey: { return "unknown signing key"; }
+            case AuthError.AlgMismatch: { return "algorithm mismatch"; }
+            case AuthError.BadSignature: { return "bad signature"; }
+            case AuthError.WrongIssuer: { return "wrong issuer"; }
+            case AuthError.WrongAudience: { return "wrong audience"; }
+            case AuthError.Expired: { return "token expired"; }
+            case AuthError.NotYetValid: { return "token not yet valid"; }
+            default: { return "ok"; }
+        }
+    }
+}
+
+/// One signing key in the key set: its JOSE algorithm and public key material.
+/// EdDSA keys carry the raw public key as hex in `pubHex`; RS256 keys carry the
+/// RSA modulus `n` and exponent `e` as base64url (the JWK `n`/`e` members), in
+/// `nB64`/`eB64`. The unused members are empty strings.
+pub struct JwkKey {
+    pub alg: string,
+    pub pubHex: string,
+    pub nB64: string,
+    pub eB64: string,
+
+    init(alg: string, pubHex: string, nB64: string, eB64: string) {
+        self.alg = alg;
+        self.pubHex = pubHex;
+        self.nB64 = nB64;
+        self.eB64 = eB64;
+    }
+}
+
+/// The key set used to verify tokens, keyed by `kid`. A port of the Rust `Jwks`.
+pub class Jwks {
+    pub keys: Map<string, JwkKey>,
+
+    init() {
+        self.keys = Map<string, JwkKey>(8, string.hash);
+    }
+
+    pub fn add(self: Jwks, kid: string, alg: string, pubHex: string): void {
+        self.keys.set(kid, JwkKey(alg, pubHex, "", ""));
+    }
+
+    /// Register an RSA (RS256) verification key from its JWK `n`/`e` (base64url),
+    /// as published by a real Entra tenant's JWKS endpoint.
+    pub fn addRsa(self: Jwks, kid: string, nB64: string, eB64: string): void {
+        self.keys.set(kid, JwkKey("RS256", "", nB64, eB64));
+    }
+
+    pub fn get(self: Jwks, kid: string): JwkKey | undefined {
+        return self.keys.get(kid);
+    }
+
+    pub fn keyCount(self: Jwks): int {
+        return self.keys.size();
+    }
+}
+
+/// What the relying party requires of a token: the issuer and our audience.
+pub struct EntraConfig {
+    pub issuer: string,
+    pub audience: string,
+
+    init(issuer: string, audience: string) {
+        self.issuer = issuer;
+        self.audience = audience;
+    }
+}
+
+/// The result of verifying a JWT: either a principal, or an error. A struct
+/// stands in for the Rust `Result<AuthPrincipal, AuthError>`.
+pub struct VerifyResult {
+    pub ok: bool,
+    pub principal: AuthPrincipal | undefined,
+    pub error: AuthError,
+
+    init(ok: bool, principal: AuthPrincipal | undefined, error: AuthError) {
+        self.ok = ok;
+        self.principal = principal;
+        self.error = error;
+    }
+}
+
+fn verifyErr(e: AuthError): VerifyResult {
+    let none: AuthPrincipal | undefined = undefined;
+    return VerifyResult(false, none, e);
+}
+
+// The three dot-separated segments of a JWT, or undefined if not exactly three.
+fn jwtParts(token: string): List<string> | undefined {
+    let parts = string.split(token, ".");
+    if (parts.size() != 3) { return undefined; }
+    return parts;
+}
+
+/// Peeks the `tid` (Entra tenant id) claim from a token WITHOUT verifying the
+/// signature. Only for picking which tenant binding to verify against; the value
+/// is UNTRUSTED until `verify` has run against the resolved config. Returns
+/// undefined if the token is malformed or carries no `tid`. Mirrors `peek_tid`.
+pub fn peekTid(token: string): string | undefined {
+    let parts = jwtParts(token);
+    if (parts == undefined) { return undefined; }
+    let p = parts ?? List<string>();
+    let claims = json.tryParse(base64.decode(p.at(1)));
+    if (claims == undefined) { return undefined; }
+    let doc = claims ?? json.null();
+    if (doc.kind != 5 || !json.has(doc, "tid")) { return undefined; }
+    return json.asString(json.get(doc, "tid"));
+}
+
+fn audienceOk(claims: json.JsonValue, audience: string): bool {
+    let aud = json.get(claims, "aud");
+    if (aud.kind == 3) { return string.eql(aud.sval, audience); }
+    if (aud.kind == 4) {
+        let arr = json.asArray(aud) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) {
+            let s = json.asString(arr.at(i));
+            if (s != undefined && string.eql(s, audience)) { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+/// Verifies a bearer JWT and returns the authenticated principal, or a specific
+/// failure. `nowMs` is injected so tests are deterministic. The signature over
+/// `header.payload` is checked BEFORE any claim is trusted; then `iss`, `aud`,
+/// and the `nbf`/`exp` window (60s JWT leeway) are validated. A port of
+/// `acp-core::auth::verify`, EdDSA branch.
+pub fn verify(token: string, jwks: Jwks, cfg: EntraConfig, nowMs: long): VerifyResult {
+    let partsOpt = jwtParts(token);
+    if (partsOpt == undefined) { return verifyErr(AuthError.Malformed); }
+    let parts = partsOpt ?? List<string>();
+
+    let headerV = json.tryParse(base64.decode(parts.at(0)));
+    if (headerV == undefined) { return verifyErr(AuthError.Malformed); }
+    let header = headerV ?? json.null();
+    let kid = json.asString(json.get(header, "kid"));
+    let alg = json.asString(json.get(header, "alg"));
+    if (kid == undefined || alg == undefined) { return verifyErr(AuthError.Malformed); }
+
+    let keyOpt = jwks.get(kid ?? "");
+    if (keyOpt == undefined) { return verifyErr(AuthError.UnknownKey); }
+    let key = keyOpt ?? JwkKey("", "", "", "");
+    if (!string.eql(key.alg, alg ?? "")) { return verifyErr(AuthError.AlgMismatch); }
+
+    // Verify the signature over "header.payload" before trusting any claim.
+    let signingInput = string.concat(string.concat(parts.at(0), "."), parts.at(1));
+    let ok = false;
+    if (string.eql(alg ?? "", "EdDSA")) {
+        let sig = base64.decode(parts.at(2));
+        if (sig.length == 64) {
+            let pk = hashing.hexDecode(key.pubHex);
+            ok = ed25519.verify(pk, signingInput as ptr, signingInput.length, sig as ptr);
+            bytes.free(pk);
+        }
+    } else if (string.eql(alg ?? "", "RS256")) {
+        // Real Entra id_tokens are RS256 (RSASSA-PKCS1-v1.5 + SHA-256) over the
+        // tenant JWKS key. Hash the signing input, then verify the signature
+        // against the key's modulus/exponent with the stdlib RSA verifier. hashId
+        // 0 selects SHA-256 and its DigestInfo prefix in rsa.verifyPkcs1.
+        let sig = base64.decode(parts.at(2));
+        let n = base64.decode(key.nB64);
+        let e = base64.decode(key.eB64);
+        if (sig.length > 0 && n.length > 0 && e.length > 0) {
+            let digest = bytes.alloc(32);
+            sha256.hashInto(signingInput as ptr, signingInput.length, digest as ptr);
+            ok = rsa.verifyPkcs1(0, digest as ptr, sig as ptr, sig.length, n as ptr, n.length, e as ptr, e.length);
+            bytes.free(digest);
+        }
+    }
+    if (!ok) { return verifyErr(AuthError.BadSignature); }
+
+    let claimsV = json.tryParse(base64.decode(parts.at(1)));
+    if (claimsV == undefined) { return verifyErr(AuthError.Malformed); }
+    let claims = claimsV ?? json.null();
+
+    if (!string.eql(json.asString(json.get(claims, "iss")) ?? "", cfg.issuer)) {
+        return verifyErr(AuthError.WrongIssuer);
+    }
+    if (!audienceOk(claims, cfg.audience)) { return verifyErr(AuthError.WrongAudience); }
+
+    let leewayS: long = 60;
+    let nowS = nowMs / 1000;
+    if (json.has(claims, "exp")) {
+        let exp = json.asNumber(json.get(claims, "exp")) ?? 0;
+        if (nowS >= exp + leewayS) { return verifyErr(AuthError.Expired); }
+    }
+    if (json.has(claims, "nbf")) {
+        let nbf = json.asNumber(json.get(claims, "nbf")) ?? 0;
+        if (nowS + leewayS < nbf) { return verifyErr(AuthError.NotYetValid); }
+    }
+
+    let p = AuthPrincipal(
+        json.asString(json.get(claims, "oid")) ?? "",
+        json.asString(json.get(claims, "preferred_username")) ?? "",
+        json.asString(json.get(claims, "tid")) ?? "",
+        rolesFromJson(json.get(claims, "roles")));
+    return VerifyResult(true, p, AuthError.None);
+}
+
+// --- Entra tenant binding + multi-tenant resolver ----------------------------
+
+/// A customer Entra tenant onboarded into the control plane: the Entra `tid`, the
+/// Varman tenant it maps to, its OIDC issuer, status, and a version. A port of
+/// the Rust `entra_binding` row.
+pub struct EntraBinding {
+    pub tid: string,
+    pub tenantId: string,
+    pub issuer: string,
+    pub status: string,
+    pub version: int,
+
+    init(tid: string, tenantId: string, issuer: string, status: string, version: int) {
+        self.tid = tid;
+        self.tenantId = tenantId;
+        self.issuer = issuer;
+        self.status = status;
+        self.version = version;
+    }
+}
+
+/// The outcome of the multi-tenant resolver: either (principal, Varman tenant),
+/// or an error string. A struct stands in for the Rust `Result<(AuthPrincipal,
+/// String), String>`.
+pub struct MtResult {
+    pub ok: bool,
+    pub principal: AuthPrincipal | undefined,
+    pub tenantId: string,
+    pub error: string,
+
+    init(ok: bool, principal: AuthPrincipal | undefined, tenantId: string, error: string) {
+        self.ok = ok;
+        self.principal = principal;
+        self.tenantId = tenantId;
+        self.error = error;
+    }
+}
+
+/// Resolve a bearer token to (principal, Varman tenant id) in the multi-tenant
+/// control plane. This is the isolation gate that replaces the spoofable
+/// `x-acp-tenant` header:
+///
+///   - the (still unverified) `tid` is read ONLY to select which onboarded
+///     binding to verify against;
+///   - a `tid` with no active binding is rejected before any tenant data is
+///     touched;
+///   - the token is then fully verified against that binding's issuer + JWKS, so
+///     a forged `tid` signed with a different key cannot borrow another tenant's
+///     binding (the signature will not verify under the onboarded key).
+///
+/// `jwksFor` is injected (issuer -> Jwks) so tests run offline; an issuer with no
+/// known keys returns an empty key set, which fails closed at `verify`
+/// (UnknownKey). A faithful port of Rust `resolve_mt` (minus the live
+/// kid-refresh retry, which is a TODO).
+pub fn resolveMt(bindings: Map<string, EntraBinding>, audience: string, token: string, nowMs: long, jwksFor: (string) -> Jwks): MtResult {
+    let none: AuthPrincipal | undefined = undefined;
+    let tidOpt = peekTid(token);
+    if (tidOpt == undefined) { return MtResult(false, none, "", "token carries no tid"); }
+    let tid = tidOpt ?? "";
+
+    let bindingOpt = bindings.get(tid);
+    if (bindingOpt == undefined) {
+        return MtResult(false, none, "", string.concat(string.concat("Entra tenant ", tid), " is not onboarded"));
+    }
+    let binding = bindingOpt ?? EntraBinding("", "", "", "", 0);
+
+    let jwks = jwksFor(binding.issuer);
+
+    // verify re-checks iss == binding.issuer (defence in depth against a forged
+    // tid) and the signature, under the ONBOARDED tenant's keys.
+    let cfg = EntraConfig(binding.issuer, audience);
+    let vr = verify(token, jwks, cfg, nowMs);
+    if (!vr.ok) {
+        return MtResult(false, none, "", string.concat("invalid token: ", vr.error.message()));
+    }
+    return MtResult(true, vr.principal, binding.tenantId, "");
+}
+
+// --- MockEntra (offline IdP for tests and local dev) -------------------------
+
+/// A mock Entra ID issuer for tests and offline dev: it issues EdDSA-signed JWTs
+/// and exposes a JWKS, so the whole verify-and-authorise path runs deterministically
+/// without a live IdP. A port of the Rust `MockEntra`.
+pub class MockEntra {
+    pub pubHex: string,
+    pub privHex: string,
+    pub kid: string,
+    pub issuer: string,
+    pub audience: string,
+
+    /// `seedHex` is a 32-byte Ed25519 seed (64 hex chars); distinct seeds give
+    /// distinct signing keys, which is what the cross-tenant isolation test needs.
+    init(tenant: string, audience: string, seedHex: string) {
+        let pk = bytes.alloc(32);
+        let sk = bytes.alloc(64);
+        let seed = hashing.hexDecode(seedHex);
+        ed25519.seedToKeypair(seed, pk, sk);
+        self.pubHex = hashing.hexEncodeN(pk, 32);
+        self.privHex = hashing.hexEncodeN(sk, 64);
+        bytes.free(seed);
+        bytes.free(pk);
+        bytes.free(sk);
+        self.kid = "mock-kid-1";
+        self.issuer = string.concat(string.concat("https://login.microsoftonline.com/", tenant), "/v2.0");
+        self.audience = audience;
+    }
+
+    pub fn config(self: MockEntra): EntraConfig {
+        return EntraConfig(self.issuer, self.audience);
+    }
+
+    pub fn jwks(self: MockEntra): Jwks {
+        let j = Jwks();
+        j.add(self.kid, "EdDSA", self.pubHex);
+        return j;
+    }
+
+    /// Issue a token for a user with roles, valid for `ttlS` seconds from `nowMs`.
+    pub fn issue(self: MockEntra, oid: string, username: string, tenant: string, roles: List<string>, nowMs: long, ttlS: long): string {
+        let nowS = nowMs / 1000;
+        let hm = Map<string, json.JsonValue>(8, string.hash);
+        hm.set("alg", json.str("EdDSA"));
+        hm.set("typ", json.str("JWT"));
+        hm.set("kid", json.str(self.kid));
+        let header = base64.encodeUrl(json.stringify(json.object(hm)));
+
+        let cm = Map<string, json.JsonValue>(16, string.hash);
+        cm.set("iss", json.str(self.issuer));
+        cm.set("aud", json.str(self.audience));
+        cm.set("oid", json.str(oid));
+        cm.set("preferred_username", json.str(username));
+        cm.set("tid", json.str(tenant));
+        cm.set("roles", rolesToJson(roles));
+        cm.set("iat", json.number(nowS));
+        cm.set("nbf", json.number(nowS));
+        cm.set("exp", json.number(nowS + ttlS));
+        let claims = base64.encodeUrl(json.stringify(json.object(cm)));
+
+        let signingInput = string.concat(string.concat(header, "."), claims);
+        let sk = hashing.hexDecode(self.privHex);
+        let sigBuf = bytes.alloc(64);
+        ed25519.sign(sk, signingInput as ptr, signingInput.length, sigBuf);
+        let sigBytes = bytes.read_string(sigBuf, 64);
+        bytes.free(sk);
+        bytes.free(sigBuf);
+        let sig = base64.encodeUrl(sigBytes);
+        return string.concat(string.concat(signingInput, "."), sig);
+    }
+}

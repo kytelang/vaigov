@@ -1,0 +1,110 @@
+// PackRepository: tenant_policy_packs installs + policy_rules provenance, over the
+// shared `acp` Postgres db. SQL mirrors acp-server store.rs pack methods exactly.
+import list;
+import string;
+import crypto.random;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.PackRows;
+
+pub struct PackRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn listInstalled(self: PackRepository, tenant: string): Rows<InstalledPackRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<InstalledPackRow>(conn, "tenant_policy_packs").query(
+            "SELECT pack_slug AS slug, version, params_json, status, installed_ms FROM tenant_policy_packs WHERE tenant_id = $1 ORDER BY installed_ms DESC", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn recordInstall(self: PackRepository, tenant: string, slug: string, version: int, paramsJson: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(slug)); p.push(db.dbInt(version));
+        p.push(db.dbText(paramsJson)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO tenant_policy_packs (tenant_id, pack_slug, version, params_json, status, installed_ms) VALUES ($1, $2, $3, $4, 'active', $5) ON CONFLICT (tenant_id, pack_slug) DO UPDATE SET version = excluded.version, params_json = excluded.params_json, status = 'active', installed_ms = excluded.installed_ms", p);
+        self.db.pool.release(conn);
+    }
+
+    // Count enabled pack rules then disable them + mark uninstalled. Returns the count.
+    pub async fn uninstall(self: PackRepository, tenant: string, slug: string): long {
+        let conn = await self.db.pool.acquire();
+        let pc = list.List<DbValue>();
+        pc.push(db.dbText(tenant)); pc.push(db.dbText(slug));
+        let cr = await Repository<PackCountRow>(conn, "policy_rules").query(
+            "SELECT count(*) AS n FROM policy_rules WHERE tenant_id = $1 AND source_pack = $2 AND enabled <> 0", pc);
+        let n: long = if (cr.items.size() > 0) ((cr.items.getOr(0, PackCountRow{ n: 0 })).n) else (0);
+        let p1 = list.List<DbValue>();
+        p1.push(db.dbText(tenant)); p1.push(db.dbText(slug));
+        let _r1 = await conn.exec("UPDATE policy_rules SET enabled = 0 WHERE tenant_id = $1 AND source_pack = $2", p1);
+        let p2 = list.List<DbValue>();
+        p2.push(db.dbText(tenant)); p2.push(db.dbText(slug));
+        let _r2 = await conn.exec("UPDATE tenant_policy_packs SET status = 'uninstalled' WHERE tenant_id = $1 AND pack_slug = $2", p2);
+        self.db.pool.release(conn);
+        return n;
+    }
+
+    // Insert a rule; returns the generated rule_id.
+    pub async fn addRule(self: PackRepository, tenant: string, name: string, description: string, matchJson: string, approver: string, verdict: string, obligations: string, nowMs: long): string {
+        let conn = await self.db.pool.acquire();
+        let ruleId = string.concat("rule-", random.randomHex(6));
+        let p = list.List<DbValue>();
+        p.push(db.dbText(ruleId)); p.push(db.dbText(tenant)); p.push(db.dbText(name)); p.push(db.dbText(description));
+        p.push(db.dbText("{}")); p.push(db.dbText("")); p.push(db.dbText("")); p.push(db.dbText("[]"));
+        p.push(db.dbText(matchJson)); p.push(db.dbText(approver)); p.push(db.dbText(verdict)); p.push(db.dbText(obligations));
+        p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO policy_rules (rule_id, tenant_id, name, description, subject_json, resource, operation, condition_json, match_json, approver_group, verdict, obligations_json, enabled, priority, created_ms, updated_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, 100, $13, $13)", p);
+        self.db.pool.release(conn);
+        return ruleId;
+    }
+
+    pub async fn setProvenance(self: PackRepository, ruleId: string, pack: string, version: int): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(pack)); p.push(db.dbInt(version)); p.push(db.dbText(ruleId));
+        let _r = await conn.exec("UPDATE policy_rules SET source_pack = $1, source_pack_version = $2 WHERE rule_id = $3", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn resolveControlItem(self: PackRepository, actSlug: string, controlId: string): string | undefined {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(actSlug)); p.push(db.dbText(controlId));
+        let r = await Repository<PackItemRow>(conn, "conformance_checklist").query(
+            "SELECT c.item_id FROM conformance_checklist c JOIN acts a ON a.act_id = c.act_id WHERE a.slug = $1 AND c.control_id = $2", p);
+        self.db.pool.release(conn);
+        if (r.items.size() == 0) { return undefined; }
+        return (r.items.getOr(0, PackItemRow{ item_id: "" })).item_id;
+    }
+
+    pub async fn setRuleControls(self: PackRepository, ruleId: string, itemIds: List<string>): void {
+        let conn = await self.db.pool.acquire();
+        let pd = list.List<DbValue>();
+        pd.push(db.dbText(ruleId));
+        let _d = await conn.exec("DELETE FROM rule_controls WHERE rule_id = $1", pd);
+        let i = 0;
+        while (i < itemIds.size()) {
+            let rcId = string.concat("rc-", random.randomHex(6));
+            let p = list.List<DbValue>();
+            p.push(db.dbText(rcId)); p.push(db.dbText(ruleId)); p.push(db.dbText(itemIds.at(i)));
+            let _r = await conn.exec("INSERT INTO rule_controls (id, rule_id, item_id, relation) VALUES ($1, $2, $3, 'satisfies') ON CONFLICT DO NOTHING", p);
+            i = i + 1;
+        }
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listPackArtifacts(self: PackRepository, tenant: string): Rows<PackArtifactRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<PackArtifactRow>(conn, "artifacts").query(
+            "SELECT a.artifact_id, a.name, a.tenant_id, COALESCE(v.body, '') AS body FROM artifacts a LEFT JOIN artifact_versions v ON v.version_id = a.active_version WHERE a.kind = 'pack' AND (a.tenant_id = $1 OR a.tenant_id = 'system') ORDER BY a.name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+}

@@ -1,0 +1,123 @@
+// POST /models/{id}/fairness -> evaluate a fairness test over {rows:[{group,
+// predicted_positive, actual_positive}]}, store it as a signed GRC attestation,
+// and return the report (acp model_fairness + acp_core::fairness).
+// NOTE vs acp: the demographic-parity and equal-opportunity gaps + overall
+// accuracy are computed faithfully; the attestation signature is simplified (the
+// per-tenant tenant_signer is not yet ported, so sig_hex is empty and pubkey_hex
+// is the control-plane key).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import datetime;
+import crypto.random;
+import Features.Models.Shared.ModelRepository;
+import Features.Models.Shared.modeljson;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+class ModelFairnessAgg {
+    pub n: int,
+    pub pp: int,
+    pub ap: int,
+    pub ppap: int,
+    pub correct: int,
+    init() { self.n = 0; self.pp = 0; self.ap = 0; self.ppap = 0; self.correct = 0; }
+}
+
+pub struct ModelFairnessHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelFairnessHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Capability.EditGrc)) { return Http.forbidden(); }
+        let th = ctx.request.getHeader("x-acp-tenant");
+        let tenant = if (th == undefined) (self.app.trustCfg.tenant) else (th ?? "");
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+
+        // rows may be a JSON array or a JSON string holding one.
+        let rowsNode = json.get(body, "rows");
+        let rowsArr = list.List<json.JsonValue>();
+        if (rowsNode.kind == 4) {
+            rowsArr = json.asArray(rowsNode) ?? list.List<json.JsonValue>();
+        } else if (rowsNode.kind == 3) {
+            let parsed = json.tryParse(json.asString(rowsNode) ?? "");
+            if (parsed != undefined) { rowsArr = json.asArray(parsed ?? json.null()) ?? list.List<json.JsonValue>(); }
+        }
+        if (rowsArr.size() == 0) { return Http.jsonResp("{\"ok\":false,\"error\":\"rows required\"}"); }
+
+        let groups = Map<string, ModelFairnessAgg>(8, string.hash);
+        let totalN = 0;
+        let totalCorrect = 0;
+        let i = 0;
+        while (i < rowsArr.size()) {
+            let r = rowsArr.get(i) ?? json.null();
+            let g = json.asString(json.get(r, "group")) ?? "";
+            let pp = json.asBool(json.get(r, "predicted_positive")) ?? false;
+            let ap = json.asBool(json.get(r, "actual_positive")) ?? false;
+            let existing = groups.get(g);
+            let agg = existing ?? ModelFairnessAgg();
+            if (existing == undefined) { groups.set(g, agg); }
+            agg.n = agg.n + 1;
+            if (pp) { agg.pp = agg.pp + 1; }
+            if (ap) { agg.ap = agg.ap + 1; }
+            if (pp && ap) { agg.ppap = agg.ppap + 1; }
+            if (pp == ap) { agg.correct = agg.correct + 1; totalCorrect = totalCorrect + 1; }
+            totalN = totalN + 1;
+            i = i + 1;
+        }
+
+        // Gaps across groups: demographic parity (predicted-positive rate) and
+        // equal opportunity (true-positive rate among the actually-positive).
+        let maxPp = 0.0;
+        let minPp = 2.0;
+        let maxTp = 0.0;
+        let minTp = 2.0;
+        let keys = groups.keys();
+        let k = 0;
+        while (k < keys.size()) {
+            let agg = groups.get(keys.at(k)) ?? ModelFairnessAgg();
+            let ppRate = if (agg.n > 0) ((agg.pp as double) / (agg.n as double)) else (0.0);
+            let tpRate = if (agg.ap > 0) ((agg.ppap as double) / (agg.ap as double)) else (0.0);
+            if (ppRate > maxPp) { maxPp = ppRate; }
+            if (ppRate < minPp) { minPp = ppRate; }
+            if (tpRate > maxTp) { maxTp = tpRate; }
+            if (tpRate < minTp) { minTp = tpRate; }
+            k = k + 1;
+        }
+        let dpGap = maxPp - minPp;
+        let eoGap = maxTp - minTp;
+        let overallAccuracy = if (totalN > 0) ((totalCorrect as double) / (totalN as double)) else (0.0);
+        let worstGap = if (dpGap > eoGap) (dpGap) else (eoGap);
+
+        let thresholdOpt = json.asFloat(json.get(body, "threshold"));
+        let passed = if (thresholdOpt == undefined) (true) else (worstGap <= (thresholdOpt ?? 1.0));
+
+        let report = Map<string, json.JsonValue>(4, string.hash);
+        report.set("demographic_parity_gap", jnum(dpGap));
+        report.set("equal_opportunity_gap", jnum(eoGap));
+        report.set("overall_accuracy", jnum(overallAccuracy));
+        let reportVal = json.object(report);
+
+        let status = if (passed) ("tested") else ("failed");
+        let nowMs = datetime.nowNs() / 1000000;
+        let gid = string.concat("grc-", random.randomHex(6));
+        let title = string.concat("Fairness test: ", id);
+        let refs = string.concat(string.concat("[\"", id), "\"]");
+        await self.repo.addAttestation(gid, id, title, status, json.stringify(reportVal), "", nowMs, self.app.trust.keypair.pubHex, "", refs, tenant);
+
+        let out = Map<string, json.JsonValue>(8, string.hash);
+        out.set("ok", json.bool(true));
+        out.set("id", json.str(gid));
+        out.set("report", reportVal);
+        out.set("max_gap", jnum(worstGap));
+        if (thresholdOpt == undefined) { out.set("threshold", json.null()); } else { out.set("threshold", jnum(thresholdOpt ?? 0.0)); }
+        out.set("passed", json.bool(passed));
+        return Http.okObj(out);
+    }
+}

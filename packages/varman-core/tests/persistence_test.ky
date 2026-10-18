@@ -1,0 +1,229 @@
+//! Gate for the persistence + evaluation-path layer.
+//!
+//! Everything here runs against the in-memory `store.MemStore`, which implements
+//! the SAME async `store.Store` interface the Postgres backend does, so no live
+//! database is needed. The three behaviours the slice promises are asserted:
+//!
+//!   1. append several records, idempotent re-append by decision id does not
+//!      duplicate, and `verify()` passes (signed heads + Merkle consistency via
+//!      `ledger.ky`);
+//!   2. `recordFromDecision` computes a stable `args_hash` equal to
+//!      `canonical.sha256HexOfJson(args)` and assembles the correct Record
+//!      fields and verdict;
+//!   3. a tampered head is rejected by `verify()`.
+//!
+//! The `PgStore` path and the `schema.ky` migration set are COMPILE-CHECKED
+//! here (the migration list is built and asserted, and `PgStore` is constructed
+//! in a never-invoked helper so its body type-checks against `data.db`); the
+//! live Postgres round-trip is DEFERRED and needs `ACP_PG_TEST_URL`.
+
+import assert;
+import string;
+import list;
+import map;
+import serde.json;
+import types;
+import canonical;
+import evalpath;
+import store;
+import schema;
+import ledger;
+import sign;
+import data.db;
+
+// RFC 8032 test-2 seed, reused as a deterministic signing key for the gate.
+const ED_SEED: string = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+
+// A fresh keypair for a store under test.
+fn keys(): sign.KeyPair {
+    return sign.keypairFromSeedHex(ED_SEED);
+}
+
+// A sample provenance stamp.
+fn prov(): types.Provenance {
+    return types.Provenance("sha256", "ed25519", "cedar@0.1", "varman@0.1", "ctx@2");
+}
+
+// A JSON args object: {"amount_cents": 90000, "to": "acct-7"}.
+fn sampleArgs(): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("amount_cents", json.number(90000));
+    m.set("to", json.str("acct-7"));
+    return json.object(m);
+}
+
+// The same object with keys inserted in the opposite order, to prove the hash is
+// order independent.
+fn sampleArgsReordered(): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("to", json.str("acct-7"));
+    m.set("amount_cents", json.number(90000));
+    return json.object(m);
+}
+
+// An ActionContext for a payment-charge tool call.
+fn sampleCtx(): evalpath.ActionContext {
+    return evalpath.ActionContext(
+        "agent-9",
+        types.Principal("alice", true),
+        "sess-42",
+        "payments.charge",
+        sampleArgs(),
+        types.Impact(types.BlastRadius.High, "impact@1.3"));
+}
+
+// A deny decision for that call.
+fn sampleDecision(): types.Decision {
+    return types.Decision(
+        types.Verdict.Deny,
+        "rule-7",
+        "amount_cents > 50000",
+        "policyhashxyz",
+        list.List<string>(),
+        "over the auto-approve ceiling",
+        types.Impact(types.BlastRadius.High, "impact@1.3"));
+}
+
+// Builds a distinct record for seq/tool via the evaluation path.
+fn recFor(seq: long, tool: string): types.Record {
+    let ctx = evalpath.ActionContext(
+        "agent-9",
+        types.Principal("alice", true),
+        "sess-42",
+        tool,
+        sampleArgs(),
+        types.Impact(types.BlastRadius.Low, "impact@1.3"));
+    return evalpath.recordFromDecision(ctx, sampleDecision(), seq, 1700000000000 + seq, `hlc-${seq}`, prov());
+}
+
+@test
+async fn mem_store_appends_are_idempotent_and_verify(): void {
+    let kp = keys();
+    let st = store.newMemStore(kp.privHex, kp.pubHex);
+
+    let s0 = await st.appendRecord("d0", recFor(0, "fs.read"));
+    let s1 = await st.appendRecord("d1", recFor(1, "fs.write"));
+    let s2 = await st.appendRecord("d2", recFor(2, "payments.charge"));
+    assert.equalInt(s0 as int, 0);
+    assert.equalInt(s1 as int, 1);
+    assert.equalInt(s2 as int, 2);
+    assert.equalInt(st.led.size(), 3);
+
+    // Idempotent re-append of an existing decision id: same seq, no new leaf.
+    let again = await st.appendRecord("d1", recFor(99, "fs.write"));
+    assert.equalInt(again as int, 1);
+    assert.equalInt(st.led.size(), 3);
+    assert.equalInt(st.records.size(), 3);
+
+    // Signed heads + Merkle consistency check.
+    assert.isTrue(await st.verify());
+
+    // One head per real append, in ascending size order.
+    let heads = await st.allHeads();
+    assert.equalInt(heads.size(), 3);
+    assert.equalInt(heads.at(2).sth.treeSize as int, 3);
+
+    // headAt / recordAt round-trips.
+    let h2 = await st.headAt(2);
+    assert.isFalse(h2 == undefined);
+    let r1 = await st.recordAt(1);
+    assert.isFalse(r1 == undefined);
+    let rr = r1 ?? recFor(0, "x");
+    assert.equalStr(rr.tool, "fs.write");
+
+    // args_blob is independent and idempotent.
+    await st.putArgsBlob("deadbeef", "{\"k\":1}");
+    await st.putArgsBlob("deadbeef", "{\"k\":1}");
+    assert.isTrue(st.argsBlobs.has("deadbeef"));
+    assert.equalInt(st.argsBlobs.size(), 1);
+}
+
+@test
+async fn record_from_decision_hashes_args_and_maps_fields(): void {
+    let ctx = sampleCtx();
+    let dec = sampleDecision();
+    let rec = evalpath.recordFromDecision(ctx, dec, 5, 1700000000000, "hlc-005", prov());
+
+    // args_hash is exactly the canonical SHA-256 of the args, and order stable.
+    let expected = canonical.sha256HexOfJson(sampleArgs());
+    assert.equalStr(rec.argsHash, expected);
+    assert.equalStr(rec.argsHash, canonical.sha256HexOfJson(sampleArgsReordered()));
+    assert.equalStr(evalpath.argsHashOf(ctx), expected);
+
+    // Fields from the context.
+    assert.equalStr(rec.agentId, "agent-9");
+    assert.equalStr(rec.principal.id, "alice");
+    assert.isTrue(rec.principal.verified);
+    assert.equalStr(rec.sessionId, "sess-42");
+    assert.equalStr(rec.tool, "payments.charge");
+
+    // Fields from the decision.
+    assert.equalStr(rec.verdict.toSnake(), "deny");
+    assert.equalStr(rec.ruleId ?? "", "rule-7");
+    assert.equalStr(rec.matched ?? "", "amount_cents > 50000");
+    assert.equalStr(rec.policyHash, "policyhashxyz");
+    assert.equalStr(rec.reason ?? "", "over the auto-approve ceiling");
+    assert.equalStr(rec.impact.level.toSnake(), "high");
+
+    // Fields from the caller / fixed.
+    assert.equalInt(rec.schema, 1);
+    assert.equalInt(rec.seq as int, 5);
+    assert.equalStr(rec.hlc, "hlc-005");
+    assert.isTrue(rec.toolServerFingerprint == undefined);
+
+    // The assembled record verifies when appended to a store.
+    let kp = keys();
+    let st = store.newMemStore(kp.privHex, kp.pubHex);
+    let seq = await st.appendRecord("dec-5", rec);
+    assert.equalInt(seq as int, 0);
+    assert.isTrue(await st.verify());
+}
+
+@test
+async fn tampered_head_is_rejected(): void {
+    let kp = keys();
+    let st = store.newMemStore(kp.privHex, kp.pubHex);
+    let s0 = await st.appendRecord("d0", recFor(0, "fs.read"));
+    let s1 = await st.appendRecord("d1", recFor(1, "fs.write"));
+    assert.isTrue(await st.verify());
+
+    // Rewrite the latest head's root to a value the key never signed and the
+    // leaves do not reconstruct. allHeads() returns the live list.
+    let heads = await st.allHeads();
+    let last = heads.size() - 1;
+    let orig = heads.at(last);
+    let bogus = types.SignedTreeHead(
+        orig.sth.treeSize,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        orig.sth.timestampMs);
+    heads.set(last, ledger.HeadEntry(bogus, orig.sigHex));
+
+    assert.isFalse(await st.verify());
+}
+
+// --- PgStore + schema: compile-checked only (live round-trip deferred) ------
+
+@test
+fn schema_migration_set_is_well_formed(): void {
+    let ms = schema.migrations();
+    assert.equalInt(ms.size(), 4);
+    assert.equalInt(ms.at(0).version as int, 1);
+    assert.equalStr(ms.at(0).name, "create_records");
+
+    // The records DDL carries the UNIQUE decision_id idempotency key.
+    assert.contains(schema.recordsUpSql(), "decision_id TEXT NOT NULL UNIQUE");
+    // The append-only guard is present on both evidence tables.
+    assert.contains(schema.migrations().at(3).up, "append-only");
+    assert.contains(schema.recordsTriggerSql(), "BEFORE UPDATE OR DELETE ON records");
+    assert.contains(schema.treeHeadsTriggerSql(), "BEFORE UPDATE OR DELETE ON tree_heads");
+    // The operator role-hardening helper is offered.
+    assert.contains(schema.appRoleHardeningSql("varman_app"), "REVOKE UPDATE, DELETE");
+}
+
+// Constructs a PgStore without connecting, so its body type-checks against the
+// data.db seam. Never invoked (no live connection in this gate); its presence is
+// what forces the compile check of the Postgres path. The result type is
+// inferred (the `store` module name reserves the bare `store.PgStore` form).
+fn buildPgStore(conn: db.Connection): void {
+    let pg = store.newPgStore(conn, "", "");
+}

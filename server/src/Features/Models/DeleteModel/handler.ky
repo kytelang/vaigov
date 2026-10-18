@@ -1,0 +1,22 @@
+// POST /models/{id}/delete -> delete a model (RegisterApp). Returns {ok:true}.
+import web.routing;
+import web.response;
+import Features.Models.Shared.ModelRepository;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct ModelDeleteHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelDeleteHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Capability.RegisterApp)) { return Http.forbidden(); }
+        let th = ctx.request.getHeader("x-acp-tenant");
+        let tenant = if (th == undefined) (self.app.trustCfg.tenant) else (th ?? "");
+        let id = ctx.param("id");
+        await self.repo.delete(id, tenant);
+        return Http.jsonResp("{\"ok\":true}");
+    }
+}

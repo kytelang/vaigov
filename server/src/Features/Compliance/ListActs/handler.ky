@@ -1,0 +1,38 @@
+// GET /acts -> {acts:[...]} framework (act) metadata.
+import string;
+import list;
+import map;
+import serde.json;
+import controls;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct ActsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: ActsHandler, ctx: routing.Context): response.Response {
+        let fws = controls.frameworks();
+        let arr = List<json.JsonValue>();
+        let i = 0;
+        while (i < fws.size()) {
+            let f = fws.at(i);
+            let m = Map<string, json.JsonValue>(8, string.hash);
+            m.set("slug", json.str(f.slug));
+            m.set("label", json.str(f.label));
+            m.set("version", json.str(f.version));
+            m.set("framework_type", json.str(f.frameworkType));
+            m.set("effective_date", json.str(f.effectiveDate));
+            m.set("record_keeping_reference", json.str(f.recordKeepingReference));
+            m.set("source", json.str(f.source));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("acts", json.array(arr));
+        return Http.jsonResp(json.stringify(json.object(out)));
+    }
+}

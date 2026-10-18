@@ -1,0 +1,56 @@
+// GET /policy-packs -> the catalogue, each marked installed/update_available for this tenant.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+import Domain.Dtos.PackRows;
+
+pub struct CatalogueHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CatalogueHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let installed = await self.repo.listInstalled(tenant);
+        let byslug = Map<string, InstalledPackRow>(8, string.hash);
+        let k = 0;
+        while (k < installed.items.size()) {
+            let row = installed.items.getOr(k, InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 });
+            byslug.set(row.slug, row);
+            k = k + 1;
+        }
+        let packs = packdata.builtinPacks();
+        let out = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < packs.size()) {
+            let p = packs.at(i);
+            let slug = json.asString(json.get(p, "slug")) ?? "";
+            let ver = (json.asNumber(json.get(p, "version")) ?? 1) as int;
+            let inst = byslug.get(slug);
+            let isActive = inst != undefined && string.eql((inst ?? InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 }).status, "active");
+            let instVer = if (inst != undefined) ((inst ?? InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 }).version) else (0);
+            let m = Map<string, json.JsonValue>(10, string.hash);
+            m.set("slug", json.str(slug));
+            m.set("title", json.get(p, "title"));
+            m.set("framework_slug", json.get(p, "framework_slug"));
+            m.set("region", json.get(p, "region"));
+            m.set("version", json.get(p, "version"));
+            m.set("description", json.get(p, "description"));
+            m.set("installed", json.bool(isActive));
+            m.set("installed_version", if (inst != undefined) (json.number(instVer as long)) else (json.null()));
+            m.set("update_available", json.bool(isActive && instVer < ver));
+            out.push(json.object(m));
+            i = i + 1;
+        }
+        let r = Map<string, json.JsonValue>(2, string.hash);
+        r.set("packs", json.array(out));
+        return Http.okObj(r);
+    }
+}

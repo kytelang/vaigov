@@ -1,0 +1,275 @@
+//! The structured, signed violation record (design-refinements R1 + R4).
+//!
+//! A violation captured at the OPA/Envoy edge is parsed out of the OPA
+//! decision-log JSON into a typed record carrying the prompt that was judged,
+//! the policy/rule that fired, the verdict, and (later) the ticket raised
+//! against it. Each record is Ed25519-signed over the JCS-canonical bytes of its
+//! immutable core, and chained to the previous record's signature, so a stored
+//! record cannot be edited, deleted, or reordered without detection. The signing
+//! primitive and canonical encoding are reused verbatim from `varman-core`
+//! (`sign`, `canonical`), so the control plane verifies with the same code.
+//!
+//! The record is a `class` (reference semantics): it owns several string fields
+//! and is held in a list and mutated in place (ticket fields fill in later), so
+//! value semantics would add needless ARC copies.
+
+import serde.json;
+import canonical;
+import sign;
+import string;
+import map;
+
+/// One captured policy violation, in structured form.
+pub class Violation {
+    pub id: long,                  // monotonic local id (the signing subject)
+    pub capturedMs: long,          // wall-clock at ingest
+    pub tenant: string,            // x-acp-tenant (which customer edge)
+    pub endpointHost: string,      // governed AI endpoint the call targeted
+    pub endpointPort: int,
+    pub principal: string,         // who/what made the call
+    pub systemId: string,          // registered AI system this call is attributed to ("" = unattributed)
+    pub prompt: string,            // the request content that was judged (per retention mode)
+    pub promptSha: string,         // sha256 of the full prompt (always kept, even when redacted)
+    pub verdict: string,           // deny / step_up / shadow
+    pub policyId: string,          // which policy fired
+    pub policyName: string,
+    pub ruleRegoPath: string,      // exact Rego path, for traceability
+    pub decisionId: string,        // correlates to OPA's own decision-log line
+    pub ticketNumber: string,      // filled once a ticket is raised; "" until then
+    pub ticketStatus: string,      // open / acknowledged / closed; "" until raised
+    pub prevSigHex: string,        // signature of the previous record (chain link)
+    pub sigHex: string,            // Ed25519 signature over this record's canonical core
+    pub flushState: string,        // "pending" | "confirmed"
+
+    init() {
+        self.id = 0;
+        self.capturedMs = 0;
+        self.tenant = "";
+        self.endpointHost = "";
+        self.endpointPort = 0;
+        self.principal = "";
+        self.systemId = "";
+        self.prompt = "";
+        self.promptSha = "";
+        self.verdict = "";
+        self.policyId = "";
+        self.policyName = "";
+        self.ruleRegoPath = "";
+        self.decisionId = "";
+        self.ticketNumber = "";
+        self.ticketStatus = "";
+        self.prevSigHex = "";
+        self.sigHex = "";
+        self.flushState = "pending";
+    }
+}
+
+/// A trimmed string field from a JSON object, or "".
+fn js(v: json.JsonValue, key: string): string {
+    if (v.kind != 5 || !json.has(v, key)) { return ""; }
+    return json.asString(json.get(v, key)) ?? "";
+}
+
+/// A nested object child, or an empty object value.
+fn jo(v: json.JsonValue, key: string): json.JsonValue {
+    if (v.kind == 5 && json.has(v, key)) { return json.get(v, key); }
+    return json.object(Map<string, json.JsonValue>(1, string.hash));
+}
+
+/// Parses one OPA decision-log record (JSON text) into a Violation. Tolerant of
+/// shape: it reads the common decision-log fields (`decision_id`, `path`,
+/// `input`, `result`) and the attributes we can map, defaulting the rest. The
+/// precise content shape arrives with the content firewall; until then this
+/// captures what the routing-level decision carries plus any `prompt` present.
+///
+/// `redact` selects the prompt retention mode: when true, `prompt` holds only a
+/// short preview and `promptSha` the full hash; when false, `prompt` is verbatim.
+pub fn parseDecision(raw: string, tenant: string, redact: bool): Violation {
+    let v = Violation();
+    v.tenant = tenant;
+    let root = json.parse(raw);
+    if (root.kind != 5) {
+        // Not an object we understand: keep the raw text as the prompt so nothing
+        // is silently lost, and mark it unparsed.
+        v.prompt = promptForMode(raw, redact);
+        v.promptSha = canonical.sha256HexOfString(raw);
+        v.verdict = "deny";
+        v.ruleRegoPath = "unparsed";
+        return v;
+    }
+
+    v.decisionId = js(root, "decision_id");
+    v.ruleRegoPath = js(root, "path");
+
+    let input = jo(root, "input");
+    // host/port/principal live under the ext_authz-style input attributes when
+    // present; we also accept flat keys for hand-posted records and tests.
+    v.endpointHost = firstNonEmpty(js(input, "host"), js(jo(input, "endpoint"), "host"));
+    v.principal = firstNonEmpty(js(input, "principal"), js(input, "subject"));
+    // AI-system attribution. The only edge signal that reliably identifies which
+    // registered system made a call is an explicit identity tag the caller (or the
+    // caller's egress sidecar/proxy) stamps on the request: the `x-varman-system`
+    // header, surfaced here as input.system_id / input.system. A network packet
+    // carries no system identity on its own, so an untagged call stays "" and is
+    // reported as unattributed; the resolver (sysresolve) can still map a known
+    // principal to a system when a mapping has been published.
+    v.systemId = firstNonEmpty(js(input, "system_id"), js(input, "system"));
+    let portStr = firstNonEmpty(js(input, "port"), js(jo(input, "endpoint"), "port"));
+    v.endpointPort = parsePort(portStr);
+
+    // the prompt/content that was judged
+    let rawPrompt = firstNonEmpty(js(input, "prompt"), js(input, "body"));
+    v.promptSha = canonical.sha256HexOfString(rawPrompt);
+    v.prompt = promptForMode(rawPrompt, redact);
+
+    // verdict + policy from the result, with routing-path fallbacks
+    let result = jo(root, "result");
+    v.verdict = normaliseVerdict(result);
+    v.policyId = firstNonEmpty(js(result, "policy_id"), js(input, "policy_id"));
+    v.policyName = firstNonEmpty(js(result, "policy"), js(result, "policy_name"));
+    if (string.eql(v.policyName, "") && !string.eql(v.ruleRegoPath, "")) {
+        v.policyName = v.ruleRegoPath;
+    }
+    return v;
+}
+
+/// The prompt as stored under the retention mode: verbatim, or a short preview
+/// (first 120 chars) when redacting. The full hash is always kept separately.
+pub fn promptForMode(raw: string, redact: bool): string {
+    if (!redact) { return raw; }
+    if (raw.length <= 120) { return raw; }
+    return string.slice(raw, 0, 120) + "…";
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+    if (!string.eql(a, "")) { return a; }
+    return b;
+}
+
+fn parsePort(s: string): int {
+    if (string.eql(s, "")) { return 443; }
+    let p = string.parseInt(s) ?? 443;
+    if (p == 0) { return 443; }
+    return p as int;
+}
+
+/// Maps an OPA result into our three-way violation verdict. Accepts an explicit
+/// `verdict` string, or an `allow` boolean (allow=false -> deny), defaulting to
+/// deny (fail-closed: an unrecognised non-allow result is treated as a block).
+fn normaliseVerdict(result: json.JsonValue): string {
+    let explicit = js(result, "verdict");
+    if (string.eql(explicit, "deny") || string.eql(explicit, "step_up") || string.eql(explicit, "shadow")) {
+        return explicit;
+    }
+    if (result.kind == 5 && json.has(result, "allow")) {
+        let a = json.get(result, "allow");
+        if (a.kind == 1 && a.bval) { return "allow"; }
+        return "deny";
+    }
+    return "deny";
+}
+
+/// The immutable, signed core of the record as a JSON object. Excludes the
+/// signature itself and the mutable ticket fields; includes `prev_sig` so the
+/// signature also attests the chain link. Signing uses the JCS-canonical bytes
+/// of this object, so field insertion order here does not matter.
+pub fn canonicalDoc(v: Violation): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("id", json.str(`${v.id}`));
+    m.set("captured_ms", json.str(`${v.capturedMs}`));
+    m.set("tenant", json.str(v.tenant));
+    m.set("endpoint_host", json.str(v.endpointHost));
+    m.set("endpoint_port", json.str(`${v.endpointPort}`));
+    m.set("principal", json.str(v.principal));
+    // Attribution is part of the signed core: once a violation is attributed to a
+    // system, that attribution cannot be altered without breaking the signature.
+    m.set("system_id", json.str(v.systemId));
+    // Both the stored prompt (preview or full, per retention mode, fixed at
+    // capture) AND its full-prompt hash are signed, so editing the displayed
+    // text is detected while redaction still works.
+    m.set("prompt", json.str(v.prompt));
+    m.set("prompt_sha", json.str(v.promptSha));
+    m.set("verdict", json.str(v.verdict));
+    m.set("policy_id", json.str(v.policyId));
+    m.set("policy_name", json.str(v.policyName));
+    m.set("rule_rego_path", json.str(v.ruleRegoPath));
+    m.set("decision_id", json.str(v.decisionId));
+    m.set("prev_sig", json.str(v.prevSigHex));
+    return json.object(m);
+}
+
+/// Signs `v` in place under `privHex` (128-hex Ed25519 private key), chaining to
+/// `prevSigHex`. Sets `v.prevSigHex` and `v.sigHex`. The signature is over the
+/// canonical bytes of `canonicalDoc(v)`.
+pub fn signInto(v: Violation, privHex: string, prevSigHex: string): void {
+    v.prevSigHex = prevSigHex;
+    let bytes = canonical.canonicalBytesOfJson(canonicalDoc(v));
+    v.sigHex = sign.signHex(privHex, bytes as ptr, bytes.length);
+}
+
+/// Verifies `v`'s signature under `pubHex`, including that `prev_sig` matches the
+/// expected chain predecessor. Returns true only if both hold.
+pub fn verify(v: Violation, pubHex: string, expectedPrevSigHex: string): bool {
+    if (!string.eql(v.prevSigHex, expectedPrevSigHex)) { return false; }
+    if (string.eql(v.sigHex, "")) { return false; }
+    let bytes = canonical.canonicalBytesOfJson(canonicalDoc(v));
+    return sign.verifyHex(pubHex, bytes as ptr, bytes.length, v.sigHex);
+}
+
+/// Serialises the FULL record (including sig, prev_sig, ticket fields, flush
+/// state) to a JSON string for durable storage and for the console/flush paths.
+pub fn toJson(v: Violation): string {
+    let m = Map<string, json.JsonValue>(20, string.hash);
+    m.set("id", json.str(`${v.id}`));
+    m.set("captured_ms", json.str(`${v.capturedMs}`));
+    m.set("tenant", json.str(v.tenant));
+    m.set("endpoint_host", json.str(v.endpointHost));
+    m.set("endpoint_port", json.str(`${v.endpointPort}`));
+    m.set("principal", json.str(v.principal));
+    m.set("system_id", json.str(v.systemId));
+    m.set("prompt", json.str(v.prompt));
+    m.set("prompt_sha", json.str(v.promptSha));
+    m.set("verdict", json.str(v.verdict));
+    m.set("policy_id", json.str(v.policyId));
+    m.set("policy_name", json.str(v.policyName));
+    m.set("rule_rego_path", json.str(v.ruleRegoPath));
+    m.set("decision_id", json.str(v.decisionId));
+    m.set("ticket_number", json.str(v.ticketNumber));
+    m.set("ticket_status", json.str(v.ticketStatus));
+    m.set("prev_sig", json.str(v.prevSigHex));
+    m.set("sig", json.str(v.sigHex));
+    m.set("flush_state", json.str(v.flushState));
+    return json.stringify(json.object(m));
+}
+
+/// Rebuilds a Violation from a stored JSON string (the inverse of `toJson`).
+pub fn fromJson(raw: string): Violation {
+    let v = Violation();
+    let o = json.parse(raw);
+    if (o.kind != 5) { return v; }
+    v.id = string.parseLong(js(o, "id")) ?? 0;
+    v.capturedMs = string.parseLong(js(o, "captured_ms")) ?? 0;
+    v.tenant = js(o, "tenant");
+    v.endpointHost = js(o, "endpoint_host");
+    // Deserialisation must be LOSSLESS: restore the exact stored port, never the
+    // decision-path parsePort() which remaps 0/"" -> 443. A content-firewall
+    // record has no port (0); signing stored endpoint_port="0", so reloading it
+    // as 443 would change the canonical bytes and break the signature. This was
+    // the chronic verified=false on reload.
+    v.endpointPort = (string.parseInt(js(o, "endpoint_port")) ?? 0) as int;
+    v.principal = js(o, "principal");
+    v.systemId = js(o, "system_id");
+    v.prompt = js(o, "prompt");
+    v.promptSha = js(o, "prompt_sha");
+    v.verdict = js(o, "verdict");
+    v.policyId = js(o, "policy_id");
+    v.policyName = js(o, "policy_name");
+    v.ruleRegoPath = js(o, "rule_rego_path");
+    v.decisionId = js(o, "decision_id");
+    v.ticketNumber = js(o, "ticket_number");
+    v.ticketStatus = js(o, "ticket_status");
+    v.prevSigHex = js(o, "prev_sig");
+    v.sigHex = js(o, "sig");
+    v.flushState = firstNonEmpty(js(o, "flush_state"), "pending");
+    return v;
+}

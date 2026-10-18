@@ -1,0 +1,168 @@
+# 3. The MCP proxy
+
+`acp-agent mcp` governs an agent's **tool calls over MCP** (the Model Context Protocol). It is the
+`mcp` capability of the [workstation agent](01-overview.md): one binary, run here as an MCP proxy. It is a
+transparent interception proxy: it relays the JSON-RPC stream between the agent and the MCP server
+verbatim, parsing out only `tools/call` frames, and it intervenes only to deny, hold for approval,
+or rewrite arguments. Invalid or unrelated frames are relayed untouched and are never a point of
+failure.
+
+## Configure in the console, launch on the box
+
+An MCP proxy is an enforcement point: an agent binary you launch on a machine. Everything it enforces is configured in the console and fetched by the agent, so you do not hand-edit files on the workstation. The agent's identity is registered on the **Agents** page (grouped under **Teams**), the policy is authored and deployed on the **Policy** page, the content firewall on the **Content firewall** page, and the per-group capability set on the **Agent config** page. The one thing you run on the box is the launch command below, pointed at the control plane with `--control-plane`. The proxy then pulls the signed policy and the firewall config over HTTP and keeps them fresh on an interval, so a deploy made in the console reaches the fleet without redeploying agents.
+
+## Two transports
+
+### stdio
+
+The common case: the proxy launches the MCP server as a child process and sits on its stdio.
+
+```sh
+acp-agent mcp stdio \
+  --control-plane http://<control-plane-host>:8787 \
+  --policy policy.yaml \
+  --ledger evidence.db \
+  --key signing.key \
+  --agent-id agt-abc123 \
+  --agent-token <token> \
+  -- your-mcp-server --its --args
+```
+
+Everything after `--` is the command to launch. `--control-plane` expands into the registry, firewall,
+reporting, evidence and approvals URLs, so you set one URL rather than five. The agent verifies its
+identity against the registry, then governs every `tools/call` the agent makes to that server.
+
+### HTTP
+
+For a streamable-HTTP MCP server, run it as a reverse proxy:
+
+```sh
+acp-agent mcp http --addr 127.0.0.1:9000 --upstream http://localhost:8080 \
+  --control-plane http://<control-plane-host>:8787 \
+  --policy policy.yaml --ledger evidence.db --key signing.key
+```
+
+The HTTP transport adds a concurrency cap: a burst beyond the limit is shed with a 503 and a
+`Retry-after`, so it cannot be exhausted, and it can stamp an enforcement attestation header for the
+[guard](06-guard.md) to check.
+
+## Server-driven capabilities
+
+An agent's capabilities do not have to be spelled out on the command line. Configure them from the
+console **Agent config** page, keyed by **directory group**: register a group, then set which
+capabilities that group runs, on which addresses, and their upstreams. The control plane stores one
+config per group, so it scales across a fleet without a config per machine. Then start the agent with
+only its identity:
+
+```sh
+acp-agent run --control-plane http://<control-plane>:8787 --principal <user@corp>
+```
+
+With no capability flags, `run` resolves the user's group (from `--principal`, via the control plane,
+or `--principal-groups`), fetches that group's config, and enables what it says (for example the
+forward-proxy firewall on the configured address). Capability flags on the command line still win, for
+hosts that need a local override.
+
+## Central policy over HTTP
+
+A remote proxy does not need a local policy file. With `--control-plane <url>` (which adds
+`--policy-url`), the proxy fetches the **signed** policy the console deployed to the control plane,
+verifies its Ed25519 signature and source hash before enforcing (fail-closed on either), and re-fetches
+it every 30 seconds so a new deploy reaches the fleet without redeploying agents. Pin the signing key
+with `--policy-pubkey <hex>` so a spoofed control plane cannot push a policy signed by another key. An
+explicit `--policy` or `--policy-dir` still wins, for air-gapped or pinned-local setups.
+
+## The enforcement pipeline
+
+::: warning Implementation status (varman today)
+This chapter describes the parity (Rust) workstation MCP proxy. The Kyte varman build does not ship a
+standalone `acp-agent mcp` binary: runtime enforcement runs through the server plus the Envoy
+`ext_authz` content-firewall sidecar and the served OPA / Rego policy bundle, on the **request path
+only**. In the pipeline below, the response-screening step, the redact obligation and the write-to-the-
+local-ledger-before-forward step are the parity design and are not wired on the varman edge today (the
+decision ledger is not populated at runtime, see [chapter 9](09-evidence.md)). Read this as the intended
+model.
+:::
+
+For each tool call the proxy runs, in order:
+
+1. **Identity.** Resolve the verified agent (and human principal, if OIDC is configured).
+2. **Policy.** Build the request context (subject, resource, operation, args, derived class flags)
+   and evaluate the signed policy. Fail-closed on any error.
+3. **Break-glass.** Apply any active kill-switch grant, which can override an allow to a deny.
+4. **Content firewall.** If enabled, scan the tool arguments for injection, PII and secrets.
+5. **Trajectory and data boundary.** If enabled, check the action against the session's history and
+   the destination.
+6. **Obligations.** Apply confirm (to step-up) and rate-limit (to deny when exhausted). The redact
+   obligation (rewrite the frame) is parity design and is not executed on the varman edge yet.
+7. **Record, then forward.** The intended guarantee is to write the decision to the ledger **before**
+   forwarding and fail closed if the evidence write fails, so nothing happens without a record. On the
+   varman build the runtime ledger append is not yet wired (see [chapter 9](09-evidence.md)).
+8. **Response screening.** Screen the tool result for indirect injection in returned content, and
+   check tool-integrity pins for a rug-pull. (Response screening is request-path-only on varman today,
+   so this step is parity design.)
+
+## Flags
+
+| Flag | Effect |
+| --- | --- |
+| `--control-plane <url>` | the one URL to set: expands into `--registry-url`, `--firewall-url`, `--report-url`, `--evidence-url`, `--approvals-url` and `--policy-url`. Any of those set explicitly overrides the expansion |
+| `--policy <file>` | the policy file to enforce |
+| `--policy-dir <dir>` | a signed policy-store directory to watch and hot-reload |
+| `--policy-url <url>` | fetch the signed policy from the control plane over HTTP, verify it, and refresh every 30s (auto-set by `--control-plane`). An explicit `--policy` or `--policy-dir` takes precedence |
+| `--policy-pubkey <hex>` | pin the policy signing key: a fetched policy signed by any other key is refused (fail-closed) |
+| `--ledger <db>` | the evidence ledger to append to |
+| `--key <file>` | the Ed25519 signing key (generated 0600 if absent; see below for HSM) |
+| `--registry <file>` | verify the agent against a local registry file |
+| `--registry-url <server>` | verify the agent against the control plane's database (no registry file); preferred once agents are registered from the console |
+| `--agent-id`, `--agent-token` | the calling agent's identity and one-time token |
+| `--trajectory <policy.yaml>` | enable sequence governance ([chapter 11](11-containment.md)) |
+| `--data-boundary <policy.yaml>` | enable destination-aware DLP ([chapter 11](11-containment.md)) |
+| `--content-firewall` | enable the signature content firewall on tool arguments |
+| `--content-ml <model.json>` | also load the trained ML injection classifier |
+| `--scan-url <url>` | send each content part to an external scanner hook ([chapter 10](10-content-firewall.md)) |
+| `--block-on-scanner-error` | fail closed if the external scanner is unreachable or replies off-contract (default: fail open to the built-in engine) |
+| `--tool-pins <file>` | enable tool-integrity pinning (rug-pull detection) |
+| `--pin-pg <dsn>` | share tool-integrity pins across replicas via Postgres |
+| `--enforcement-key <hex>` | stamp the enforcement attestation the guard verifies |
+| `--report-url <server>` | report a heartbeat and non-allow events to the control plane |
+| `--report-token <tok>` | the shared token the control-plane reporting routes require (`ACP_REPORT_TOKEN`) |
+| `--proxy-id <id>` | the identifier this PEP reports under (defaults to the agent id, else `proxy`) |
+| `--evidence-url <server>` | push every decision record (allow and deny) to the central fleet-evidence store |
+| `--approvals-url <server>` | register step-up holds with the control plane and reconcile the operator's decision back |
+| `--entra-tenant`, `--entra-audience` | resolve the human principal per request via Microsoft Entra |
+
+## Environment
+
+- `ACP_LEDGER_KEK` / `ACP_LEDGER_KEK_FILE`: encrypt argument payloads at rest ([chapter 9](09-evidence.md)).
+- `ACP_PKCS11_MODULE` (+ `ACP_PKCS11_SLOT`, `ACP_PKCS11_PIN`, `ACP_PKCS11_LABEL`): sign evidence on
+  an HSM instead of the file key ([chapter 9](09-evidence.md)).
+- `ACP_LOG` / `RUST_LOG` and `ACP_LOG_FORMAT=json`: logging level and format ([chapter 14](14-operations.md)).
+
+The proxy's operational logs go to stderr; stdout carries only the JSON-RPC protocol, so structured
+logging never corrupts the stream.
+
+## Running modes and their safety trade-offs
+
+Beyond the flags above, three modes change how strictly the proxy enforces. Two of them deliberately
+weaken the default guarantees, so use them knowingly.
+
+| Flag | Effect | Safety impact |
+| --- | --- | --- |
+| `--shadow` | evaluate and record every decision, but never block; the call is always forwarded | observe-only. Nothing is enforced. Use to gather real traffic before you enforce (feeds `acp learn` and `acp posture`), never as a steady state |
+| `--fail-open` | on an evidence-write failure, forward the call ungoverned instead of failing closed | **weakens the core guarantee.** By default the proxy fails **closed**: if it cannot record a decision, it does not forward. `--fail-open` drops that, so a ledger outage becomes an ungoverned window. The proxy warns loudly at startup; use only for controlled testing |
+| `--tool-hash <hex>` | verify the tool-server binary's fingerprint before launching it, and refuse to start if it does not match | strengthens supply-chain safety: a swapped tool binary is caught at launch |
+
+Several flags wire the proxy into the control plane. `--report-url <control-plane>` makes it post a
+heartbeat every ten seconds and a governance event on each non-allow decision (lighting up the console
+liveness, alerts and violation views), `--report-token <token>` presents the shared token those routes
+require, and `--proxy-id <id>` sets the name it reports under. `--evidence-url <control-plane>` pushes
+every decision record (allow and deny) to the central fleet-evidence store ([chapter 9](09-evidence.md)),
+and `--approvals-url <control-plane>` registers each step-up hold with the console approvals inbox and
+reconciles the operator's decision back to the proxy ([chapter 11](11-containment.md)). See
+[chapter 14](14-operations.md) for the monitoring surface. `--otel <endpoint>` streams OTLP traces to an
+OpenTelemetry collector.
+
+An MCP agent started with no `--policy` and no `--policy-dir` runs in transparent mode: it forwards every
+`tools/call` ungoverned and warns loudly that nothing is being enforced, so an accidental ungoverned run
+is visible in the logs rather than silent.

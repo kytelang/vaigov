@@ -1,0 +1,84 @@
+// Coverage matrix view as KYX (matches acp/console CoverageView.vue): four stat
+// tiles across the top, then a table of every enforceable control with how policy
+// covers it. Status badge: enforced -> ok, authored -> warn, gap -> bad. Themed
+// classes only; no literal braces in attribute values.
+import list;
+import string;
+import Features.Decisions.Shared.coverage;
+
+fn covTile(label: string, value: long, tone: string): Html {
+    let valueClass = if (string.eql(tone, "ok")) ("text-2xl font-semibold text-ok")
+        else if (string.eql(tone, "bad")) ("text-2xl font-semibold text-bad")
+        else if (string.eql(tone, "accent")) ("text-2xl font-semibold text-accent")
+        else ("text-2xl font-semibold text-txt");
+    return <div class="bg-panel border border-line rounded-xl px-4 py-3">
+        <div class="text-xs text-dim">{label}</div>
+        <div class={valueClass}>{`${value}`}</div>
+    </div>;
+}
+
+fn covStatusBadge(s: string): Html {
+    if (string.eql(s, "enforced")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{s}</span>;
+    } else if (string.eql(s, "authored")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{s}</span>;
+    } else {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-bad">{s}</span>;
+    }
+}
+
+fn covRow(r: coverage.CoverageRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 uppercase text-xs text-dim whitespace-nowrap">{r.act}</td>
+        <td class="py-2 pr-4 font-mono text-xs text-dim whitespace-nowrap">{r.controlId}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{r.title}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{r.obligationType}</td>
+        <td class="py-2 pr-4 text-sm">{`${r.rules.size()}`}</td>
+        <td class="py-2 pr-4 text-sm">{`${r.decisions}`}</td>
+        <td class="py-2 pr-4 text-sm">{`${r.denies}`}</td>
+        <td class="py-2 pr-4">{covStatusBadge(r.status)}</td>
+    </tr>;
+}
+
+pub fn coveragePanel(data: coverage.CoverageData): Html {
+    return <div id="coverage" class="grid gap-4">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {covTile("Enforceable controls", data.total, "txt")}
+            {covTile("Authored (has rule)", data.authored, "accent")}
+            {covTile("Observed in decisions", data.observed, "ok")}
+            {covTile("Gaps (no rule)", data.gap, "bad")}
+        </div>
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Control coverage</h2>
+                <p class="text-xs text-dim">Enforceable controls across your enabled acts, and how policy covers each.</p>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                            <th class="py-2 pr-4">Act</th>
+                            <th class="py-2 pr-4">Control</th>
+                            <th class="py-2 pr-4">Title</th>
+                            <th class="py-2 pr-4">Obligation</th>
+                            <th class="py-2 pr-4">Rules</th>
+                            <th class="py-2 pr-4">Decisions</th>
+                            <th class="py-2 pr-4">Denies</th>
+                            <th class="py-2 pr-4">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {for (i in 0..data.rows.size()) {
+                            covRow(data.rows.at(i));
+                        }}
+                        {if (data.rows.size() == 0) {
+                            <tr><td colspan="8" class="py-10 text-center text-dim">
+                                No enforceable controls. Enable an act under Organisation, then author rules on the Policy screen and tag them to controls.
+                            </td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>;
+}

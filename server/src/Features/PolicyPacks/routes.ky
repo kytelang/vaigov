@@ -1,0 +1,67 @@
+// Policy packs feature route table (acp-compatible JSON over the shared `acp` db).
+// Covers the full /policy-packs/* surface (the Policy packs screen) + the read
+// side of the signed control packs (/packs, /packs/available). The signed-pack
+// WRITE side (POST /packs load + POST /packs/custom author) needs the acp-core
+// pack-signing + artifact store and is a follow-up (registered as flagged stubs).
+import web.app;
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Catalogue.handler;
+import Features.PolicyPacks.Installed.handler;
+import Features.PolicyPacks.Detail.handler;
+import Features.PolicyPacks.Redteam.handler;
+import Features.PolicyPacks.Install.handler;
+import Features.PolicyPacks.Uninstall.handler;
+import Features.PolicyPacks.Upgrade.handler;
+import Features.PolicyPacks.PacksList.handler;
+import Features.PolicyPacks.PacksAvailable.handler;
+import Features.PolicyPacks.PacksView.handler;
+import Features.PolicyPacks.PacksConsole.handler;
+
+// Flagged stubs for the signed control-pack write paths (acp-core pack signing).
+pub struct PackCustomHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: PackCustomHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(false));
+        m.set("error", json.str("custom control packs require the acp-core signing + artifact store (not yet ported)"));
+        return Http.okObj(m);
+    }
+}
+pub struct PackLoadHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: PackLoadHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(false));
+        m.set("error", json.str("loading a signed control pack requires acp-core pack verification (not yet ported)"));
+        return Http.okObj(m);
+    }
+}
+
+pub fn registerPolicyPacks(ctx: AppContext): void {
+    let repo = PackRepository(ctx.db);
+    // Console hypermedia view, registered BEFORE "/policy-packs/{slug}" so the
+    // literal "view" segment is not captured as a {slug}.
+    ctx.app.get("/policy-packs/view", PacksViewHandler(repo, ctx));
+    ctx.app.post("/console/packs/install", PacksInstallHandler(repo, ctx));
+    ctx.app.post("/console/packs/uninstall", PacksUninstallHandler(repo, ctx));
+    ctx.app.get("/policy-packs", CatalogueHandler(repo, ctx));
+    ctx.app.get("/policy-packs/installed", InstalledHandler(repo, ctx));
+    ctx.app.get("/policy-packs/{slug}", DetailHandler(repo, ctx));
+    ctx.app.get("/policy-packs/{slug}/redteam", RedteamHandler(repo, ctx));
+    ctx.app.post("/policy-packs/{slug}/install", InstallHandler(repo, ctx));
+    ctx.app.post("/policy-packs/{slug}/uninstall", UninstallHandler(repo, ctx));
+    ctx.app.post("/policy-packs/{slug}/upgrade", UpgradeHandler(repo, ctx));
+    ctx.app.get("/packs", PacksListHandler(repo, ctx));
+    ctx.app.get("/packs/available", PacksAvailableHandler(repo, ctx));
+    ctx.app.post("/packs/custom", PackCustomHandler(ctx));
+    ctx.app.post("/packs", PackLoadHandler(ctx));
+}

@@ -1,0 +1,284 @@
+//! Known-answer gate for the Varman trust core (hashing + merkle + sign).
+//!
+//! Every expected hash below is a REAL known answer computed independently with
+//! the shell (`shasum -a 256`, RFC 6962 trees built by hand), not a value read
+//! back from the implementation. "It compiles" is not the bar; these asserts
+//! are. The Ed25519 vector is RFC 8032 test 2.
+//!
+//! Shell derivation of the Merkle constants (leaf data is the ASCII bytes "L0"
+//! .. "L3"):
+//!   leaf(x) = SHA-256(0x00 || x)             node(l,r) = SHA-256(0x01 || l || r)
+//!   ROOT1   = leaf0
+//!   ROOT2   = node(leaf0, leaf1)
+//!   ROOT3   = node(node(leaf0, leaf1), leaf2)             (splitPoint(3) = 2)
+//!   ROOT4   = node(node(leaf0, leaf1), node(leaf2, leaf3)) (splitPoint(4) = 2)
+
+import bytes;
+import list;
+import string;
+import assert;
+import hashing;
+import merkle;
+import sign;
+
+// --- expected constants (shell-computed) ----------------------------------
+
+const EMPTY_ROOT: string = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const LEAF_OF_EMPTY: string = "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+const LEAF_OF_HELLO: string = "8a2a5c9b768827de5a9552c38a044c66959c68f6d2f21b5260af54d2f87db827";
+
+const ROOT1: string = "12403899e10d73557e1d37c2d1c3dc1686a9512034479aa25d06f1d80fc46069";
+const ROOT2: string = "926054f28bc88651ef446709206587f183c49ae5b0f1393caaeb104e54fcc50f";
+const ROOT3: string = "49b3ac37087cacbed8e89716b70f93b0440b87e22a573e8fefe5a4d15e827862";
+const ROOT4: string = "11170c8d45f48eb6ec89abd8dd8b6e07d153db5e70f8083841d6bb5e00f3f9f0";
+
+// RFC 8032 test 2 (1-byte message 0x72).
+const ED_SEED: string = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+const ED_PUB: string = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+const ED_MSG_HEX: string = "72";
+const ED_SIG: string = "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00";
+
+// --- helpers ----------------------------------------------------------------
+
+/// Raw byte buffer holding the ASCII bytes of `s` (caller frees).
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(if (n == 0) (1) else (n));
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+/// Leaf hash (hex) of the ASCII string `s`.
+fn leafOf(s: string): string {
+    let b = strBuf(s);
+    let h = hashing.leafHashHex(b, s.length);
+    bytes.free(b);
+    return h;
+}
+
+/// First `n` canonical test leaves ("L0".."L3") as a List of leaf hashes.
+fn leavesN(n: int): List<string> {
+    let names = List<string>();
+    names.push("L0"); names.push("L1"); names.push("L2"); names.push("L3");
+    let xs = List<string>();
+    let i = 0;
+    while (i < n) { xs.push(leafOf(names.at(i))); i = i + 1; }
+    return xs;
+}
+
+/// A MerkleLog pre-filled with the first `n` canonical test leaves.
+fn logN(n: int): merkle.MerkleLog {
+    let log = merkle.MerkleLog();
+    let leaves = leavesN(n);
+    let i = 0;
+    while (i < n) { log.appendHashHex(leaves.at(i)); i = i + 1; }
+    return log;
+}
+
+// --- hashing ----------------------------------------------------------------
+
+@test
+fn empty_root_is_sha256_of_empty(): void {
+    assert.isTrue(string.eql(hashing.emptyRootHex(), EMPTY_ROOT));
+}
+
+@test
+fn leaf_hash_of_empty_input(): void {
+    let b = strBuf("");
+    let h = hashing.leafHashHex(b, 0);
+    bytes.free(b);
+    assert.isTrue(string.eql(h, LEAF_OF_EMPTY));
+}
+
+@test
+fn leaf_hash_of_known_input(): void {
+    assert.isTrue(string.eql(leafOf("hello"), LEAF_OF_HELLO));
+}
+
+@test
+fn hex_round_trip(): void {
+    // hexDecode then hexEncode must reproduce the input exactly.
+    let b = hashing.hexDecode(ROOT4);
+    let back = hashing.hexEncode(b);
+    bytes.free(b);
+    assert.isTrue(string.eql(back, ROOT4));
+}
+
+// --- rootOf (RFC 6962 MTH), 1..4 leaves ------------------------------------
+
+@test
+fn root_of_one_leaf(): void {
+    assert.isTrue(string.eql(merkle.rootOf(leavesN(1)), ROOT1));
+}
+
+@test
+fn root_of_two_leaves(): void {
+    assert.isTrue(string.eql(merkle.rootOf(leavesN(2)), ROOT2));
+}
+
+@test
+fn root_of_three_leaves_uneven_split(): void {
+    assert.isTrue(string.eql(merkle.rootOf(leavesN(3)), ROOT3));
+}
+
+@test
+fn root_of_four_leaves(): void {
+    assert.isTrue(string.eql(merkle.rootOf(leavesN(4)), ROOT4));
+}
+
+@test
+fn empty_tree_root_matches_empty_hash(): void {
+    assert.isTrue(string.eql(merkle.rootOf(List<string>()), EMPTY_ROOT));
+}
+
+// --- MerkleLog --------------------------------------------------------------
+
+@test
+fn log_root_matches_root_of(): void {
+    assert.equalInt(logN(4).size(), 4);
+    assert.isTrue(string.eql(logN(3).root(), ROOT3));
+    assert.isTrue(string.eql(logN(4).root(), ROOT4));
+}
+
+@test
+fn log_leaf_at(): void {
+    let log = logN(4);
+    let want = leavesN(4);
+    assert.isTrue(string.eql(log.leafAt(0) ?? "", want.at(0)));
+    assert.isTrue(string.eql(log.leafAt(3) ?? "", want.at(3)));
+    // Out of range -> undefined (sentinel "").
+    assert.isTrue(string.eql(log.leafAt(4) ?? "X", "X"));
+}
+
+// --- inclusion proofs -------------------------------------------------------
+
+@test
+fn inclusion_proofs_verify_every_index_size4(): void {
+    let log = logN(4);
+    let leaves = leavesN(4);
+    let i = 0;
+    while (i < 4) {
+        let proof = log.inclusionProof(i) ?? List<string>();
+        assert.isTrue(merkle.verifyInclusion(leaves.at(i), i, 4, proof, ROOT4));
+        i = i + 1;
+    }
+}
+
+@test
+fn inclusion_proof_verifies_uneven_size3(): void {
+    let log = logN(3);
+    let leaves = leavesN(3);
+    // Index 2 is the lone right leaf under the uneven split.
+    let proof = log.inclusionProof(2) ?? List<string>();
+    assert.isTrue(merkle.verifyInclusion(leaves.at(2), 2, 3, proof, ROOT3));
+    let proof0 = log.inclusionProof(0) ?? List<string>();
+    assert.isTrue(merkle.verifyInclusion(leaves.at(0), 0, 3, proof0, ROOT3));
+}
+
+@test
+fn inclusion_proof_rejects_wrong_leaf(): void {
+    let log = logN(4);
+    let leaves = leavesN(4);
+    let proof = log.inclusionProof(1) ?? List<string>();
+    // Correct leaf passes, a different leaf at the same position fails.
+    assert.isTrue(merkle.verifyInclusion(leaves.at(1), 1, 4, proof, ROOT4));
+    assert.isTrue(!merkle.verifyInclusion(leaves.at(2), 1, 4, proof, ROOT4));
+}
+
+@test
+fn inclusion_proof_rejects_wrong_root(): void {
+    let log = logN(4);
+    let leaves = leavesN(4);
+    let proof = log.inclusionProof(0) ?? List<string>();
+    assert.isTrue(!merkle.verifyInclusion(leaves.at(0), 0, 4, proof, ROOT3));
+}
+
+// --- consistency proofs -----------------------------------------------------
+
+@test
+fn consistency_proof_verifies_m2_n4(): void {
+    let log = logN(4);
+    let proof = log.consistencyProof(2) ?? List<string>();
+    assert.isTrue(merkle.verifyConsistency(2, ROOT2, 4, ROOT4, proof));
+}
+
+@test
+fn consistency_proof_verifies_m1_n4(): void {
+    let log = logN(4);
+    let proof = log.consistencyProof(1) ?? List<string>();
+    assert.isTrue(merkle.verifyConsistency(1, ROOT1, 4, ROOT4, proof));
+}
+
+@test
+fn consistency_proof_verifies_m3_n4(): void {
+    let log = logN(4);
+    let proof = log.consistencyProof(3) ?? List<string>();
+    assert.isTrue(merkle.verifyConsistency(3, ROOT3, 4, ROOT4, proof));
+}
+
+@test
+fn consistency_proof_rejects_tampered(): void {
+    let log = logN(4);
+    let proof = log.consistencyProof(2) ?? List<string>();
+    // Valid as produced.
+    assert.isTrue(merkle.verifyConsistency(2, ROOT2, 4, ROOT4, proof));
+    // Tamper one proof element: must be rejected.
+    let bad = proof.copy();
+    bad.set(0, EMPTY_ROOT);
+    assert.isTrue(!merkle.verifyConsistency(2, ROOT2, 4, ROOT4, bad));
+    // A wrong claimed first root must also be rejected.
+    assert.isTrue(!merkle.verifyConsistency(2, ROOT3, 4, ROOT4, proof));
+}
+
+// --- Ed25519 signing seam ---------------------------------------------------
+
+@test
+fn ed25519_keypair_from_seed_matches_rfc8032(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    assert.isTrue(string.eql(kp.pubHex, ED_PUB));
+    // Private key is seed || pub (128 hex chars).
+    assert.equalInt(kp.privHex.length, 128);
+}
+
+@test
+fn ed25519_sign_matches_rfc8032_vector(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let msg = hashing.hexDecode(ED_MSG_HEX);
+    let sigHex = sign.signHex(kp.privHex, msg, 1);
+    bytes.free(msg);
+    assert.isTrue(string.eql(sigHex, ED_SIG));
+}
+
+@test
+fn ed25519_verify_round_trip_accepts(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let msg = hashing.hexDecode(ED_MSG_HEX);
+    let sigHex = sign.signHex(kp.privHex, msg, 1);
+    assert.isTrue(sign.verifyHex(kp.pubHex, msg, 1, sigHex));
+    bytes.free(msg);
+}
+
+@test
+fn ed25519_rejects_tampered_signature(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let msg = hashing.hexDecode(ED_MSG_HEX);
+    // Flip one byte of the signature and re-encode.
+    let sigBytes = hashing.hexDecode(ED_SIG);
+    bytes.write_byte(sigBytes, 8, bytes.read_byte(sigBytes, 8) ^ 1);
+    let badSig = hashing.hexEncodeN(sigBytes, 64);
+    bytes.free(sigBytes);
+    assert.isTrue(!sign.verifyHex(kp.pubHex, msg, 1, badSig));
+    bytes.free(msg);
+}
+
+@test
+fn ed25519_rejects_tampered_message(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let msg = hashing.hexDecode(ED_MSG_HEX);
+    let sigHex = sign.signHex(kp.privHex, msg, 1);
+    // Flip the single message byte: the good signature must no longer verify.
+    bytes.write_byte(msg, 0, bytes.read_byte(msg, 0) ^ 1);
+    assert.isTrue(!sign.verifyHex(kp.pubHex, msg, 1, sigHex));
+    bytes.free(msg);
+}

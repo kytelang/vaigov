@@ -1,0 +1,50 @@
+// EndpointRepository: the `governed_endpoints` table in the shared `acp` db.
+// SQL mirrors acp-server store.rs exactly (tenant_id column, enabled INTEGER,
+// id `ep-<hex6>`). The edge proxy TLS-bumps and applies policy only to these hosts.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.EndpointRow;
+
+pub struct EndpointRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: EndpointRepository, tenant: string): Rows<EndpointRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<EndpointRow>(conn, "governed_endpoints").query(
+            "SELECT id, host, port, enabled, note FROM governed_endpoints WHERE tenant_id = $1 ORDER BY host", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn add(self: EndpointRepository, id: string, tenant: string, host: string, port: int, note: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant)); p.push(db.dbText(host));
+        p.push(db.dbInt(port)); p.push(db.dbText(note)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO governed_endpoints (id, tenant_id, host, port, enabled, note, created_ms) VALUES ($1, $2, $3, $4, 1, $5, $6)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn update(self: EndpointRepository, id: string, tenant: string, host: string, port: int, enabled: int, note: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(host)); p.push(db.dbInt(port)); p.push(db.dbInt(enabled));
+        p.push(db.dbText(note)); p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE governed_endpoints SET host = $1, port = $2, enabled = $3, note = $4 WHERE id = $5 AND tenant_id = $6", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: EndpointRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM governed_endpoints WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+}

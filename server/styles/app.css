@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+/* The content globs (which files Tailwind scans for class names, including the
+   `.kyx` views) live in tailwind.config.js at the project root, loaded here. */
+@config "../tailwind.config.js";
+
+/* Theme custom properties, ported verbatim from the Vue console (src/style.css).
+   Dark is the default; `:root.light` flips to light. The Tailwind colour aliases
+   in tailwind.config.js (bg/panel/line/accent/...) resolve to these. */
+:root {
+  --bg: #0a0e1a; --panel: #111726; --panel2: #0d1320;
+  --line: #1e2740; --line2: #28324f;
+  --txt: #e5eaf5; --dim: #8892ab; --muted: #5c6685;
+  --accent: #6366f1; --ok: #10b981; --warn: #f59e0b; --bad: #ef4444;
+  --sidebar: linear-gradient(180deg,#0c1120,#0a0e1a); --topbar: #0d1320;
+}
+:root.light, body.light {
+  --bg: #eef1f7; --panel: #ffffff; --panel2: #f4f6fb;
+  --line: #e2e7f0; --line2: #d3dae7;
+  --txt: #161d2e; --dim: #586182; --muted: #9098ad;
+  --sidebar: linear-gradient(180deg,#ffffff,#f4f6fb); --topbar: #ffffff;
+}
+
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--txt);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px; line-height: 1.5;
+}
+* { box-sizing: border-box; }
+a { color: inherit; text-decoration: none; }
+
+/* Chrome backgrounds driven by the theme vars (class-based so no inline styles,
+   keeping the strict CSP style-src 'self'). */
+.app-sidebar { background: var(--sidebar); }
+.app-topbar { background: var(--topbar); }
+
+::-webkit-scrollbar { height: 8px; width: 8px; }
+::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
+
+/* Sidebar nav items (match the Vue Sidebar.vue: left-border accent on active). */
+.nav-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 8px 16px; font-size: 13px; border: 0; border-left: 2px solid transparent;
+  color: var(--dim); background: transparent; cursor: pointer; }
+.nav-item:hover { color: var(--txt); background: color-mix(in srgb, var(--panel2) 60%, transparent); }
+.nav-active { border-left-color: var(--accent); color: var(--txt);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.grp-label { padding: 0 16px 6px; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .12em; color: var(--muted); font-weight: 600; }
+
+@media print {
+  .app-sidebar, .app-topbar { display: none !important; }
+  .app-content { max-width: none !important; }
+}

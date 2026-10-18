@@ -1,0 +1,44 @@
+// GET /agents -> {"agents":[{id,app_id,name,owner,metadata_json,active(bool),tenant,created_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Agents.Shared.AgentRepository;
+import Domain.Dtos.AgentListRow;
+
+pub fn agentRowJson(r: AgentListRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("app_id", json.str(r.app_id));
+    m.set("name", json.str(r.name));
+    m.set("owner", json.str(r.owner));
+    m.set("metadata_json", json.str(r.metadata_json));
+    m.set("active", json.bool(r.active != 0));
+    m.set("tenant", json.str(r.tenant));
+    m.set("created_ms", json.number(r.created_ms));
+    return json.object(m);
+}
+
+pub struct ListAgentsHandler impl RouteHandler {
+    repo: AgentRepository,
+    app: AppContext,
+    init(repo: AgentRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListAgentsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(agentRowJson(rows.items.getOr(i, AgentListRow{ id: "", app_id: "", name: "", owner: "", metadata_json: "{}", active: 0, tenant: "", created_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("agents", json.array(arr));
+        return Http.okObj(m);
+    }
+}

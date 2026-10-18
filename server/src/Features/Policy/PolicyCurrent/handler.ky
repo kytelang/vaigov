@@ -1,0 +1,31 @@
+// GET /policy/current -> {hash, body, max_staleness_s}. The compiled active policy.
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Features.Policy.Shared.policyrules;
+import Features.Opa.Shared.bundle;
+import Features.Rules.Shared.RuleRepository;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct PolicyCurrentHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: PolicyCurrentHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let regoSrc = rego.compileRules(rules, self.app.trustCfg.defaultVerdict);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("hash", json.str(bundle.revision(regoSrc)));
+        m.set("body", json.str(regoSrc));
+        m.set("max_staleness_s", json.number(30));
+        return Http.okObj(m);
+    }
+}

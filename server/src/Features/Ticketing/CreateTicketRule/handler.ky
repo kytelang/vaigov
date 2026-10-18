@@ -1,0 +1,45 @@
+// POST /ticket-rules (EditPolicy) -> {"ok":true,"id":"tr-<hex>"} | {"ok":false,"error":...}.
+// Body: {name, connector(webhook|servicenow|jira), match_verdict?, match_control?, match_resource?,
+// target?, throttle_sec?}. Mirrors acp ticket_rule_create defaults.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Ticketing.Shared.TicketRepository;
+
+pub struct CreateTicketRuleHandler impl RouteHandler {
+    repo: TicketRepository,
+    app: AppContext,
+    init(repo: TicketRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateTicketRuleHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let name = json.asString(json.get(body, "name")) ?? "";
+        if (string.trim(name).length == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str("name is required"));
+            return Http.okObj(e);
+        }
+        let c = json.asString(json.get(body, "connector")) ?? "";
+        let connector = if (string.eql(c, "servicenow") || string.eql(c, "jira")) (c) else ("webhook");
+        let v = json.asString(json.get(body, "match_verdict")) ?? "";
+        let verdict = if (v.length == 0) ("deny") else (v);
+        let matchControl = json.asString(json.get(body, "match_control")) ?? "";
+        let matchResource = json.asString(json.get(body, "match_resource")) ?? "";
+        let targetJson = if (json.has(body, "target")) (json.stringify(json.get(body, "target"))) else ("{}");
+        let throttle = (json.asNumber(json.get(body, "throttle_sec")) ?? 3600) as int;
+        let id = string.concat("tr-", random.randomHex(6));
+        await self.repo.addRule(id, tenant, name, verdict, matchControl, matchResource, connector, targetJson, throttle, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

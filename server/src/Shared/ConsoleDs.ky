@@ -1,0 +1,23 @@
+// Datastar response helpers for the first-party console. A console mutation
+// (create/edit/delete/toggle posted from a `.kyx` form) answers with ONE SSE body
+// that both morphs the refreshed fragment back in by its id AND patches a few
+// signals (e.g. closing the modal, clearing an error) -- so the table updates and
+// the form resets in a single round-trip. `ds_response.patch` only does elements,
+// so this adds the signals frame.
+import web.response;
+import datastar;
+import ds_sink;
+
+/// Refreshed `fragment` (carries its own target id) + a `patch-signals` frame
+/// from `signalsJson` (e.g. `{"epModal":"","epErr":""}`), as one Datastar SSE
+/// response. Use from a console POST handler after mutating via the repo.
+pub async fn patchAndSignals(fragment: string, signalsJson: string): response.Response {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let _a = await sse.patchElementsSimple(fragment);
+    let _b = await sse.patchSignals(signalsJson);
+    let r = response.Response(Status.Ok, buf.contents());
+    r.setHeader("Content-Type", "text/event-stream");
+    r.setHeader("Cache-Control", "no-cache");
+    return r;
+}

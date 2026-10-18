@@ -1,0 +1,209 @@
+// Shared helpers for the Systems feature: body getters, JSON row builders, the
+// subject-profile derivation, and the per-system conformance report computation
+// (freshness gate + crosswalk propagation), ported from acp-server systems.rs.
+import string;
+import list;
+import map;
+import serde.json;
+import conformance;
+import controls;
+import Domain.Dtos.SystemDtos;
+
+pub fn sysStr(body: json.JsonValue, key: string): string {
+    if (body.kind != 5 || !json.has(body, key)) { return ""; }
+    let v = json.get(body, key);
+    if (v.kind != 3) { return ""; }
+    return string.trim(v.sval);
+}
+
+pub fn sysNum(body: json.JsonValue, key: string): long {
+    if (body.kind != 5 || !json.has(body, key)) { return 0; }
+    return json.asNumber(json.get(body, key)) ?? 0;
+}
+
+// The raw `jurisdictions` value as a JSON-array text string (acp stores + renders
+// it as a string). Returns "[]" when absent.
+pub fn sysJurText(body: json.JsonValue): string {
+    if (body.kind == 5 && json.has(body, "jurisdictions")) {
+        return json.stringify(json.get(body, "jurisdictions"));
+    }
+    return "[]";
+}
+
+pub fn systemRowJson(s: SystemRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("id", json.str(s.id));
+    m.set("name", json.str(s.name));
+    m.set("purpose", json.str(s.purpose));
+    m.set("owner", json.str(s.owner));
+    m.set("lifecycle_state", json.str(s.lifecycle_state));
+    m.set("risk_tier", json.str(s.risk_tier));
+    m.set("sector", json.str(s.sector));
+    m.set("asset_type", json.str(s.asset_type));
+    m.set("jurisdictions", json.str(s.jurisdictions));
+    m.set("tenant", json.str(s.tenant));
+    m.set("created_ms", json.number(s.created_ms));
+    m.set("updated_ms", json.number(s.updated_ms));
+    return json.object(m);
+}
+
+pub fn systemRoleJson(r: SystemRoleRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("system_id", json.str(r.system_id));
+    m.set("role", json.str(r.role));
+    m.set("jurisdiction", json.str(r.jurisdiction));
+    m.set("market_date", json.str(r.market_date));
+    m.set("created_ms", json.number(r.created_ms));
+    return json.object(m);
+}
+
+// The subject profile from a system + its roles (acp system_profile).
+pub fn systemProfile(sys: SystemRow, roles: List<SystemRoleRow>): conformance.SubjectProfile {
+    let names = List<string>();
+    let i = 0;
+    while (i < roles.size()) {
+        let rn = roles.at(i).role;
+        let seen = false;
+        let j = 0;
+        while (j < names.size()) { if (string.eql(names.at(j), rn)) { seen = true; } j = j + 1; }
+        if (!seen && rn.length > 0) { names.push(rn); }
+        i = i + 1;
+    }
+    if (names.size() == 0) { names.push("provider"); names.push("deployer"); }
+    // First non-empty role jurisdiction.
+    let jur: string | undefined = undefined;
+    let k = 0;
+    while (k < roles.size()) {
+        if (roles.at(k).jurisdiction.length > 0) { jur = roles.at(k).jurisdiction; k = roles.size(); } else { k = k + 1; }
+    }
+    let tier = if (sys.risk_tier.length > 0) (sys.risk_tier) else ("high");
+    let sector: string | undefined = if (sys.sector.length > 0) (sys.sector) else (undefined);
+    let asset: string | undefined = if (sys.asset_type.length > 0) (sys.asset_type) else (undefined);
+    return conformance.SubjectProfile(names, tier, sector, jur, asset);
+}
+
+// subject_profile JSON (as acp serializes SubjectProfile).
+pub fn profileJson(p: conformance.SubjectProfile): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    let rs = List<json.JsonValue>();
+    let i = 0;
+    while (i < p.roles.size()) { rs.push(json.str(p.roles.at(i))); i = i + 1; }
+    m.set("roles", json.array(rs));
+    m.set("risk_tier", if (p.riskTier == undefined) (json.null()) else (json.str(p.riskTier ?? "")));
+    m.set("sector", if (p.sector == undefined) (json.null()) else (json.str(p.sector ?? "")));
+    m.set("jurisdiction", if (p.jurisdiction == undefined) (json.null()) else (json.str(p.jurisdiction ?? "")));
+    m.set("asset_type", if (p.assetType == undefined) (json.null()) else (json.str(p.assetType ?? "")));
+    return json.object(m);
+}
+
+fn conformantStatus(s: string): bool {
+    return string.eql(s, "implemented") || string.eql(s, "done") || string.eql(s, "conformant");
+}
+
+// status -> conformity (acp status_conformity).
+fn statusConformity(status: string, applicable: bool): conformance.Conformity {
+    if (!applicable) { return conformance.Conformity.NotApplicable; }
+    if (conformantStatus(status)) { return conformance.Conformity.Conformant; }
+    if (string.eql(status, "partial") || string.eql(status, "in-progress")) { return conformance.Conformity.Partial; }
+    if (string.eql(status, "gap") || string.eql(status, "non-conformant")) { return conformance.Conformity.NonConformant; }
+    if (string.eql(status, "not-applicable")) { return conformance.Conformity.NotApplicable; }
+    return conformance.Conformity.NotAssessed;
+}
+
+// A stored SoA entry for a (framework,control), or undefined.
+fn soaFor(soa: List<SoaStoredRow>, framework: string, cid: string): SoaStoredRow | undefined {
+    let i = 0;
+    while (i < soa.size()) {
+        let e = soa.at(i);
+        if (string.eql(e.framework, framework) && string.eql(e.control_id, cid)) { return e; }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+// Whether (framework,control) is satisfied: applicable + conformant-ish status +
+// fresh evidence.
+fn isSatisfied(soa: List<SoaStoredRow>, fresh: List<string>, framework: string, cid: string): bool {
+    let e = soaFor(soa, framework, cid);
+    if (e == undefined) { return false; }
+    let ee = e ?? SoaStoredRow{ framework: "", control_id: "", applicable: 0, justification: "", status: "", updated_ms: 0 };
+    if (ee.applicable == 0 || !conformantStatus(ee.status)) { return false; }
+    let key = string.concat(string.concat(framework, ":"), cid);
+    let i = 0;
+    while (i < fresh.size()) { if (string.eql(fresh.at(i), key)) { return true; } i = i + 1; }
+    return false;
+}
+
+// Build the full report JSON for one system/framework (acp system_report),
+// applying the freshness gate and crosswalk propagation.
+pub fn systemReportJson(sys: SystemRow, profile: conformance.SubjectProfile, framework: string, soa: List<SoaStoredRow>, fresh: List<string>, asAt: long, nowMs: long): json.JsonValue {
+    let edges = controls.crosswalkEdges();
+    let lib = controls.forFramework(framework);
+    let rows = List<conformance.ControlAssessment>();
+    let ci = 0;
+    while (ci < lib.size()) {
+        let c = lib.at(ci);
+        let ar = conformance.applies(c, profile);
+        let e = soaFor(soa, framework, c.id);
+        let applicable = if (e == undefined) (ar.ok) else ((e ?? SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 }).applicable != 0);
+        let excl = if (applicable) ("") else (if (e == undefined) (ar.reason) else ((e ?? SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 }).justification));
+        let conf = conformance.Conformity.NotAssessed;
+        if (!applicable) {
+            conf = conformance.Conformity.NotApplicable;
+        } else if (isSatisfied(soa, fresh, framework, c.id)) {
+            conf = conformance.Conformity.Conformant;
+        } else if (e != undefined) {
+            let ee = e ?? SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 };
+            if (conformantStatus(ee.status)) {
+                excl = "claimed implemented but no fresh evidence";
+                conf = conformance.Conformity.Partial;
+            } else {
+                conf = statusConformity(ee.status, true);
+            }
+        } else {
+            conf = conformance.Conformity.NotAssessed;
+        }
+        rows.push(conformance.ControlAssessment(c.framework, c.id, c.title, c.reference, c.obligationType, applicable, conf, excl));
+        ci = ci + 1;
+    }
+    let summary = conformance.summarise(rows);
+    let controlRows = List<json.JsonValue>();
+    let ri = 0;
+    while (ri < rows.size()) {
+        let r = rows.at(ri);
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("control_id", json.str(r.controlId));
+        m.set("title", json.str(r.title));
+        m.set("reference", json.str(r.reference));
+        m.set("obligation_type", json.str(r.obligationType));
+        m.set("applicable", json.bool(r.applicable));
+        m.set("conformity", json.str(r.conformity.toSnake()));
+        m.set("exclusion_reason", json.str(r.exclusionReason));
+        controlRows.push(json.object(m));
+        ri = ri + 1;
+    }
+    let fw = controls.framework(framework);
+    let out = Map<string, json.JsonValue>(16, string.hash);
+    out.set("framework", json.str(framework));
+    out.set("framework_label", if (fw == undefined) (json.null()) else (json.str((fw ?? controls.Framework("","","","","","","")).label)));
+    out.set("framework_version", if (fw == undefined) (json.null()) else (json.str((fw ?? controls.Framework("","","","","","","")).version)));
+    out.set("framework_type", if (fw == undefined) (json.null()) else (json.str((fw ?? controls.Framework("","","","","","","")).frameworkType)));
+    let sm = Map<string, json.JsonValue>(4, string.hash);
+    sm.set("id", json.str(sys.id)); sm.set("name", json.str(sys.name)); sm.set("owner", json.str(sys.owner)); sm.set("risk_tier", json.str(sys.risk_tier));
+    out.set("system", json.object(sm));
+    out.set("subject_profile", profileJson(profile));
+    out.set("generated_ms", json.number(nowMs));
+    out.set("as_at", json.number(asAt));
+    out.set("controls", json.array(controlRows));
+    let cs = Map<string, json.JsonValue>(8, string.hash);
+    cs.set("total", json.number(summary.total as long));
+    cs.set("applicable", json.number(summary.applicable as long));
+    cs.set("not_applicable", json.number(summary.notApplicable as long));
+    cs.set("conformant", json.number(summary.conformant as long));
+    cs.set("partial", json.number(summary.partial as long));
+    cs.set("non_conformant", json.number(summary.nonConformant as long));
+    cs.set("not_assessed", json.number(summary.notAssessed as long));
+    out.set("conformity_summary", json.object(cs));
+    return json.object(out);
+}

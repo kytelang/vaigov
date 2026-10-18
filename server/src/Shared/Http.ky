@@ -1,0 +1,178 @@
+//! Shared helpers for the control-plane feature slices: JSON responses for the
+//! machine-facing endpoints (OPA, CLI), the current-time source, request-body
+//! parsing, and the capability-RBAC gate that mutating endpoints call. Hypermedia
+//! handlers render `.kyx` views and answer via `ds_response.patch`; these helpers
+//! cover the JSON side and the shared security gate.
+
+import string;
+import list;
+import map;
+import serde.json;
+import datetime;
+import sign;
+import Shared.Auth;
+import Shared.AppContext;
+import web.routing;
+import web.response;
+import web.status;
+
+pub fn sessionCookieName(): string { return "acp_session"; }
+
+pub fn nowMs(): long { return datetime.nowNs() / 1000000; }
+
+/// A 200 JSON response.
+pub fn jsonResp(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.headers.set("Content-Type", "application/json");
+    return r;
+}
+
+/// A JSON response at an explicit status.
+pub fn jsonStatus(st: Status, body: string): response.Response {
+    let r = response.Response(st, body);
+    r.headers.set("Content-Type", "application/json");
+    return r;
+}
+
+/// Serialise a JSON object map into a 200 JSON response.
+pub fn okObj(m: Map<string, json.JsonValue>): response.Response {
+    return jsonResp(json.stringify(json.object(m)));
+}
+
+/// Attaches a detached Ed25519 signature over `resp`'s body, under the control
+/// plane's trust key, as `x-acp-signature` (+ the public key as `x-acp-pubkey`).
+/// The edge sidecar verifies this before applying pulled config (design-
+/// refinements R5 + R4), so it refuses tampered or unauthenticated config.
+pub fn signConfig(app: AppContext, resp: response.Response): response.Response {
+    let body = resp.body;
+    let sig = sign.signHex(app.trust.keypair.privHex, body as ptr, body.length);
+    resp.headers.set("x-acp-signature", sig);
+    resp.headers.set("x-acp-pubkey", app.trust.keypair.pubHex);
+    return resp;
+}
+
+/// A signed 200 JSON object response (okObj + signConfig).
+pub fn signedObj(app: AppContext, m: Map<string, json.JsonValue>): response.Response {
+    return signConfig(app, okObj(m));
+}
+
+pub fn okTrue(): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(true));
+    return okObj(m);
+}
+
+pub fn errResp(st: Status, msg: string): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return jsonStatus(st, json.stringify(json.object(m)));
+}
+
+pub fn badRequest(msg: string): response.Response { return errResp(Status.BadRequest, msg); }
+pub fn notFound(msg: string): response.Response { return errResp(Status.NotFound, msg); }
+pub fn forbidden(): response.Response { return errResp(Status.Forbidden, "forbidden: missing capability"); }
+
+/// An HTML fragment response (text/html), for a non-Datastar hypermedia reply.
+pub fn html(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.headers.set("Content-Type", "text/html; charset=utf-8");
+    return r;
+}
+
+/// A 303 See Other redirect. Built from primitives (the pinned compiler std
+/// predates `response.seeOther`), so it compiles regardless of std vintage.
+pub fn redirectTo(url: string): response.Response {
+    let r = response.Response(Status.SeeOther, "");
+    r.headers.set("Location", url);
+    return r;
+}
+
+/// A 303 redirect that also sets a `Set-Cookie` header (login/logout).
+pub fn redirectWithCookie(url: string, cookie: string): response.Response {
+    let r = response.Response(Status.SeeOther, "");
+    r.headers.set("Location", url);
+    r.headers.set("Set-Cookie", cookie);
+    return r;
+}
+
+/// Parse the request body as JSON, or a JSON null when empty/malformed.
+pub fn bodyJson(ctx: routing.Context): json.JsonValue {
+    let b = ctx.request.body;
+    if (b.length == 0) { return json.null(); }
+    let v = json.tryParse(b);
+    if (v == undefined) { return json.null(); }
+    return v ?? json.null();
+}
+
+pub fn strList(xs: List<string>): json.JsonValue {
+    let out = List<json.JsonValue>();
+    let i = 0;
+    while (i < xs.size()) { out.push(json.str(xs.at(i))); i = i + 1; }
+    return json.array(out);
+}
+
+pub fn optQuery(ctx: routing.Context, key: string): string | undefined {
+    let v = ctx.query(key);
+    if (v.length == 0) { return undefined; }
+    return v;
+}
+
+/// The authenticated caller, read from the signed session cookie, or `undefined`
+/// when no (valid) session cookie is present. Verified in constant time against
+/// the server session key and both expiry windows before any claim is trusted.
+pub fn principalOf(app: AppContext, req: routing.Context): Auth.AuthPrincipal | undefined {
+    // Prefer an `Authorization: Bearer <jwt>` header (acp's dev-token / Entra path):
+    // verify against the dev MockEntra JWKS + issuer/audience before trusting claims.
+    let authz = req.request.getHeader("authorization");
+    if (authz != undefined) {
+        let h = authz ?? "";
+        if (string.startsWith(h, "Bearer ")) {
+            let tok = string.slice(h, 7, h.length);
+            let vr = Auth.verify(tok, app.trust.mockEntra.jwks(), app.trust.mockEntra.config(), nowMs());
+            if (vr.ok) { return vr.principal; }
+        }
+    }
+    // Else a signed session cookie (the BFF path), verified in constant time
+    // against the server session key and both expiry windows.
+    let cookie = req.request.getCookie(sessionCookieName());
+    if (cookie == undefined) { return undefined; }
+    let sess = Auth.verifySession(app.trustCfg.sessionKeyHex, cookie ?? "", nowMs(), app.trustCfg.sessionIdleMs);
+    if (sess == undefined) { return undefined; }
+    return (sess ?? Auth.Session("", "", "", "", List<string>(), 0, 0)).principal();
+}
+
+/// The tenant bound into the verified session cookie, or `undefined` when there
+/// is no valid session. Console mutations use this to isolate writes to the
+/// caller's own tenant, so a forged `x-acp-tenant` header cannot act across
+/// tenants (the header is attacker-controlled and must never pick the tenant).
+pub fn sessionTenant(app: AppContext, req: routing.Context): string | undefined {
+    let cookie = req.request.getCookie(sessionCookieName());
+    if (cookie == undefined) { return undefined; }
+    let sess = Auth.verifySession(app.trustCfg.sessionKeyHex, cookie ?? "", nowMs(), app.trustCfg.sessionIdleMs);
+    if (sess == undefined) { return undefined; }
+    return (sess ?? Auth.Session("", "", "", "", List<string>(), 0, 0)).tenantId;
+}
+
+/// The varman tenant for an authenticated caller, derived from the verified
+/// identity rather than the spoofable `x-acp-tenant` header. A session cookie
+/// carries the varman tenant directly; a bearer token carries only the Entra
+/// `tid`, which is mapped to the onboarded varman tenant (or the configured
+/// default tenant in the single-tenant / dev case).
+pub fn tenantForIdentity(app: AppContext, req: routing.Context, prin: Auth.AuthPrincipal): string {
+    let st = sessionTenant(app, req);
+    if (st != undefined) { return st ?? app.trustCfg.tenant; }
+    let b = app.trust.entraBindings.get(prin.tenant);
+    if (b != undefined) { return (b ?? Auth.EntraBinding("", "", "", "", 0)).tenantId; }
+    return app.trustCfg.tenant;
+}
+
+/// The capability-RBAC gate every mutating endpoint calls. Matches acp's
+/// `authorize`: a caller must present a valid bearer token (or session cookie)
+/// whose roles grant `cap`, otherwise the request is denied. A forged or
+/// capability-poor credential can never escalate.
+pub fn requireCap(app: AppContext, req: routing.Context, cap: Auth.Capability): bool {
+    let p = principalOf(app, req);
+    if (p == undefined) { return false; }
+    return (p ?? Auth.AuthPrincipal("", "", "", List<string>())).can(cap);
+}

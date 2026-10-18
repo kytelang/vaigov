@@ -1,0 +1,37 @@
+// Auth feature route table (acp dev-auth + session + Entra). Only registration
+// lives here; each handler is in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Auth.DevToken.handler;
+import Features.Auth.DevLogin.handler;
+import Features.Auth.Session.handler;
+import Features.Auth.Login.handler;
+import Features.Auth.Logout.handler;
+import Features.Auth.Callback.handler;
+import Features.Auth.EntraBindings.handler;
+import Features.Auth.EntraOnboard.handler;
+import Features.Auth.EntraWhoami.handler;
+import Features.Auth.EntraGroups.handler;
+import Features.Auth.EntraConsentUrl.handler;
+import Features.Auth.EntraConsented.handler;
+
+pub fn registerAuth(ctx: AppContext, devAuth: bool): void {
+    // The dev-login / dev-token routes mint a fully privileged session cookie or
+    // bearer token with no authentication. They are registered ONLY behind the
+    // explicit `--dev-auth` flag (local development), so a production deployment
+    // never exposes them (GET returns 404 there).
+    if (devAuth) {
+        ctx.app.get("/auth/dev-token", DevTokenHandler(ctx));
+        ctx.app.get("/auth/dev-login", DevLoginHandler(ctx));
+    }
+    ctx.app.get("/auth/session", SessionHandler(ctx));
+    ctx.app.get("/auth/login", LoginHandler(ctx));
+    ctx.app.get("/auth/logout", LogoutHandler(ctx));
+    ctx.app.get("/auth/callback", CallbackHandler(ctx));
+    ctx.app.get("/auth/entra/bindings", EntraBindingsHandler(ctx));
+    ctx.app.post("/auth/entra/bindings", EntraOnboardHandler(ctx));
+    ctx.app.get("/auth/entra/whoami", EntraWhoamiHandler(ctx));
+    ctx.app.get("/auth/entra/groups", EntraGroupsHandler(ctx));
+    ctx.app.get("/auth/entra/consent-url", EntraConsentUrlHandler(ctx));
+    ctx.app.get("/auth/entra/consented", EntraConsentedHandler(ctx));
+}

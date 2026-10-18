@@ -1,0 +1,114 @@
+// Reports view as KYX (full parity with acp/console ReportsView.vue): a filter bar
+// (framework / role / risk tier / jurisdiction) that re-runs the per-control
+// conformance report, plus the summary stat row and the controls table. Apply
+// posts the filter signals to /reports/view, which recomputes via varman-core.
+import list;
+import string;
+import conformance;
+
+pub class FwOpt {
+    pub slug: string,
+    pub label: string,
+    init(slug: string, label: string) { self.slug = slug; self.label = label; }
+}
+
+fn jq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "\"", "\\\""); }
+
+fn repStat(n: int, labelText: string, tone: string): Html {
+    let cls = if (string.eql(tone, "ok")) ("text-lg font-semibold text-ok")
+        else if (string.eql(tone, "warn")) ("text-lg font-semibold text-warn")
+        else if (string.eql(tone, "bad")) ("text-lg font-semibold text-bad")
+        else if (string.eql(tone, "accent")) ("text-lg font-semibold text-accent")
+        else if (string.eql(tone, "dim")) ("text-lg font-semibold text-dim")
+        else ("text-lg font-semibold text-txt");
+    return <div><div class={cls}>{`${n}`}</div><div class="text-[10px] text-dim uppercase">{labelText}</div></div>;
+}
+
+fn conformityBadge(snake: string): Html {
+    if (string.eql(snake, "conformant")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{snake}</span>; }
+    else if (string.eql(snake, "partial")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{snake}</span>; }
+    else if (string.eql(snake, "non-conformant")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-bad">{snake}</span>; }
+    else if (string.eql(snake, "not-applicable")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">{snake}</span>; }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{snake}</span>;
+}
+
+fn controlAssessmentRow(c: conformance.ControlAssessment): Html {
+    let ref = if (c.reference.length > 0) (c.reference) else (c.controlId);
+    let note = if (c.applicable) ("") else (c.exclusionReason);
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs text-dim whitespace-nowrap">{ref}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{c.title}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{c.obligationType}</td>
+        <td class="py-2 pr-4">{conformityBadge(c.conformity.toSnake())}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{note}</td>
+    </tr>;
+}
+
+fn fwOption(o: FwOpt): Html {
+    return <option value={o.slug}>{o.label}</option>;
+}
+
+pub fn reportsPanel(frameworkSlug: string, frameworkLabel: string, role: string, tier: string, jurisdiction: string, fwOpts: list.List<FwOpt>, total: int, applicable: int, conformant: int, partial: int, notAssessed: int, notApplicable: int, rows: list.List<conformance.ControlAssessment>): Html {
+    let sigs = "{rpFramework: '" + jq(frameworkSlug) + "', rpRole: '" + jq(role) + "', rpTier: '" + jq(tier) + "', rpJur: '" + jq(jurisdiction) + "'}";
+    return <div id="reports" data-signals={sigs} class="grid gap-4">
+        <div class="bg-panel border border-line rounded-xl px-5 py-4">
+            <div class="flex flex-wrap items-end gap-3">
+                <label class="text-xs text-dim">Framework
+                    <select data-bind="rpFramework" class="mt-1 block bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm min-w-52">
+                        {for (i in 0..fwOpts.size()) { fwOption(fwOpts.at(i)); }}
+                    </select>
+                </label>
+                <label class="text-xs text-dim">Role
+                    <select data-bind="rpRole" class="mt-1 block bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                        <option value="">provider + deployer</option><option value="provider">provider</option><option value="deployer">deployer</option><option value="developer">developer</option>
+                    </select>
+                </label>
+                <label class="text-xs text-dim">Risk tier
+                    <select data-bind="rpTier" class="mt-1 block bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                        <option value="high">high</option><option value="limited">limited</option><option value="minimal">minimal</option><option value="unacceptable">unacceptable</option>
+                    </select>
+                </label>
+                <label class="text-xs text-dim">Jurisdiction
+                    <input type="text" data-bind="rpJur" class="mt-1 block bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm w-28" placeholder="e.g. UK" />
+                </label>
+                <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90" data-on:click="@post('/reports/view')">Apply</button>
+            </div>
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl px-5 py-4">
+            <div class="flex items-center gap-3 flex-wrap">
+                <div>
+                    <div class="text-base font-semibold text-txt">{frameworkLabel}</div>
+                    <div class="text-xs text-dim">{frameworkSlug + " · risk tier: " + tier}</div>
+                </div>
+                <div class="ml-auto grid grid-cols-3 sm:grid-cols-6 gap-3 text-center">
+                    {repStat(total, "total", "txt")}
+                    {repStat(applicable, "applicable", "accent")}
+                    {repStat(conformant, "conformant", "ok")}
+                    {repStat(partial, "partial", "warn")}
+                    {repStat(notAssessed, "to assess", "accent")}
+                    {repStat(notApplicable, "N/A", "dim")}
+                </div>
+            </div>
+        </div>
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Controls</h2>
+                <p class="text-xs text-dim">{`${rows.size()} controls, exhaustive per-control conformance.`}</p>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                        <th class="py-2 pr-4">Reference</th><th class="py-2 pr-4">Control</th><th class="py-2 pr-4">Type</th><th class="py-2 pr-4">Conformity</th><th class="py-2 pr-4">Note</th>
+                    </tr></thead>
+                    <tbody>
+                        {for (i in 0..rows.size()) { controlAssessmentRow(rows.at(i)); }}
+                        {if (rows.size() == 0) {
+                            <tr><td colspan="5" class="py-10 text-center text-dim">No controls for this framework.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>;
+}

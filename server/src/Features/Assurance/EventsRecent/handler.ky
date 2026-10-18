@@ -1,0 +1,39 @@
+// GET /events/recent -> {"events":[...],"count":n} from violation_events.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.AssuranceRepository;
+import Domain.Dtos.ViolationRow;
+
+pub fn violationJson(v: ViolationRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(12, string.hash);
+    m.set("id", json.str(v.id)); m.set("kind", json.str(v.kind)); m.set("pep", json.str(v.pep));
+    m.set("agent", json.str(v.agent)); m.set("tool", json.str(v.tool)); m.set("verdict", json.str(v.verdict));
+    m.set("rule_id", json.str(v.rule_id)); m.set("impact", json.str(v.impact));
+    m.set("outcome", json.str(v.outcome)); m.set("ts_ms", json.number(v.ts_ms));
+    return json.object(m);
+}
+
+pub struct EventsRecentHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: EventsRecentHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.listViolations(100);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(violationJson(rows.items.getOr(i, ViolationRow{ id: "", kind: "", pep: "", agent: "", tool: "", verdict: "", rule_id: "", impact: "", outcome: "", ts_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("events", json.array(arr));
+        m.set("count", json.number(arr.size() as long));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,46 @@
+// GET /packs -> loaded control-pack artifacts: {"packs":[{id,name,controls,is_builtin}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.PolicyPacks.Shared.PackRepository;
+import Domain.Dtos.PackRows;
+
+pub fn packArtifactJson(r: PackArtifactRow): json.JsonValue {
+    let count: long = 0;
+    let bv = json.tryParse(r.body);
+    if (bv != undefined) {
+        let cs = json.asArray(json.get(bv ?? json.null(), "controls"));
+        if (cs != undefined) { count = (cs ?? list.List<json.JsonValue>()).size() as long; }
+    }
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("name", json.str(r.name));
+    m.set("controls", json.number(count));
+    m.set("is_builtin", json.bool(string.eql(r.tenant_id, "system")));
+    return json.object(m);
+}
+
+pub struct PacksListHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: PacksListHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listPackArtifacts(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(packArtifactJson(rows.items.getOr(i, PackArtifactRow{ id: "", name: "", tenant_id: "", body: "{}" })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("packs", json.array(arr));
+        return Http.okObj(m);
+    }
+}

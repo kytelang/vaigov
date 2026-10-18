@@ -1,0 +1,47 @@
+// POST /systems/{id}/update -> {"ok":true}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+
+pub struct UpdateSystemHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: UpdateSystemHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str("unknown system"));
+            return Http.okObj(e);
+        }
+        let sys = srows.items.getOr(0, SystemRow{ id:"", name:"", purpose:"", owner:"", lifecycle_state:"", risk_tier:"", sector:"", asset_type:"", jurisdictions:"[]", tenant:"", created_ms:0, updated_ms:0 });
+        let body = Http.bodyJson(ctx);
+        let name = systemhelp.sysStr(body, "name"); if (name.length == 0) { name = sys.name; }
+        let purpose = systemhelp.sysStr(body, "purpose"); if (purpose.length == 0) { purpose = sys.purpose; }
+        let owner = systemhelp.sysStr(body, "owner"); if (owner.length == 0) { owner = sys.owner; }
+        let lifecycle = systemhelp.sysStr(body, "lifecycle_state"); if (lifecycle.length == 0) { lifecycle = sys.lifecycle_state; }
+        let riskTier = systemhelp.sysStr(body, "risk_tier"); if (riskTier.length == 0) { riskTier = sys.risk_tier; }
+        let sector = systemhelp.sysStr(body, "sector"); if (sector.length == 0) { sector = sys.sector; }
+        let assetType = systemhelp.sysStr(body, "asset_type"); if (assetType.length == 0) { assetType = sys.asset_type; }
+        let jur = sys.jurisdictions;
+        if (body.kind == 5 && json.has(body, "jurisdictions")) { jur = json.stringify(json.get(body, "jurisdictions")); }
+        let now = Http.nowMs();
+        await self.repo.updateSystem(id, name, purpose, owner, lifecycle, riskTier, sector, assetType, jur, tenant, now);
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "system-updated", "system", name, tenant, now);
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("ok", json.bool(true));
+        return Http.okObj(m);
+    }
+}

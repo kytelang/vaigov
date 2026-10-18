@@ -1,0 +1,94 @@
+// First-party console mutations for the Ticketing screen (back views/ticketing.kyx):
+// add an automation rule (connector-specific target), enable/disable, delete. Returns
+// the refreshed #ticketing fragment. Trusted /console/* (no bearer); the machine
+// /ticket-rules JSON API keeps its checks.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Ticketing.Shared.TicketRepository;
+import Features.Ticketing.views.ticketing;
+import Domain.Dtos.TicketRuleRow;
+
+fn tkTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+fn sig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+
+async fn renderPanel(repo: TicketRepository, tenant: string, signals: string): Response {
+    let rules = await repo.listRules(tenant);
+    let tickets = await repo.listTickets(tenant);
+    return await ConsoleDs.patchAndSignals(ticketing.ticketingPanel(rules.items, tickets.items), signals);
+}
+
+fn targetJson(body: json.JsonValue, connector: string): string {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    if (string.eql(connector, "webhook")) {
+        m.set("url", json.str(sig(body, "tkUrl")));
+    } else if (string.eql(connector, "servicenow")) {
+        m.set("instance", json.str(sig(body, "tkInstance")));
+        let tbl = sig(body, "tkTable"); if (tbl.length == 0) { tbl = "incident"; }
+        m.set("table", json.str(tbl));
+    } else {
+        m.set("base", json.str(sig(body, "tkBase")));
+        m.set("project_key", json.str(sig(body, "tkProject")));
+        let lbl = sig(body, "tkLabel"); if (lbl.length > 0) { m.set("label", json.str(lbl)); }
+    }
+    return json.stringify(json.object(m));
+}
+
+pub struct TicketingSaveHandler impl RouteHandler {
+    app: AppContext,
+    repo: TicketRepository,
+    init(app: AppContext) { self.app = app; self.repo = TicketRepository(app.db); }
+    async fn serve(self: TicketingSaveHandler, ctx: routing.Context): Response {
+        let tenant = tkTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = sig(body, "tkName");
+        if (name.length == 0) { return await renderPanel(self.repo, tenant, "{\"tkErr\":\"Name is required.\"}"); }
+        let connector = sig(body, "tkConnector"); if (connector.length == 0) { connector = "webhook"; }
+        let throttle = string.parseInt(sig(body, "tkThrottle")) ?? 3600;
+        let id = string.concat("tr-", random.randomHex(6));
+        await self.repo.addRule(id, tenant, name, sig(body, "tkVerdict"), sig(body, "tkControl"), sig(body, "tkResource"), connector, targetJson(body, connector), throttle, Http.nowMs());
+        return await renderPanel(self.repo, tenant, "{\"tkModal\":\"\",\"tkErr\":\"\"}");
+    }
+}
+
+pub struct TicketingToggleHandler impl RouteHandler {
+    app: AppContext,
+    repo: TicketRepository,
+    init(app: AppContext) { self.app = app; self.repo = TicketRepository(app.db); }
+    async fn serve(self: TicketingToggleHandler, ctx: routing.Context): Response {
+        let tenant = tkTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "tkId");
+        let rules = await self.repo.listRules(tenant);
+        let i = 0;
+        while (i < rules.items.size()) {
+            let r = rules.items.getOr(i, TicketRuleRow{ id:"", name:"", enabled:0, match_verdict:"", match_control:"", match_resource:"", connector:"", target_json:"{}", throttle_sec:3600 });
+            if (string.eql(r.id, id)) {
+                await self.repo.setEnabled(r.id, tenant, r.enabled == 0);
+                i = rules.items.size();
+            } else { i = i + 1; }
+        }
+        return await renderPanel(self.repo, tenant, "{\"tkModal\":\"\",\"tkErr\":\"\"}");
+    }
+}
+
+pub struct TicketingDeleteHandler impl RouteHandler {
+    app: AppContext,
+    repo: TicketRepository,
+    init(app: AppContext) { self.app = app; self.repo = TicketRepository(app.db); }
+    async fn serve(self: TicketingDeleteHandler, ctx: routing.Context): Response {
+        let tenant = tkTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "tkId");
+        if (id.length > 0) { await self.repo.deleteRule(id, tenant); }
+        return await renderPanel(self.repo, tenant, "{\"tkModal\":\"\",\"tkErr\":\"\"}");
+    }
+}

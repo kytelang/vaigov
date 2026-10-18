@@ -1,0 +1,21 @@
+// GET /policy/view -> the Policy hypermedia view (Datastar fragment), rendering
+// the authored rule set (acp/console PolicyView.vue, read half). Reads the shared
+// RuleRepository, the same source the compiler reads to produce the OPA bundle.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Rules.Shared.RuleRepository;
+import Features.Policy.views.policy;
+
+pub struct PolicyViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: RuleRepository,
+    init(app: AppContext) { self.app = app; self.repo = RuleRepository(app.db); }
+
+    async fn serve(self: PolicyViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rs = await self.repo.list(tenant);
+        return await ds_response.patch(policy.policyPanel(rs.items, "", "", ""));
+    }
+}

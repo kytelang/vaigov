@@ -1,0 +1,14 @@
+// Read DTO: the shape the evidence views render. Derived from EvidenceItem by the
+// feature mapper. Fields camelCase; @from bridges the snake_case entity columns.
+@serializable
+pub struct EvidenceDto {
+    pub id: string,
+    @from("system_id") pub systemId: string,
+    pub framework: string,
+    @from("control_id") pub controlId: string,
+    pub title: string,
+    pub source: string,
+    pub owner: string,
+    @from("valid_until_ms") pub validUntilMs: long,
+    @from("created_ms") pub createdMs: long,
+}

@@ -1,0 +1,42 @@
+// GET /vendors -> {"vendors":[{id,name,risk_json,tenant,review_due_ms,created_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Vendors.Shared.VendorRepository;
+import Domain.Dtos.VendorListRow;
+
+pub fn vendorRowJson(r: VendorListRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("name", json.str(r.name));
+    m.set("risk_json", json.str(r.risk_json));
+    m.set("tenant", json.str(r.tenant));
+    m.set("review_due_ms", json.number(r.review_due_ms));
+    m.set("created_ms", json.number(r.created_ms));
+    return json.object(m);
+}
+
+pub struct ListVendorsHandler impl RouteHandler {
+    repo: VendorRepository,
+    app: AppContext,
+    init(repo: VendorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListVendorsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(vendorRowJson(rows.items.getOr(i, VendorListRow{ id: "", name: "", risk_json: "{}", tenant: "", review_due_ms: 0, created_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("vendors", json.array(arr));
+        return Http.okObj(m);
+    }
+}

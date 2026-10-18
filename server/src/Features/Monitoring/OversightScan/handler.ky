@@ -1,0 +1,29 @@
+// POST /oversight/scan -> {"ok":true,"flagged":n,"findings":[...]}. Analyse and
+// write a signed governance finding per flagged approver.
+// NOTE: approver analysis + signed-finding write (acp_core::oversight) is not
+// ported; returns zero findings. The route exists so the console flow works.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Monitoring.Shared.MonitorRepository;
+
+pub struct OversightScanHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: OversightScanHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("flagged", json.number(0));
+        m.set("findings", json.array(list.List<json.JsonValue>()));
+        return Http.okObj(m);
+    }
+}

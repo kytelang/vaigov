@@ -1,0 +1,38 @@
+// Rows for the Assurance feature, over acp's shared tables.
+@serializable pub struct ViolationRow {
+    pub id: string,
+    pub kind: string,
+    pub pep: string,
+    pub agent: string,
+    pub tool: string,
+    pub verdict: string,
+    pub rule_id: string,
+    pub impact: string,
+    pub outcome: string,
+    pub ts_ms: long,
+}
+
+// A red-team attestation stored in grc_records (kind='attestation').
+@serializable pub struct RedteamAttestRow {
+    pub id: string,
+    pub status: string,
+    pub created_ms: long,
+    pub body: string,
+    pub pubkey_hex: string,
+    pub sig_hex: string,
+}
+
+// The tenant's firewall_config row (subset used by the red-team + threat-pack path).
+@serializable pub struct FwRow {
+    pub deny_topics: string,
+    pub threat_signatures: string,
+    pub block_secrets: int,
+    pub block_toxicity: int,
+    pub model: string,
+    pub feed_version: long,
+}
+
+// A one-column probe for existence checks.
+@serializable pub struct AsrProbe {
+    pub one: int,
+}

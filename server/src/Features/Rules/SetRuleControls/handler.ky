@@ -1,0 +1,29 @@
+// POST /rules/{id}/controls -> {"ok":true,"count":n} (EditPolicy). Mirrors acp rule_set_controls.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.Shared.rulebody;
+
+pub struct SetRuleControlsHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SetRuleControlsHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+        let ids = rulebody.ruleBodyStrArray(body, "controls");
+        let n = await self.repo.setControls(id, ids);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("count", json.number(n as long));
+        return Http.okObj(m);
+    }
+}

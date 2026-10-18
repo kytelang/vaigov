@@ -1,0 +1,71 @@
+// GET /systems/{id}/report/{framework}?as_at= -> the per-system conformance report.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+import Domain.Dtos.SystemDtos;
+
+pub struct SystemReportHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SystemReportHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let framework = ctx.param("framework");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(1, string.hash); e.set("error", json.str("system not found")); return Http.okObj(e);
+        }
+        let sys = srows.items.getOr(0, SystemRow{ id:"", name:"", purpose:"", owner:"", lifecycle_state:"", risk_tier:"", sector:"", asset_type:"", jurisdictions:"[]", tenant:"", created_ms:0, updated_ms:0 });
+        let roleRows = await self.repo.listRoles(id, tenant);
+        let roles = list.List<SystemRoleRow>();
+        let ri = 0;
+        while (ri < roleRows.items.size()) { roles.push(roleRows.items.getOr(ri, SystemRoleRow{ id:"", system_id:"", role:"", jurisdiction:"", market_date:"", created_ms:0 })); ri = ri + 1; }
+        let profile = systemhelp.systemProfile(sys, roles);
+
+        let now = Http.nowMs();
+        let asAt = now;
+        let asAtQ = ctx.query("as_at");
+        if (asAtQ.length > 0) { asAt = json.asNumber(json.number(0)) ?? now; asAt = parseLong(asAtQ, now); }
+
+        // Fresh evidence keys "framework:control_id".
+        let evRows = await self.repo.listEvidence(id, tenant);
+        let fresh = list.List<string>();
+        let ei = 0;
+        while (ei < evRows.items.size()) {
+            let e = evRows.items.getOr(ei, SystemEvidenceRow{ id:"", framework:"", control_id:"", title:"", source:"", owner:"", produced_ms:0, valid_until_ms:0 });
+            if (e.produced_ms <= asAt && (e.valid_until_ms == 0 || e.valid_until_ms > asAt)) {
+                fresh.push(string.concat(string.concat(e.framework, ":"), e.control_id));
+            }
+            ei = ei + 1;
+        }
+
+        let soaRows = await self.repo.listAllSoa(id, tenant);
+        let soa = list.List<SoaStoredRow>();
+        let si = 0;
+        while (si < soaRows.items.size()) {
+            let e = soaRows.items.getOr(si, SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 });
+            if (e.updated_ms <= asAt) { soa.push(e); }
+            si = si + 1;
+        }
+
+        let report = systemhelp.systemReportJson(sys, profile, framework, soa, fresh, asAt, now);
+        let r = response.Response(Status.Ok, json.stringify(report));
+        r.headers.set("Content-Type", "application/json");
+        return r;
+    }
+}
+
+fn parseLong(s: string, dflt: long): long {
+    let v = json.tryParse(s);
+    if (v == undefined) { return dflt; }
+    return json.asNumber(v ?? json.null()) ?? dflt;
+}

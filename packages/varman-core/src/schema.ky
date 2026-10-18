@@ -1,0 +1,183 @@
+//! The PostgreSQL schema of the evidence ledger, as `data.migrate` migrations.
+//!
+//! A port of the SQLite `SCHEMA` string in Rust `acp-core`'s `ledger/mod.rs` to
+//! native PostgreSQL DDL, carried across the migration decision in the design
+//! doc (sections 4.3 and 5.3): PostgreSQL is the single control-plane store and
+//! the sqlx `Any` dialect layer is dropped, so the DDL can use native Postgres
+//! types and real constraints instead of the TEXT/BIGINT-only shape SQLite
+//! forced.
+//!
+//! Three tables carry the log:
+//!
+//!   - `records`     one row per evidence leaf. The columns spell out the
+//!                   `types.Record` shape (schema, seq, ts_ms, hlc, agent_id,
+//!                   principal split into id + verified, session_id, tool,
+//!                   args_hash, impact split into level + taxonomy, verdict,
+//!                   rule_id, matched, policy_hash, reason, and the five
+//!                   provenance fields), plus `decision_id` (UNIQUE, the
+//!                   idempotency key), and the stored `canonical` bytes and
+//!                   `leaf_hash` so the tree can be rebuilt and re-verified
+//!                   without re-deriving them.
+//!   - `args_blob`   the separately-purgeable argument payloads, keyed by
+//!                   `args_hash`, with an at-rest `encrypted` flag (the 0x01
+//!                   envelope-tag convention of the Rust `encode_blob`).
+//!   - `tree_heads`  one signed head per append (`tree_size` PRIMARY KEY,
+//!                   `root_hash`, `timestamp_ms`, and the detached
+//!                   `sig_hex`/`pubkey_hex` so a head is offline-verifiable).
+//!
+//! Append-only enforcement (design 5.3): a `BEFORE UPDATE OR DELETE` trigger on
+//! both `records` and `tree_heads` raises, the direct Postgres equivalent of the
+//! SQLite `RAISE(ABORT, ...)` triggers. This is reinforced in production by a
+//! NOSUPERUSER application role that holds no UPDATE/DELETE grant on those two
+//! tables; because the role name is deployment-specific, the grant statements
+//! are offered as a helper ([`appRoleHardeningSql`]) for the operator to run
+//! rather than baked into an auto-applied migration.
+//!
+//! [`migrations`] returns the ordered list a `data.migrate` runner applies.
+
+import string;
+import list;
+import data.migrate;
+
+/// Table name for the evidence leaves.
+pub const RECORDS_TABLE: string = "records";
+/// Table name for the separately-purgeable argument payloads.
+pub const ARGS_BLOB_TABLE: string = "args_blob";
+/// Table name for the signed tree heads.
+pub const TREE_HEADS_TABLE: string = "tree_heads";
+
+/// The `records` table DDL (native Postgres). `seq` is the explicit leaf index
+/// (the Merkle position), `decision_id` is the UNIQUE idempotency key, and the
+/// remaining columns mirror the `types.Record` value field by field. `canonical`
+/// holds the JCS canonical bytes of the record (compact ASCII JSON) and
+/// `leaf_hash` the RFC 6962 leaf hash, both stored so the log can be rebuilt and
+/// verified from the rows alone.
+pub fn recordsUpSql(): string {
+    return "CREATE TABLE IF NOT EXISTS records ("
+        + "seq BIGINT PRIMARY KEY, "
+        + "decision_id TEXT NOT NULL UNIQUE, "
+        + "schema INTEGER NOT NULL, "
+        + "ts_ms BIGINT NOT NULL, "
+        + "hlc TEXT NOT NULL, "
+        + "tool_server_fingerprint TEXT, "
+        + "agent_id TEXT NOT NULL, "
+        + "principal_id TEXT NOT NULL, "
+        + "principal_verified BOOLEAN NOT NULL, "
+        + "session_id TEXT NOT NULL, "
+        + "tool TEXT NOT NULL, "
+        + "args_hash TEXT NOT NULL, "
+        + "impact_level TEXT NOT NULL, "
+        + "impact_taxonomy TEXT NOT NULL, "
+        + "verdict TEXT NOT NULL, "
+        + "rule_id TEXT, "
+        + "matched TEXT, "
+        + "policy_hash TEXT NOT NULL, "
+        + "reason TEXT, "
+        + "prov_algo_hash TEXT NOT NULL, "
+        + "prov_algo_sig TEXT NOT NULL, "
+        + "prov_evaluator TEXT NOT NULL, "
+        + "prov_compiler TEXT NOT NULL, "
+        + "prov_context_derivation TEXT NOT NULL, "
+        + "canonical TEXT NOT NULL, "
+        + "leaf_hash TEXT NOT NULL, "
+        + "created_ms BIGINT NOT NULL"
+        + ")";
+}
+
+/// The `args_blob` table DDL. Keyed by `args_hash` so a repeated payload is
+/// stored once; `encrypted` records whether `blob` is an AES-GCM envelope
+/// (the Rust 0x01-tag convention) rather than plaintext JSON.
+pub fn argsBlobUpSql(): string {
+    return "CREATE TABLE IF NOT EXISTS args_blob ("
+        + "args_hash TEXT PRIMARY KEY, "
+        + "blob TEXT NOT NULL, "
+        + "encrypted BOOLEAN NOT NULL DEFAULT FALSE"
+        + ")";
+}
+
+/// The `tree_heads` table DDL. One signed head per append, keyed by `tree_size`.
+/// `sig_hex` and `pubkey_hex` make each head a detached, offline-verifiable
+/// signature over the canonical STH bytes.
+pub fn treeHeadsUpSql(): string {
+    return "CREATE TABLE IF NOT EXISTS tree_heads ("
+        + "tree_size BIGINT PRIMARY KEY, "
+        + "root_hash TEXT NOT NULL, "
+        + "timestamp_ms BIGINT NOT NULL, "
+        + "sig_hex TEXT NOT NULL, "
+        + "pubkey_hex TEXT NOT NULL"
+        + ")";
+}
+
+/// The shared PL/pgSQL trigger function that raises on any write: the Postgres
+/// equivalent of the SQLite `RAISE(ABORT, 'append-only')`. `CREATE OR REPLACE`
+/// so re-applying is harmless.
+pub fn appendOnlyFnSql(): string {
+    return "CREATE OR REPLACE FUNCTION varman_append_only() RETURNS trigger AS $$ "
+        + "BEGIN RAISE EXCEPTION 'append-only: % on % is forbidden', TG_OP, TG_TABLE_NAME; END; "
+        + "$$ LANGUAGE plpgsql";
+}
+
+/// `BEFORE UPDATE OR DELETE` trigger wiring the append-only function onto
+/// `records`.
+pub fn recordsTriggerSql(): string {
+    return "CREATE TRIGGER records_append_only BEFORE UPDATE OR DELETE ON records "
+        + "FOR EACH ROW EXECUTE FUNCTION varman_append_only()";
+}
+
+/// `BEFORE UPDATE OR DELETE` trigger wiring the append-only function onto
+/// `tree_heads`.
+pub fn treeHeadsTriggerSql(): string {
+    return "CREATE TRIGGER tree_heads_append_only BEFORE UPDATE OR DELETE ON tree_heads "
+        + "FOR EACH ROW EXECUTE FUNCTION varman_append_only()";
+}
+
+/// Operator helper (NOT an auto-applied migration): the grants that harden the
+/// append-only guarantee with role grants, as design 5.3 requires. `role` is the
+/// NOSUPERUSER application role. The role keeps SELECT and INSERT on the two
+/// evidence tables but never UPDATE or DELETE, so even a compromised app
+/// connection cannot rewrite history; the trigger is the second line of defence.
+/// The role name is deployment-specific, which is why this is a helper the
+/// operator runs, not a migration.
+pub fn appRoleHardeningSql(role: string): string {
+    return "REVOKE UPDATE, DELETE ON records, tree_heads FROM " + role + "; "
+        + "GRANT SELECT, INSERT ON records, tree_heads TO " + role + ";";
+}
+
+/// The ordered migration set a `data.migrate` runner applies. Versions are a
+/// simple ascending counter; each step is expand-only (create table / create
+/// trigger), so it is safe to apply during a rolling deploy. The `down` scripts
+/// drop in reverse dependency order (triggers and function before the tables).
+pub fn migrations(): list.List<migrate.Migration> {
+    let ms = list.List<migrate.Migration>();
+
+    ms.push(migrate.migration(
+        1,
+        "create_records",
+        recordsUpSql(),
+        migrate.dropTableSql("records")));
+
+    ms.push(migrate.migration(
+        2,
+        "create_args_blob",
+        argsBlobUpSql(),
+        migrate.dropTableSql("args_blob")));
+
+    ms.push(migrate.migration(
+        3,
+        "create_tree_heads",
+        treeHeadsUpSql(),
+        migrate.dropTableSql("tree_heads")));
+
+    // The append-only function plus both triggers land as one step so a database
+    // never has the tables without their write guard. The down drops the two
+    // triggers and the function.
+    ms.push(migrate.migration(
+        4,
+        "append_only_triggers",
+        appendOnlyFnSql() + "; " + recordsTriggerSql() + "; " + treeHeadsTriggerSql(),
+        "DROP TRIGGER IF EXISTS records_append_only ON records; "
+            + "DROP TRIGGER IF EXISTS tree_heads_append_only ON tree_heads; "
+            + "DROP FUNCTION IF EXISTS varman_append_only()"));
+
+    return ms;
+}

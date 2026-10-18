@@ -1,0 +1,38 @@
+// GET /auth/entra/bindings -> {"bindings":[{entra_tid,tenant_id,issuer,status}]}.
+// Onboarded customer Entra tenants (from the in-memory binding map).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct EntraBindingsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraBindingsHandler, ctx: routing.Context): response.Response {
+        let arr = list.List<json.JsonValue>();
+        let keys = self.app.trust.entraBindings.keys();
+        let i = 0;
+        while (i < keys.size()) {
+            let b = self.app.trust.entraBindings.get(keys.get(i) ?? "");
+            if (b != undefined) {
+                let bb = b ?? Auth.EntraBinding("", "", "", "", 0);
+                let m = Map<string, json.JsonValue>(4, string.hash);
+                m.set("entra_tid", json.str(bb.tid));
+                m.set("tenant_id", json.str(bb.tenantId));
+                m.set("issuer", json.str(bb.issuer));
+                m.set("status", json.str(bb.status));
+                arr.push(json.object(m));
+            }
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(1, string.hash);
+        out.set("bindings", json.array(arr));
+        return Http.okObj(out);
+    }
+}

@@ -1,0 +1,33 @@
+// POST /ai-endpoints/{id} {host, port?=443, enabled?=true, note?} -> {"ok":true} (EditPolicy).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Endpoints.Shared.EndpointRepository;
+import Features.Endpoints.CreateEndpoint.handler;
+
+pub struct UpdateEndpointHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: UpdateEndpointHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let body = Http.bodyJson(ctx);
+        let host = string.trim(json.asString(json.get(body, "host")) ?? "");
+        if (host.length == 0) { return endpointOkFalse("host is required"); }
+        let port = (json.asNumber(json.get(body, "port")) ?? 443) as int;
+        let enabled = json.asBool(json.get(body, "enabled")) ?? true;
+        let note = json.asString(json.get(body, "note")) ?? "";
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.update(id, tenant, host, port, if (enabled) (1) else (0), note);
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("ok", json.bool(true));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,41 @@
+// VendorRepository: the `vendors` table in the shared `acp` db. Mirrors acp store.rs.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.VendorListRow;
+
+pub struct VendorRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: VendorRepository, tenant: string): Rows<VendorListRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<VendorListRow>(conn, "vendors").query(
+            "SELECT id, name, risk_json, tenant_id AS tenant, review_due_ms, created_ms FROM vendors WHERE tenant_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn add(self: VendorRepository, id: string, name: string, riskJson: string, tenant: string, reviewDueMs: long, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(name)); p.push(db.dbText(riskJson));
+        p.push(db.dbText(tenant)); p.push(db.dbLong(reviewDueMs)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO vendors (id, name, risk_json, tenant_id, review_due_ms, created_ms) VALUES ($1, $2, $3, $4, $5, $6)", p);
+        self.db.pool.release(conn);
+    }
+
+    // Returns true when a row was updated (one affected), matching acp set_vendor_review.
+    pub async fn setReview(self: VendorRepository, id: string, tenant: string, reviewDueMs: long): bool {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbLong(reviewDueMs)); p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await conn.exec("UPDATE vendors SET review_due_ms = $1 WHERE id = $2 AND tenant_id = $3", p);
+        self.db.pool.release(conn);
+        return r.rows_affected == 1;
+    }
+}

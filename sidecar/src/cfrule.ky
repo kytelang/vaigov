@@ -1,0 +1,98 @@
+//! Content-firewall rule model (content-firewall-design §3).
+//!
+//! A content rule is a deterministic check over request/response text, authored
+//! in the control plane and provisioned to the edge (signed, via the R5 loop).
+//! This module is the edge-side representation plus the JSON parse used when a
+//! pulled rule set is installed. The rule is a `class` (reference): it owns a
+//! string list and is held in a list, so value semantics would add ARC copies.
+
+import serde.json;
+import string;
+import list;
+
+pub class ContentRule {
+    pub id: string,                 // stable id, also used in evidence
+    pub name: string,               // human name, shown in the console
+    pub kind: string,               // regex | substr | secret | pii | size
+    pub pattern: string,            // regex / substring / detector selector
+    pub threshold: int,             // for kind="size"
+    pub target: string,             // request | response | both
+    pub action: string,             // block | shadow | step_up
+    pub severity: string,           // low | medium | high | critical
+    pub controlIds: list.List<string>,
+
+    init(id: string, name: string, kind: string, pattern: string) {
+        self.id = id;
+        self.name = name;
+        self.kind = kind;
+        self.pattern = pattern;
+        self.threshold = 0;
+        self.target = "request";
+        self.action = "block";
+        self.severity = "medium";
+        self.controlIds = list.List<string>();
+    }
+}
+
+fn js(v: json.JsonValue, key: string): string {
+    if (v.kind != 5 || !json.has(v, key)) { return ""; }
+    return json.asString(json.get(v, key)) ?? "";
+}
+
+fn ji(v: json.JsonValue, key: string): int {
+    if (v.kind != 5 || !json.has(v, key)) { return 0; }
+    let n = json.asNumber(json.get(v, key));
+    if (n == undefined) { return 0; }
+    return (n ?? 0) as int;
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+    if (!string.eql(a, "")) { return a; }
+    return b;
+}
+
+/// Parses one rule object into a ContentRule, defaulting missing fields.
+pub fn fromJson(o: json.JsonValue): ContentRule {
+    let r = ContentRule(js(o, "id"), js(o, "name"), firstNonEmpty(js(o, "kind"), "substr"), js(o, "pattern"));
+    r.threshold = ji(o, "threshold");
+    r.target = firstNonEmpty(js(o, "target"), "request");
+    // A missing action defaults to "block" (fail closed), NOT "shadow": an
+    // observe-only default would let a rule-set with omitted actions pass all
+    // traffic. A present-but-unknown action is preserved verbatim so the engine
+    // can fail it closed (deny) rather than mistaking a typo for "shadow -> allow".
+    r.action = firstNonEmpty(js(o, "action"), "block");
+    r.severity = firstNonEmpty(js(o, "severity"), "medium");
+    if (o.kind == 5 && json.has(o, "controls")) {
+        let cs = json.get(o, "controls");
+        if (cs.kind == 4) { // array
+            let arr = cs.arr ?? list.List<json.JsonValue>();
+            let i = 0;
+            while (i < arr.size()) {
+                let c = arr.get(i) ?? json.str("");
+                let s = json.asString(c);
+                if (s != undefined) { r.controlIds.push(s ?? ""); }
+                i = i + 1;
+            }
+        }
+    }
+    return r;
+}
+
+/// Parses a JSON array of rule objects (the pulled, verified active set).
+pub fn parseSet(bodyJson: string): list.List<ContentRule> {
+    let out = list.List<ContentRule>();
+    let root = json.parse(bodyJson);
+    let items = list.List<json.JsonValue>();
+    if (root.kind == 4) { items = root.arr ?? list.List<json.JsonValue>(); }
+    else if (root.kind == 5 && json.has(root, "rules")) { // {"rules":[...]}
+        let rr = json.get(root, "rules");
+        if (rr.kind == 4) { items = rr.arr ?? list.List<json.JsonValue>(); }
+    }
+    let i = 0;
+    while (i < items.size()) {
+        let o = items.get(i) ?? json.str("");
+        if (o.kind == 5) { out.push(fromJson(o)); }
+        i = i + 1;
+    }
+    return out;
+}

@@ -1,0 +1,869 @@
+//! The UI-authored policy rule model: compile to OPA Rego and evaluate in-process.
+//!
+//! A faithful port of Rust `acp-core`'s `rulemodel.rs`. A rule's match is a
+//! two-level boolean tree:
+//!   match = { combinator: "all"|"any", groups: [ { combinator: "all"|"any", conditions: [cond] } ] }
+//!   cond  = { target, op, value, negate? }
+//! Targets name a path into OPA's `input` (see `targetPath`); operators cover
+//! equality, ordering, set membership, substring and pattern matching. The tree
+//! is expanded to disjunctive normal form (OR of ANDs) so the Rego stays simple
+//! (one `results contains r if { .. }` block per AND-term) and the in-process
+//! evaluator mirrors it exactly: a rule fires if ANY term's conditions all hold.
+//!
+//! Rules and conditions are carried as `serde.json.JsonValue`, exactly as the
+//! Rust original carries `serde_json::Value`, so the shape is identical and the
+//! known-answer gate can build inputs from JSON literals.
+
+import string;
+import list;
+import map;
+import serde.json;
+import collections.string_builder;
+import canonical;
+import text.regex;
+
+/// A target resolved to its `input` path plus whether it is an array-membership
+/// target (groups/roles).
+pub struct TargetPath {
+    pub path: string,
+    pub isArr: bool,
+
+    init(path: string, isArr: bool) {
+        self.path = path;
+        self.isArr = isArr;
+    }
+}
+
+/// Map a target name to its `input` path, and whether it is an array-membership
+/// target. Mirrors Rust `target_path`.
+pub fn targetPath(target: string): TargetPath {
+    if (string.eql(target, "subject.id")) { return TargetPath("input.subject.id", false); }
+    if (string.eql(target, "subject.kind")) { return TargetPath("input.subject.kind", false); }
+    if (string.eql(target, "subject.department")) { return TargetPath("input.subject.department", false); }
+    if (string.eql(target, "subject.group")) { return TargetPath("input.subject.groups", true); }
+    if (string.eql(target, "subject.role")) { return TargetPath("input.subject.roles", true); }
+    if (string.eql(target, "resource.id")) { return TargetPath("input.resource.id", false); }
+    if (string.eql(target, "resource.type")) { return TargetPath("input.resource.type", false); }
+    if (string.eql(target, "resource.classification")) { return TargetPath("input.resource.classification", false); }
+    if (string.eql(target, "resource.region")) { return TargetPath("input.resource.region", false); }
+    if (string.eql(target, "resource.sensitivity")) { return TargetPath("input.resource.sensitivity", false); }
+    if (string.eql(target, "operation")) { return TargetPath("input.operation", false); }
+    if (string.eql(target, "context.time_hour")) { return TargetPath("input.context.time_hour", false); }
+    if (string.eql(target, "context.cost_usd")) { return TargetPath("input.context.cost_usd", false); }
+    if (string.eql(target, "context.tokens")) { return TargetPath("input.context.tokens", false); }
+    if (string.eql(target, "context.env")) { return TargetPath("input.context.env", false); }
+    // args.* (or a bare field name) -> input.args["field"].
+    let f = target;
+    if (string.startsWith(target, "args.")) { f = string.slice(target, 5, target.length); }
+    return TargetPath(`input.args[${json.quote(f)}]`, false);
+}
+
+// Render a JSON value as a Rego scalar. Numeric-looking strings become numbers
+// (so `> 5` works when the UI delivered "5" as text). Mirrors `rego_scalar`.
+fn regoScalar(v: json.JsonValue): string {
+    if (v.kind == 2) {
+        // number: emit its text form (integer or literal).
+        if (v.numIsInt) { return json.stringify(v); }
+        return json.stringify(v);
+    }
+    if (v.kind == 1) { return if (v.bval) "true" else "false"; }
+    if (v.kind == 3) {
+        let s = v.sval;
+        let asLong = string.parseLong(s);
+        if (asLong != undefined) { return json.stringify(json.number(asLong)); }
+        let asDouble = string.parseDouble(s);
+        if (asDouble != undefined) { return s; }
+        return json.quote(s);
+    }
+    // arrays/objects/null: quote their stringified form (matches Rust's debug of a string).
+    return json.quote(json.stringify(v));
+}
+
+// The list of scalars for `in`/`not_in`: a JSON array, or a comma-separated
+// string. Mirrors `value_list`.
+fn valueList(v: json.JsonValue): List<string> {
+    let out = List<string>();
+    if (v.kind == 4) {
+        let arr = json.asArray(v) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) { out.push(regoScalar(arr.at(i))); i = i + 1; }
+        return out;
+    }
+    if (v.kind == 3) {
+        let parts = string.split(v.sval, ",");
+        let i = 0;
+        while (i < parts.size()) {
+            let t = string.trim(parts.at(i));
+            if (t.length > 0) { out.push(regoScalar(json.str(t))); }
+            i = i + 1;
+        }
+        return out;
+    }
+    out.push(regoScalar(v));
+    return out;
+}
+
+// Complementary operator for negation folding, or undefined when none exists.
+// Mirrors `flip`.
+fn flip(op: string): string | undefined {
+    if (string.eql(op, "eq")) { return "ne"; }
+    if (string.eql(op, "ne")) { return "eq"; }
+    if (string.eql(op, "gt")) { return "le"; }
+    if (string.eql(op, "le")) { return "gt"; }
+    if (string.eql(op, "lt")) { return "ge"; }
+    if (string.eql(op, "ge")) { return "lt"; }
+    if (string.eql(op, "in")) { return "not_in"; }
+    if (string.eql(op, "not_in")) { return "in"; }
+    return undefined;
+}
+
+fn condTarget(c: json.JsonValue): string {
+    return json.asString(json.get(c, "target")) ?? "";
+}
+fn condOp(c: json.JsonValue): string {
+    return json.asString(json.get(c, "op")) ?? "eq";
+}
+fn condNegate(c: json.JsonValue): bool {
+    return json.asBool(json.get(c, "negate")) ?? false;
+}
+fn condValue(c: json.JsonValue): json.JsonValue {
+    if (json.has(c, "value")) { return json.get(c, "value"); }
+    return json.null();
+}
+
+/// Compile one condition to a Rego expression, or undefined when the target is
+/// empty. Mirrors `cond_to_rego`.
+pub fn condToRego(c: json.JsonValue): string | undefined {
+    let target = condTarget(c);
+    if (target.length == 0) { return undefined; }
+    let op = condOp(c);
+    let negate = condNegate(c);
+    let val = condValue(c);
+    let tp = targetPath(target);
+    let path = tp.path;
+
+    // Fold negation into a complementary operator where one exists.
+    if (negate) {
+        let f = flip(op);
+        if (f != undefined) { op = f; negate = false; }
+    }
+
+    if (tp.isArr) {
+        let member = regoScalar(val);
+        if (string.eql(op, "not_in")) { return `not ${member} in ${path}`; }
+        return `${member} in ${path}`;
+    }
+
+    let expr = "";
+    if (string.eql(op, "ne")) { expr = `${path} != ${regoScalar(val)}`; }
+    else if (string.eql(op, "gt")) { expr = `${path} > ${regoScalar(val)}`; }
+    else if (string.eql(op, "lt")) { expr = `${path} < ${regoScalar(val)}`; }
+    else if (string.eql(op, "ge")) { expr = `${path} >= ${regoScalar(val)}`; }
+    else if (string.eql(op, "le")) { expr = `${path} <= ${regoScalar(val)}`; }
+    else if (string.eql(op, "in")) { expr = `${path} in [${string.join(valueList(val), ", ")}]`; }
+    else if (string.eql(op, "not_in")) { expr = `not ${path} in [${string.join(valueList(val), ", ")}]`; }
+    else if (string.eql(op, "contains")) { expr = `contains(${path}, ${regoScalar(val)})`; }
+    else if (string.eql(op, "startswith")) { expr = `startswith(${path}, ${regoScalar(val)})`; }
+    else if (string.eql(op, "endswith")) { expr = `endswith(${path}, ${regoScalar(val)})`; }
+    else if (string.eql(op, "matches")) { expr = `regex.match(${regoScalar(val)}, ${path})`; }
+    else if (string.eql(op, "glob")) { expr = `glob.match(${regoScalar(val)}, null, ${path})`; }
+    else { expr = `${path} == ${regoScalar(val)}`; }
+
+    if (negate) { return `not ${expr}`; }
+    return expr;
+}
+
+// Terms for one group: `all` -> a single term with every condition; `any` ->
+// one term per condition. Mirrors `group_terms`.
+fn groupTerms(group: json.JsonValue): List<List<json.JsonValue>> {
+    let out = List<List<json.JsonValue>>();
+    let conds = json.asArray(json.get(group, "conditions")) ?? List<json.JsonValue>();
+    let any = string.eql(json.asString(json.get(group, "combinator")) ?? "all", "any");
+    if (conds.size() == 0) {
+        out.push(List<json.JsonValue>());
+        return out;
+    }
+    if (any) {
+        let i = 0;
+        while (i < conds.size()) {
+            let t = List<json.JsonValue>();
+            t.push(conds.at(i));
+            out.push(t);
+            i = i + 1;
+        }
+        return out;
+    }
+    out.push(conds);
+    return out;
+}
+
+// Build the match tree for a rule, honouring the `match` tree or falling back to
+// the legacy subject/resource/operation/condition fields. Mirrors `rule_match`.
+fn ruleMatch(rule: json.JsonValue): json.JsonValue {
+    if (json.has(rule, "match")) {
+        let m = json.get(rule, "match");
+        if (m.kind == 5) {
+            let groups = json.asArray(json.get(m, "groups"));
+            if (groups != undefined && groups.size() > 0) { return m; }
+        }
+    }
+    // Legacy: subject + resource + operation + condition[] -> one all-group.
+    let conds = List<json.JsonValue>();
+    if (json.has(rule, "subject")) {
+        let sj = json.get(rule, "subject");
+        let kind = json.asString(json.get(sj, "kind")) ?? "any";
+        let sval = if (json.has(sj, "value")) (json.get(sj, "value")) else (json.null());
+        if (string.eql(kind, "agent") || string.eql(kind, "principal")) {
+            conds.push(mkCond("subject.id", "eq", sval));
+        } else if (string.eql(kind, "group")) {
+            conds.push(mkCond("subject.group", "in", sval));
+        }
+    }
+    let rid = json.asString(json.get(rule, "resource")) ?? "";
+    if (rid.length > 0) { conds.push(mkCond("resource.id", "eq", json.str(rid))); }
+    let oper = json.asString(json.get(rule, "operation")) ?? "";
+    if (oper.length > 0) { conds.push(mkCond("operation", "eq", json.str(oper))); }
+    if (json.has(rule, "condition")) {
+        let cs = json.asArray(json.get(rule, "condition")) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < cs.size()) {
+            let c = cs.at(i);
+            let field = json.asString(json.get(c, "field")) ?? "";
+            if (field.length > 0) {
+                let cop = if (json.has(c, "op")) (json.asString(json.get(c, "op")) ?? "eq") else ("eq");
+                let cval = if (json.has(c, "value")) (json.get(c, "value")) else (json.null());
+                conds.push(mkCond(`args.${field}`, cop, cval));
+            }
+            i = i + 1;
+        }
+    }
+    return mkGroupTree(conds);
+}
+
+fn mkCond(target: string, op: string, value: json.JsonValue): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("target", json.str(target));
+    m.set("op", json.str(op));
+    m.set("value", value);
+    return json.object(m);
+}
+
+fn mkGroupTree(conds: List<json.JsonValue>): json.JsonValue {
+    let group = Map<string, json.JsonValue>(8, string.hash);
+    group.set("combinator", json.str("all"));
+    group.set("conditions", json.array(conds));
+    let groups = List<json.JsonValue>();
+    groups.push(json.object(group));
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("combinator", json.str("all"));
+    m.set("groups", json.array(groups));
+    return json.object(m);
+}
+
+/// Expand a rule's match tree to disjunctive normal form: a list of AND-terms
+/// (each a list of conditions). The rule fires if ANY term's conditions all
+/// hold. Mirrors `dnf`.
+pub fn dnf(rule: json.JsonValue): List<List<json.JsonValue>> {
+    let m = ruleMatch(rule);
+    let groups = json.asArray(json.get(m, "groups")) ?? List<json.JsonValue>();
+    let out = List<List<json.JsonValue>>();
+    if (groups.size() == 0) {
+        out.push(List<json.JsonValue>());
+        return out;
+    }
+    let any = string.eql(json.asString(json.get(m, "combinator")) ?? "all", "any");
+    if (any) {
+        let gi = 0;
+        while (gi < groups.size()) {
+            let gt = groupTerms(groups.at(gi));
+            let ti = 0;
+            while (ti < gt.size()) { out.push(gt.at(ti)); ti = ti + 1; }
+            gi = gi + 1;
+        }
+        return out;
+    }
+    // cartesian product across groups, concatenating conditions.
+    let acc = List<List<json.JsonValue>>();
+    acc.push(List<json.JsonValue>());
+    let gi = 0;
+    while (gi < groups.size()) {
+        let gt = groupTerms(groups.at(gi));
+        let next = List<List<json.JsonValue>>();
+        let pi = 0;
+        while (pi < acc.size()) {
+            let prefix = acc.at(pi);
+            let ti = 0;
+            while (ti < gt.size()) {
+                let term = gt.at(ti);
+                let combined = List<json.JsonValue>();
+                let k = 0;
+                while (k < prefix.size()) { combined.push(prefix.at(k)); k = k + 1; }
+                k = 0;
+                while (k < term.size()) { combined.push(term.at(k)); k = k + 1; }
+                next.push(combined);
+                ti = ti + 1;
+            }
+            pi = pi + 1;
+        }
+        acc = next;
+        gi = gi + 1;
+    }
+    return acc;
+}
+
+// Build the self-describing decision object for a rule. Mirrors `decision_json`.
+fn decisionJson(rule: json.JsonValue): json.JsonValue {
+    let controls = List<json.JsonValue>();
+    let cs = json.asArray(json.get(rule, "controls"));
+    if (cs != undefined) {
+        let i = 0;
+        while (i < cs.size()) {
+            let c = cs.at(i);
+            let act = json.asString(json.get(c, "act"));
+            let cid = json.asString(json.get(c, "control_id"));
+            if (act != undefined && cid != undefined) {
+                controls.push(json.str(`${act}:${cid}`));
+            }
+            i = i + 1;
+        }
+    }
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("rule", json.str(json.asString(json.get(rule, "rule_id")) ?? ""));
+    m.set("verdict", json.str(json.asString(json.get(rule, "verdict")) ?? "deny"));
+    m.set("controls", json.array(controls));
+    if (json.has(rule, "obligations")) {
+        m.set("obligations", json.get(rule, "obligations"));
+    } else {
+        m.set("obligations", json.array(List<json.JsonValue>()));
+    }
+    let g = json.asString(json.get(rule, "approver_group")) ?? "";
+    if (g.length > 0) { m.set("approver_group", json.str(g)); }
+    return json.object(m);
+}
+
+fn ruleEnabled(r: json.JsonValue): bool {
+    return json.asBool(json.get(r, "enabled")) ?? true;
+}
+
+/// Compile a tenant's rules to a Rego module. Deny-overrides, then step-up, then
+/// allow, then the default. Mirrors `compile_rules`.
+pub fn compileRules(rules: List<json.JsonValue>, defaultVerdict: string): string {
+    let sb = string_builder.StringBuilder();
+    sb.append("package acp\n\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.contains\n\n");
+    let ri = 0;
+    while (ri < rules.size()) {
+        let r = rules.at(ri);
+        if (ruleEnabled(r)) {
+            let decision = canonical.canonicalBytesOfJson(decisionJson(r));
+            let terms = dnf(r);
+            let ti = 0;
+            while (ti < terms.size()) {
+                let term = terms.at(ti);
+                sb.append("results contains r if {\n");
+                let ci = 0;
+                while (ci < term.size()) {
+                    let expr = condToRego(term.at(ci));
+                    if (expr != undefined) { sb.append(`\t${expr}\n`); }
+                    ci = ci + 1;
+                }
+                sb.append(`\tr := ${decision}\n}\n\n`);
+                ti = ti + 1;
+            }
+        }
+        ri = ri + 1;
+    }
+    sb.append("decision := d if {\n\tsome d in results\n\td.verdict == \"deny\"\n} else := d if {\n\tsome d in results\n\td.verdict == \"step_up\"\n} else := d if {\n\tsome d in results\n} else := {\"verdict\": ");
+    sb.append(json.quote(defaultVerdict));
+    sb.append(", \"rule\": \"default\", \"controls\": [], \"obligations\": []}\n");
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}
+
+// ---- in-process evaluator (mirror of the Rego semantics above) ----
+
+// Resolve a target to its value within `input`, tolerating a flat form
+// (input.subject as a string standing for its .id). Mirrors `resolve`.
+fn resolve(target: string, input: json.JsonValue): json.JsonValue | undefined {
+    if (string.startsWith(target, "args.")) {
+        let field = string.slice(target, 5, target.length);
+        let args = json.get(input, "args");
+        if (args.kind == 5 && json.has(args, field)) { return json.get(args, field); }
+        return undefined;
+    }
+    let path = List<string>();
+    if (string.eql(target, "subject.group")) { path.push("subject"); path.push("groups"); }
+    else if (string.eql(target, "subject.role")) { path.push("subject"); path.push("roles"); }
+    else if (string.eql(target, "operation")) { path.push("operation"); }
+    else {
+        let parts = string.split(target, ".");
+        let i = 0;
+        while (i < parts.size()) { path.push(parts.at(i)); i = i + 1; }
+    }
+    // Allow input.subject / input.resource to be a bare string standing for .id.
+    if (path.size() == 2 && string.eql(path.at(1), "id")) {
+        if (json.has(input, path.at(0))) {
+            let head = json.get(input, path.at(0));
+            if (head.kind == 3) { return head; }
+        }
+    }
+    let cur = input;
+    let i = 0;
+    while (i < path.size()) {
+        if (cur.kind != 5 || !json.has(cur, path.at(i))) { return undefined; }
+        cur = json.get(cur, path.at(i));
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn asF64(v: json.JsonValue): double | undefined {
+    if (v.kind == 2) { return json.asFloat(v); }
+    if (v.kind == 3) { return string.parseDouble(v.sval); }
+    return undefined;
+}
+
+fn asStr(v: json.JsonValue): string | undefined {
+    if (v.kind == 3) { return v.sval; }
+    if (v.kind == 2) { return json.stringify(v); }
+    if (v.kind == 1) { return if (v.bval) "true" else "false"; }
+    return undefined;
+}
+
+// Members of a value for `in`/`not_in`. Mirrors `value_members`.
+fn valueMembers(v: json.JsonValue): List<string> {
+    let out = List<string>();
+    if (v.kind == 4) {
+        let arr = json.asArray(v) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) {
+            let s = asStr(arr.at(i));
+            if (s != undefined) { out.push(s); }
+            i = i + 1;
+        }
+        return out;
+    }
+    if (v.kind == 3) {
+        let parts = string.split(v.sval, ",");
+        let i = 0;
+        while (i < parts.size()) {
+            let t = string.trim(parts.at(i));
+            if (t.length > 0) { out.push(t); }
+            i = i + 1;
+        }
+        return out;
+    }
+    let s = asStr(v);
+    if (s != undefined) { out.push(s); }
+    return out;
+}
+
+// Minimal glob: `*` matches any run, `?` one char. Mirrors `glob_match`.
+fn globMatch(pattern: string, s: string): bool {
+    let sb = string_builder.StringBuilder();
+    sb.appendChar(94); // ^
+    let i = 0;
+    while (i < pattern.length) {
+        let c = pattern[i];
+        if (c == 42) { sb.append(".*"); }         // *
+        else if (c == 63) { sb.append("."); }     // ?
+        else if (isRegexMeta(c)) { sb.appendChar(92); sb.appendChar(c); } // escape
+        else { sb.appendChar(c); }
+        i = i + 1;
+    }
+    sb.appendChar(36); // $
+    let pat = sb.toString();
+    sb.delete();
+    let re = regex.compile(pat);
+    return re.test(s);
+}
+
+fn isRegexMeta(c: int): bool {
+    // . + ( ) [ ] { } ^ $ | \
+    return c == 46 || c == 43 || c == 40 || c == 41 || c == 91 || c == 93
+        || c == 123 || c == 125 || c == 94 || c == 36 || c == 124 || c == 92;
+}
+
+// Evaluate one condition against `input`. Mirrors `eval_cond`.
+fn evalCond(c: json.JsonValue, input: json.JsonValue): bool {
+    let target = condTarget(c);
+    if (target.length == 0) { return true; }
+    let op = condOp(c);
+    let negate = condNegate(c);
+    if (negate) {
+        let f = flip(op);
+        if (f != undefined) { op = f; negate = false; }
+    }
+    let val = condValue(c);
+    let tp = targetPath(target);
+    let actual = resolve(target, input);
+
+    let base = false;
+    if (tp.isArr) {
+        let member = asStr(val) ?? "";
+        let inSet = false;
+        if (actual != undefined && actual.kind == 4) {
+            let arr = json.asArray(actual) ?? List<json.JsonValue>();
+            let i = 0;
+            while (i < arr.size()) {
+                let x = asStr(arr.at(i));
+                if (x != undefined && string.eql(x, member)) { inSet = true; }
+                i = i + 1;
+            }
+        }
+        base = if (string.eql(op, "not_in")) (!inSet) else (inSet);
+    } else {
+        if (actual == undefined) {
+            // missing field: condition false (so a leftover negate yields true).
+            return negate;
+        }
+        let a = actual;
+        if (string.eql(op, "eq")) { base = strEq(asStr(a), asStr(val)); }
+        else if (string.eql(op, "ne")) { base = !strEq(asStr(a), asStr(val)); }
+        else if (string.eql(op, "gt")) { base = cmpF64(asF64(a), asF64(val), 1); }
+        else if (string.eql(op, "lt")) { base = cmpF64(asF64(a), asF64(val), 2); }
+        else if (string.eql(op, "ge")) { base = cmpF64(asF64(a), asF64(val), 3); }
+        else if (string.eql(op, "le")) { base = cmpF64(asF64(a), asF64(val), 4); }
+        else if (string.eql(op, "in")) { base = membersHas(valueMembers(val), asStr(a) ?? ""); }
+        else if (string.eql(op, "not_in")) { base = !membersHas(valueMembers(val), asStr(a) ?? ""); }
+        else if (string.eql(op, "contains")) { base = string.contains(asStr(a) ?? "", asStr(val) ?? ""); }
+        else if (string.eql(op, "startswith")) { base = string.startsWith(asStr(a) ?? "", asStr(val) ?? ""); }
+        else if (string.eql(op, "endswith")) { base = string.endsWith(asStr(a) ?? "", asStr(val) ?? ""); }
+        else if (string.eql(op, "matches")) { base = regex.compile(asStr(val) ?? "").test(asStr(a) ?? ""); }
+        else if (string.eql(op, "glob")) { base = globMatch(asStr(val) ?? "", asStr(a) ?? ""); }
+        else { base = strEq(asStr(a), asStr(val)); }
+    }
+    if (negate && flip(op) == undefined) { return !base; }
+    return base;
+}
+
+fn strEq(a: string | undefined, b: string | undefined): bool {
+    if (a == undefined || b == undefined) { return a == undefined && b == undefined; }
+    return string.eql(a, b);
+}
+
+// mode: 1 gt, 2 lt, 3 ge, 4 le.
+fn cmpF64(a: double | undefined, b: double | undefined, mode: int): bool {
+    if (a == undefined || b == undefined) { return false; }
+    if (mode == 1) { return a > b; }
+    if (mode == 2) { return a < b; }
+    if (mode == 3) { return a >= b; }
+    return a <= b;
+}
+
+fn membersHas(members: List<string>, needle: string): bool {
+    let i = 0;
+    while (i < members.size()) {
+        if (string.eql(members.at(i), needle)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ruleFires(r: json.JsonValue, input: json.JsonValue): bool {
+    let terms = dnf(r);
+    let ti = 0;
+    while (ti < terms.size()) {
+        let term = terms.at(ti);
+        let all = true;
+        let ci = 0;
+        while (ci < term.size()) {
+            if (!evalCond(term.at(ci), input)) { all = false; }
+            ci = ci + 1;
+        }
+        if (all) { return true; }
+        ti = ti + 1;
+    }
+    return false;
+}
+
+/// Evaluate the rules against an input, returning the self-describing decision
+/// (same precedence as the compiled Rego: deny-overrides, then step_up, then
+/// allow, then the default). Mirrors `evaluate`.
+pub fn evaluate(rules: List<json.JsonValue>, input: json.JsonValue, defaultVerdict: string): json.JsonValue {
+    let matches = List<json.JsonValue>();
+    let ri = 0;
+    while (ri < rules.size()) {
+        let r = rules.at(ri);
+        if (ruleEnabled(r) && ruleFires(r, input)) { matches.push(r); }
+        ri = ri + 1;
+    }
+    let chosen = pickVerdict(matches, "deny");
+    if (chosen == undefined) { chosen = pickVerdict(matches, "step_up"); }
+    if (chosen == undefined && matches.size() > 0) { chosen = matches.at(0); }
+    if (chosen == undefined) {
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("verdict", json.str(defaultVerdict));
+        m.set("rule", json.str("default"));
+        m.set("controls", json.array(List<json.JsonValue>()));
+        m.set("obligations", json.array(List<json.JsonValue>()));
+        return json.object(m);
+    }
+    return decisionJson(chosen);
+}
+
+fn pickVerdict(matches: List<json.JsonValue>, verd: string): json.JsonValue | undefined {
+    let i = 0;
+    while (i < matches.size()) {
+        let v = json.asString(json.get(matches.at(i), "verdict")) ?? "";
+        if (string.eql(v, verd)) { return matches.at(i); }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+// ---- validation and lint ----
+
+// A normalized, comparable key for one condition. Mirrors `cond_key`.
+fn condKey(c: json.JsonValue): string {
+    let target = condTarget(c);
+    let op = condOp(c);
+    let negate = condNegate(c);
+    if (negate) {
+        let f = flip(op);
+        if (f != undefined) { op = f; } else { op = `!${op}`; }
+    }
+    return `${target}|${op}|${regoScalar(condValue(c))}`;
+}
+
+// A term's sorted set of condition keys (one entry per distinct key).
+fn termKeys(term: List<json.JsonValue>): List<string> {
+    let keys = List<string>();
+    let i = 0;
+    while (i < term.size()) {
+        let k = condKey(term.at(i));
+        if (!membersHas(keys, k)) { keys.push(k); }
+        i = i + 1;
+    }
+    keys.sort((a, b) => { return string.compare(a, b); });
+    return keys;
+}
+
+// Is every element of `small` present in `big`?
+fn isSubset(small: List<string>, big: List<string>): bool {
+    let i = 0;
+    while (i < small.size()) {
+        if (!membersHas(big, small.at(i))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn keysEqual(a: List<string>, b: List<string>): bool {
+    if (a.size() != b.size()) { return false; }
+    let i = 0;
+    while (i < a.size()) {
+        if (!string.eql(a.at(i), b.at(i))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Validate a rule's match tree before it is stored: every `matches` pattern
+/// must be bounded in length and well-formed. Returns undefined on success, or
+/// an error message. Mirrors `validate_match`.
+///
+/// Kyte's Pike-VM regex compiler does not surface a parse error, so
+/// "non-compiling" is checked structurally (balanced `()`/`[]`, no dangling
+/// escape, a quantifier must follow an atom). This rejects the same malformed
+/// patterns the Rust `regex` crate rejects for the shapes an author can author.
+pub fn validateMatch(m: json.JsonValue): string | undefined {
+    let groups = json.asArray(json.get(m, "groups")) ?? List<json.JsonValue>();
+    let gi = 0;
+    while (gi < groups.size()) {
+        let conds = json.asArray(json.get(groups.at(gi), "conditions")) ?? List<json.JsonValue>();
+        let ci = 0;
+        while (ci < conds.size()) {
+            let c = conds.at(ci);
+            if (string.eql(condOp(c), "matches")) {
+                let pat = json.asString(json.get(c, "value")) ?? "";
+                if (pat.length > 1024) {
+                    return `regex pattern too long (${pat.length} chars, max 1024)`;
+                }
+                let err = regexWellFormed(pat);
+                if (err != undefined) { return `invalid regex '${pat}': ${err}`; }
+            }
+            ci = ci + 1;
+        }
+        gi = gi + 1;
+    }
+    return undefined;
+}
+
+// Structural well-formedness check for a regex pattern. Returns undefined when
+// the pattern looks compilable, or a short reason otherwise.
+fn regexWellFormed(pat: string): string | undefined {
+    let depth = 0;
+    let inClass = false;
+    let prevAtom = false; // was the previous token something a quantifier can apply to?
+    let i = 0;
+    while (i < pat.length) {
+        let c = pat[i];
+        if (c == 92) {
+            // backslash escape: must have a following char.
+            if (i + 1 >= pat.length) { return "dangling escape"; }
+            i = i + 2;
+            prevAtom = !inClass;
+            continue;
+        }
+        if (inClass) {
+            if (c == 93) { inClass = false; prevAtom = true; } // ]
+            i = i + 1;
+            continue;
+        }
+        if (c == 91) { inClass = true; i = i + 1; continue; } // [
+        if (c == 93) { return "unbalanced ']'"; }
+        if (c == 40) { depth = depth + 1; prevAtom = false; i = i + 1; continue; } // (
+        if (c == 41) {
+            if (depth == 0) { return "unbalanced ')'"; }
+            depth = depth - 1; prevAtom = true; i = i + 1; continue;
+        }
+        if (c == 42 || c == 43 || c == 63) { // * + ?
+            if (!prevAtom) { return "quantifier with no preceding atom"; }
+            // a following lazy '?' is allowed; the atom stays consumed.
+            prevAtom = false;
+            i = i + 1;
+            continue;
+        }
+        prevAtom = true;
+        i = i + 1;
+    }
+    if (inClass) { return "unterminated character class"; }
+    if (depth != 0) { return "unbalanced '('"; }
+    return undefined;
+}
+
+fn ruleVerdict(r: json.JsonValue): string {
+    return json.asString(json.get(r, "verdict")) ?? "deny";
+}
+fn ruleName(r: json.JsonValue): string {
+    return json.asString(json.get(r, "name")) ?? "";
+}
+fn ruleId(r: json.JsonValue): string {
+    return json.asString(json.get(r, "rule_id")) ?? "";
+}
+
+fn mkFinding(severity: string, rid: string, kind: string, message: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("severity", json.str(severity));
+    m.set("rule_id", json.str(rid));
+    m.set("kind", json.str(kind));
+    m.set("message", json.str(message));
+    return json.object(m);
+}
+
+/// Heuristic lint over a tenant's rules. Flags catch-all denies, allow/step_up
+/// rules a deny always overrides (deny-overrides), and duplicate matches with
+/// conflicting verdicts. Mirrors `lint`.
+pub fn lint(rules: List<json.JsonValue>): List<json.JsonValue> {
+    let out = List<json.JsonValue>();
+    let active = List<json.JsonValue>();
+    let i = 0;
+    while (i < rules.size()) {
+        if (ruleEnabled(rules.at(i))) { active.push(rules.at(i)); }
+        i = i + 1;
+    }
+    // Precompute DNF term-keysets per active rule.
+    let terms = List<List<List<string>>>();
+    i = 0;
+    while (i < active.size()) {
+        let rterms = List<List<string>>();
+        let d = dnf(active.at(i));
+        let ti = 0;
+        while (ti < d.size()) { rterms.push(termKeys(d.at(ti))); ti = ti + 1; }
+        terms.push(rterms);
+        i = i + 1;
+    }
+
+    // catch-all: a deny with a term that has no conditions matches every request.
+    i = 0;
+    while (i < active.size()) {
+        if (string.eql(ruleVerdict(active.at(i)), "deny")) {
+            if (anyEmptyTerm(terms.at(i))) {
+                out.push(mkFinding("warning", ruleId(active.at(i)), "catch_all",
+                    `Rule "${ruleName(active.at(i))}" denies every request (a condition group is empty); any allow/step-up is overridden whenever it applies.`));
+            }
+        }
+        i = i + 1;
+    }
+
+    // shadowed: a non-deny rule whose every term is a superset of some deny rule's term.
+    i = 0;
+    while (i < active.size()) {
+        let av = ruleVerdict(active.at(i));
+        if (!string.eql(av, "deny") && terms.at(i).size() > 0) {
+            let j = 0;
+            let flagged = false;
+            while (j < active.size() && !flagged) {
+                if (j != i && string.eql(ruleVerdict(active.at(j)), "deny")) {
+                    if (allTermsShadowed(terms.at(i), terms.at(j))) {
+                        out.push(mkFinding("warning", ruleId(active.at(i)), "shadowed",
+                            `Rule "${ruleName(active.at(i))}" (${av}) can never take effect: deny rule "${ruleName(active.at(j))}" matches whenever it does (deny overrides).`));
+                        flagged = true;
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // duplicate match, conflicting verdict.
+    i = 0;
+    while (i < active.size()) {
+        let j = i + 1;
+        while (j < active.size()) {
+            if (!string.eql(ruleVerdict(active.at(i)), ruleVerdict(active.at(j)))) {
+                if (termSetsEqual(terms.at(i), terms.at(j)) && terms.at(i).size() > 0) {
+                    out.push(mkFinding("info", ruleId(active.at(j)), "conflict",
+                        `Rules "${ruleName(active.at(i))}" (${ruleVerdict(active.at(i))}) and "${ruleName(active.at(j))}" (${ruleVerdict(active.at(j))}) match the same requests with different verdicts; deny-overrides decides.`));
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn anyEmptyTerm(rterms: List<List<string>>): bool {
+    let i = 0;
+    while (i < rterms.size()) {
+        if (rterms.at(i).size() == 0) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Every term of `aTerms` is a superset of some term of `dTerms`.
+fn allTermsShadowed(aTerms: List<List<string>>, dTerms: List<List<string>>): bool {
+    let i = 0;
+    while (i < aTerms.size()) {
+        let covered = false;
+        let j = 0;
+        while (j < dTerms.size()) {
+            if (isSubset(dTerms.at(j), aTerms.at(i))) { covered = true; }
+            j = j + 1;
+        }
+        if (!covered) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Do the two rules have the same SET of terms (order-independent)?
+fn termSetsEqual(a: List<List<string>>, b: List<List<string>>): bool {
+    if (a.size() != b.size()) { return false; }
+    let i = 0;
+    while (i < a.size()) {
+        let found = false;
+        let j = 0;
+        while (j < b.size()) {
+            if (keysEqual(a.at(i), b.at(j))) { found = true; }
+            j = j + 1;
+        }
+        if (!found) { return false; }
+        i = i + 1;
+    }
+    return true;
+}

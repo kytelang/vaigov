@@ -1,0 +1,36 @@
+// GET /auth/login -> start the Microsoft Entra interactive sign-in (OIDC
+// authorization-code flow). When the Entra app registration is configured in the
+// environment (ENTRA_TENANT_ID / ENTRA_CLIENT_ID / ENTRA_CLIENT_SECRET), this
+// 303-redirects the browser to Entra's /authorize endpoint with a fresh,
+// cookie-bound `state` (CSRF) and `nonce` (replay). Otherwise it stays in
+// dev-auth mode and reports unavailable, exactly as before.
+import web.routing;
+import web.response;
+import web.status;
+import crypto.random;
+import entra;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Auth.Shared.authhelp;
+
+pub struct LoginHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: LoginHandler, ctx: routing.Context): response.Response {
+        let cfg = self.app.entra;
+        if (!authhelp.entraConfigured(cfg)) {
+            return response.Response(Status.ServiceUnavailable, "Entra sign-in is not configured (set the `entra` section in app.yaml).");
+        }
+        let e = entra.Entra(cfg.tenantId, cfg.clientId, authhelp.entraSecret(cfg));
+        let state = random.randomHex(16);
+        let nonce = random.randomHex(16);
+        // Optional login_hint typed on the branded /login screen (work email or
+        // domain\user), forwarded so Entra pre-fills the account picker.
+        let hint = ctx.query("login_hint");
+        let authUrl = e.authorizeUrl(authhelp.entraRedirectUri(cfg), state, nonce, hint);
+        // Bind the state to the browser so the callback can reject a forged code.
+        let cookie = "acp_oauth_state=" + state + "; HttpOnly; SameSite=Lax; Path=/; Max-Age=600";
+        return Http.redirectWithCookie(authUrl, cookie);
+    }
+}

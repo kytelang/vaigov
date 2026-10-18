@@ -1,0 +1,27 @@
+// GET /controls -> {controls:[...]} the full built-in control library.
+import string;
+import list;
+import map;
+import serde.json;
+import controls;
+import Features.Compliance.Shared.compliance;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct ControlsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: ControlsHandler, ctx: routing.Context): response.Response {
+        let lib = controls.library();
+        let arr = List<json.JsonValue>();
+        let i = 0;
+        while (i < lib.size()) { arr.push(controlToJson(lib.at(i))); i = i + 1; }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("controls", json.array(arr));
+        return Http.jsonResp(json.stringify(json.object(m)));
+    }
+}

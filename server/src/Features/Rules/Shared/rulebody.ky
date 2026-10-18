@@ -1,0 +1,64 @@
+// Shared request-body helpers for the rules handlers, mirroring acp rules.rs
+// `s()` (string-or-empty) and `j()` (sub-value serialized, or default).
+import string;
+import list;
+import serde.json;
+
+/// A string field, or "".
+pub fn ruleBodyStr(body: json.JsonValue, key: string): string {
+    if (body.kind != 5 || !json.has(body, key)) { return ""; }
+    return json.asString(json.get(body, key)) ?? "";
+}
+
+/// A sub-value re-serialized to its JSON string (for the *_json columns), or `dflt`
+/// when absent/null.
+pub fn ruleBodyJsonStr(body: json.JsonValue, key: string, dflt: string): string {
+    if (body.kind != 5 || !json.has(body, key)) { return dflt; }
+    let v = json.get(body, key);
+    if (v.kind == 0) { return dflt; }
+    return json.stringify(v);
+}
+
+pub fn ruleBodyBool(body: json.JsonValue, key: string, dflt: bool): bool {
+    if (body.kind != 5 || !json.has(body, key)) { return dflt; }
+    return json.asBool(json.get(body, key)) ?? dflt;
+}
+
+pub fn ruleBodyInt(body: json.JsonValue, key: string, dflt: int): int {
+    if (body.kind != 5 || !json.has(body, key)) { return dflt; }
+    let n = json.asNumber(json.get(body, key));
+    if (n == undefined) { return dflt; }
+    return (n ?? 0) as int;
+}
+
+/// The string elements of a body array field (e.g. `controls`).
+pub fn ruleBodyStrArray(body: json.JsonValue, key: string): list.List<string> {
+    let out = list.List<string>();
+    if (body.kind != 5 || !json.has(body, key)) { return out; }
+    let arr = json.asArray(json.get(body, key));
+    if (arr != undefined) {
+        let a = arr ?? list.List<json.JsonValue>();
+        let i = 0;
+        while (i < a.size()) {
+            let s = json.asString(a.at(i));
+            if (s != undefined) { out.push(s ?? ""); }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Normalise a verdict to acp's allow/deny/step_up, defaulting to deny.
+pub fn ruleNormVerdict(v: string): string {
+    if (string.eql(v, "allow") || string.eql(v, "deny") || string.eql(v, "step_up")) { return v; }
+    return "deny";
+}
+
+/// Parse a stored *_json string into a JSON value, falling back to `fallbackKind`
+/// (5=object {}, 4=array []).
+pub fn ruleParse(s: string, fallbackKind: int): json.JsonValue {
+    let v = json.tryParse(s);
+    if (v != undefined) { return v ?? json.null(); }
+    if (fallbackKind == 4) { return json.array(list.List<json.JsonValue>()); }
+    return json.object(Map<string, json.JsonValue>(1, string.hash));
+}

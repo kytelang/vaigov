@@ -1,0 +1,194 @@
+//! varman-server: the control-plane service (the acp-server port), as a Kyte
+//! hypermedia web app in vertical-slice layout.
+//!
+//! Composition root: construct the App (which loads app.yaml into `app.config`),
+//! bind the typed config sections, build the app-wide dependencies ONCE (the
+//! Postgres pool and the trust-core runtime), bundle them in an AppContext, then
+//! let each feature's `register<Feature>(ctx)` wire its own routes. Human/console
+//! endpoints render `.kyx` views and return HTML (Datastar); machine endpoints
+//! (OPA, the CLI) return JSON.
+
+import web.app;
+import web.secure_headers;
+import net.aio;
+import net.poller;
+import net.eventedio;
+import env;
+import list;
+import string;
+import data.migrate;
+import migrations;
+import Shared.AppContext;
+import Shared.Db;
+import Shared.AppConfig;
+import Shared.TrustState;
+import Features.Health.routes;
+import Features.Opa.routes;
+import Features.Decisions.routes;
+import Features.Policy.routes;
+import Features.Compliance.routes;
+import Features.Agents.routes;
+import Features.Apps.routes;
+import Features.Models.routes;
+import Features.Vendors.routes;
+import Features.Principals.routes;
+import Features.Grc.routes;
+import Features.Evidence.routes;
+import Features.Assurance.routes;
+import Features.Monitoring.routes;
+import Features.Overview.routes;
+import Features.Endpoints.routes;
+import Features.ContentRules.routes;
+import Features.Rules.routes;
+import Features.Ticketing.routes;
+import Features.Systems.routes;
+import Features.Approvals.routes;
+import Features.PolicyPacks.routes;
+import Features.Admin.routes;
+import Features.Auth.routes;
+import Features.Billing.routes;
+
+fn buildApp(devAuth: bool): App | undefined {
+    let app = App();
+    // Secure response headers (CSP, HSTS, X-Frame-Options, nosniff, ...). The CSP
+    // is relaxed only to allow the Datastar client from the jsDelivr CDN; styles
+    // are self-hosted (Tailwind CLI -> /index.css) and all fetches are same-origin.
+    let secure = SecureHeadersMiddleware();
+    secure.csp = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'";
+    app.use(secure);
+
+    // TLS 1.3 termination (self-hosted stack). Entra requires an https redirect
+    // URI, so the control plane is served over https. Cert + key paths come from
+    // the `tls` section of app.yaml; when disabled the server stays plain http.
+    let tlsCfg = app.config.bind<WebTlsConfig>("tls");
+    if (tlsCfg.enabled) {
+        app.useTls(tlsCfg.certPath, tlsCfg.keyPath);
+        // Serve HTTP/1.1 over TLS (the console + Entra redirect run fine on h1);
+        // HTTP/2 is not negotiated to avoid the h2-over-TLS response stall.
+        app.useHttp1Only();
+    }
+
+    // Typed config sections, bound from app.yaml.
+    let dbCfg = app.config.bind<DbConfig>("db");
+    let trustCfg = app.config.bind<TrustConfig>("trust");
+    let entraCfg = app.config.bind<EntraSignInConfig>("entra");
+
+    // Fail closed: the signing seed and the session HMAC key must be configured
+    // for any real deployment. A built-in default would let anyone reproduce the
+    // signing key and forge admin bearer tokens / session cookies. Only the
+    // explicit `--dev-auth` flag (local development) fills a working local key.
+    if (trustCfg.seedHex.length == 0 || trustCfg.sessionKeyHex.length == 0) {
+        if (!devAuth) {
+            console.log("fatal: trust.seedHex and trust.sessionKeyHex must be set in app.yaml for a non-dev deployment (pass --dev-auth for local development only)");
+            return undefined;
+        }
+        // Dev-only fallback (RFC 8032 test-2 seed + a fixed session key): a
+        // working local signing config so the console runs without a real key.
+        // Never reached in production (requires the explicit --dev-auth flag).
+        if (trustCfg.seedHex.length == 0) { trustCfg.seedHex = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"; }
+        if (trustCfg.sessionKeyHex.length == 0) { trustCfg.sessionKeyHex = "7365727665722d73657373696f6e2d6b65792d646f6d61696e2d7365706172"; }
+    }
+
+    // Build the app-wide dependencies once, then hand them to each feature.
+    let db = Db(dbCfg.dsn, dbCfg.poolSize);
+    let trust = TrustState(trustCfg);
+    let ctx = AppContext(app, db, app.config, trustCfg, entraCfg, trust);
+
+    registerHealth(ctx);
+    registerOpa(ctx);
+    registerDecisions(ctx);
+    registerPolicy(ctx);
+    registerCompliance(ctx);
+    registerAgents(ctx);
+    registerApps(ctx);
+    registerModels(ctx);
+    registerVendors(ctx);
+    registerPrincipals(ctx);
+    registerGrc(ctx);
+    registerEvidence(ctx);
+    registerAssurance(ctx);
+    registerMonitoring(ctx);
+    registerOverview(ctx);
+    registerEndpoints(ctx);
+    registerContentRules(ctx);
+    registerRules(ctx);
+    registerTicketing(ctx);
+    registerSystems(ctx);
+    registerApprovals(ctx);
+    registerPolicyPacks(ctx);
+    registerAdmin(ctx);
+    registerAuth(ctx, devAuth);
+    registerBilling(ctx);
+
+    // Console SPA/shell + static assets: anything unmatched is served from wwwroot.
+    ctx.app.useStatic("/", "./wwwroot");
+    return ctx.app;
+}
+
+fn hasFlag(args: list.List<string>, flag: string): bool {
+    let i = 0;
+    while (i < args.size()) {
+        if (string.eql(args.get(i) ?? "", flag)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The migration coroutine: runs on the server reactor (started via `onStart` +
+// `coroStart`), where reactor-native Postgres I/O works (the standalone async-main
+// driver does not stand up a full reactor, so socket I/O must run under `app.run`).
+// `migrate.run` takes the advisory lock, ensures the tracking table, applies only
+// steps whose version exceeds the current one (idempotent), and releases the lock.
+// It exits the process directly so `--migrate` is a one-shot that never serves.
+async fn migrateCoro(db: Db, ms: list.List<migrate.Migration>): void {
+    let conn = await db.pool.acquire();
+    let rep = await migrate.run(conn, ms);
+    db.pool.release(conn);
+    if (rep.ok()) {
+        console.log(`migrate: applied ${rep.applied} migration(s); schema up to date`);
+        kyte_exit(0);
+    } else {
+        console.log("migrate: FAILED: " + rep.err);
+        kyte_exit(1);
+    }
+}
+
+// Reactor start task: `coroStart`s the migration coroutine. Kept as a top-level
+// function (never an inline lambda body) so the bare `coroStart` builtin is lowered
+// through the call path, mirroring the sidecar's `onStart` + `coroStart` pattern.
+fn startMigrate(db: Db, ms: list.List<migrate.Migration>): void {
+    coroStart(migrateCoro(db, ms));
+}
+
+// `--migrate` mode: apply this app's schema migrations against Postgres, then EXIT.
+// Runs the migration on the reactor `app.run` makes current (so Postgres socket I/O
+// works), then `migrateCoro` exits. The orchestrator invokes this before a rollout,
+// when the service port is still free.
+fn runMigrations(): int {
+    let app = App();
+    let ms = migrations.all();
+    let warns = migrate.lintAll(ms);
+    let wi = 0;
+    while (wi < warns.size()) { console.log("migrate warning: " + (warns.get(wi) ?? "")); wi = wi + 1; }
+    console.log(`migrate: ${ms.size()} migration(s) declared; applying ...`);
+    let dbCfg = app.config.bind<DbConfig>("db");
+    let db = Db(dbCfg.dsn, dbCfg.poolSize);
+    app.onStart(() => startMigrate(db, ms));
+    app.run(app.config.port(8080));
+    return 0;
+}
+
+fn main(): int {
+    if (hasFlag(env.args(), "--migrate")) { return runMigrations(); }
+    // `--dev-auth`: local-development mode. Enables the dev-login / dev-token
+    // routes and lets a missing signing config fall back to a known local key.
+    let devAuth = hasFlag(env.args(), "--dev-auth");
+    let built = buildApp(devAuth);
+    if (built == undefined) { return 1; }
+    let app = built ?? App();
+    let port = app.config.port(8787);
+    let scheme = if (app.tlsEnabled) "https" else "http";
+    console.log("varman-server (control plane) on " + scheme + "://127.0.0.1:" + `${port}`);
+    app.run(port);
+    return 0;
+}

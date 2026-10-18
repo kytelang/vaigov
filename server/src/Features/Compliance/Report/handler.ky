@@ -1,0 +1,43 @@
+// GET /report/framework/{name} -> an exhaustive per-control conformance report.
+import string;
+import list;
+import map;
+import serde.json;
+import conformance;
+import Features.Compliance.Shared.compliance;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct ReportHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: ReportHandler, ctx: routing.Context): response.Response {
+        let name = ctx.param("name");
+        let profile = profileFromQuery(ctx);
+        let rows = conformance.assessFramework(name, profile, List<string>(), List<string>());
+        let summary = conformance.summarise(rows);
+
+        let arr = List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.size()) { arr.push(assessmentToJson(rows.at(i))); i = i + 1; }
+
+        let sm = Map<string, json.JsonValue>(8, string.hash);
+        sm.set("total", json.number(summary.total as long));
+        sm.set("applicable", json.number(summary.applicable as long));
+        sm.set("not_applicable", json.number(summary.notApplicable as long));
+        sm.set("conformant", json.number(summary.conformant as long));
+        sm.set("partial", json.number(summary.partial as long));
+        sm.set("non_conformant", json.number(summary.nonConformant as long));
+        sm.set("not_assessed", json.number(summary.notAssessed as long));
+
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("framework", json.str(name));
+        m.set("rows", json.array(arr));
+        m.set("summary", json.object(sm));
+        return Http.jsonResp(json.stringify(json.object(m)));
+    }
+}

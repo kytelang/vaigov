@@ -1,0 +1,27 @@
+// GET /auth/dev-token?role=<Role> -> {"token":"<EdDSA JWT>","role":"<Role>"}.
+// Mirrors acp dev_token: the MockEntra issuer signs a token for the role.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct DevTokenHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: DevTokenHandler, ctx: routing.Context): response.Response {
+        let role = ctx.query("role");
+        if (role.length == 0) { role = "PolicyAdmin"; }
+        let roles = list.List<string>();
+        roles.push(role);
+        let tok = self.app.trust.mockEntra.issue("dev-oid", "dev@local", "common", roles, Http.nowMs(), 3600);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("token", json.str(tok));
+        m.set("role", json.str(role));
+        return Http.okObj(m);
+    }
+}

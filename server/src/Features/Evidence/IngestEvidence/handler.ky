@@ -1,0 +1,63 @@
+// POST /evidence/ingest -> {"ok":true,"ingested":n}. Each record is signed with the
+// control-plane Ed25519 key (over its canonical bytes) so the central store is
+// itself verifiable. Deduped by decision_id (idempotent). Mirrors acp evidence_ingest.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import canonical;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Evidence.Shared.EvidenceRepository;
+
+pub fn evStr(v: json.JsonValue, key: string, dflt: string): string {
+    if (v.kind != 5 || !json.has(v, key)) { return dflt; }
+    let s = json.asString(json.get(v, key));
+    if (s == undefined) { return dflt; }
+    return s ?? dflt;
+}
+
+pub struct IngestEvidenceHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: IngestEvidenceHandler, ctx: routing.Context): response.Response {
+        // acp gates on the shared report token (authorize_report); open here until the auth wave.
+        let body = Http.bodyJson(ctx);
+        let pep = evStr(body, "pep", "pep");
+        let recs = list.List<json.JsonValue>();
+        if (body.kind == 5 && json.has(body, "records")) {
+            let a = json.asArray(json.get(body, "records"));
+            if (a != undefined) { recs = a ?? list.List<json.JsonValue>(); }
+        } else {
+            recs.push(body);
+        }
+        let priv = self.app.trust.keypair.privHex;
+        let pubk = self.app.trust.keypair.pubHex;
+        let now = Http.nowMs();
+        let count = 0;
+        let i = 0;
+        while (i < recs.size()) {
+            let r = recs.get(i) ?? json.null();
+            i = i + 1;
+            let did = evStr(r, "decision_id", "");
+            if (did.length == 0) { continue; }
+            let kind = evStr(r, "kind", "decision");
+            let verdict = evStr(r, "verdict", "");
+            let record = if (r.kind == 5 && json.has(r, "record")) (json.get(r, "record")) else (json.object(Map<string, json.JsonValue>(1, string.hash)));
+            let cb = canonical.canonicalBytesOfJson(record);
+            let sig = sign.signHex(priv, cb as ptr, cb.length);
+            let recStr = json.stringify(record);
+            let ok = await self.repo.addIngested(did, pep, kind, verdict, recStr, "control-plane", now, pubk, sig);
+            if (ok) { count = count + 1; }
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("ingested", json.number(count as long));
+        return Http.okObj(m);
+    }
+}

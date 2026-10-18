@@ -1,0 +1,48 @@
+// AI systems feature route table (acp-compatible JSON over the shared `acp` db):
+// the system registry, roles, Statement of Applicability, per-control evidence,
+// audit trail, and the per-system conformance report.
+import web.app;
+import Shared.AppContext;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.ListSystems.handler;
+import Features.Systems.CreateSystem.handler;
+import Features.Systems.GetSystem.handler;
+import Features.Systems.UpdateSystem.handler;
+import Features.Systems.DeleteSystem.handler;
+import Features.Systems.AddRole.handler;
+import Features.Systems.DeleteRole.handler;
+import Features.Systems.SoaGet.handler;
+import Features.Systems.SoaSet.handler;
+import Features.Systems.ApplyPack.handler;
+import Features.Systems.EvidenceList.handler;
+import Features.Systems.EvidenceAdd.handler;
+import Features.Systems.SystemAudit.handler;
+import Features.Systems.SystemReport.handler;
+import Features.Systems.SystemsView.handler;
+import Features.Systems.SystemDetailView.handler;
+import Features.Systems.SystemsConsole.handler;
+
+pub fn registerSystems(ctx: AppContext): void {
+    let repo = SystemRepository(ctx.db);
+    // Console hypermedia view. Registered BEFORE "/systems/{id}" (the router
+    // matches in registration order, no static-over-param precedence) so the
+    // literal "view" segment is not captured as an {id}.
+    ctx.app.get("/systems/view", SystemsViewHandler(ctx));
+    ctx.app.get("/systems/detail/{id}/view", SystemDetailViewHandler(ctx));
+    ctx.app.post("/console/systems/save", SystemsSaveHandler(repo, ctx));
+    ctx.app.post("/console/systems/delete", SystemsDeleteHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/delete", DeleteSystemHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/update", UpdateSystemHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/roles/{rid}/delete", DeleteRoleHandler(repo, ctx));
+    ctx.app.get("/systems", ListSystemsHandler(repo, ctx));
+    ctx.app.post("/systems", CreateSystemHandler(repo, ctx));
+    ctx.app.get("/systems/{id}", GetSystemHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/roles", AddRoleHandler(repo, ctx));
+    ctx.app.get("/systems/{id}/soa/{framework}", SoaGetHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/soa/{framework}", SoaSetHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/apply-pack", ApplyPackHandler(repo, ctx));
+    ctx.app.get("/systems/{id}/evidence", EvidenceListHandler(repo, ctx));
+    ctx.app.post("/systems/{id}/evidence", EvidenceAddHandler(repo, ctx));
+    ctx.app.get("/systems/{id}/audit", SystemAuditHandler(repo, ctx));
+    ctx.app.get("/systems/{id}/report/{framework}", SystemReportHandler(repo, ctx));
+}

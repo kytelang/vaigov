@@ -1,0 +1,30 @@
+// Policy authoring + evaluation feature route table. Compiles the tenant's
+// policy_rules (shared acp db) to Rego via varman-core. /rules CRUD is owned by
+// the Rules feature. Only registration lives here.
+import web.app;
+import Shared.AppContext;
+import Features.Rules.Shared.RuleRepository;
+import Features.Policy.Compile.handler;
+import Features.Policy.GetRego.handler;
+import Features.Policy.TestPolicy.handler;
+import Features.Policy.Lint.handler;
+import Features.Policy.PolicyCurrent.handler;
+import Features.Policy.PolicyTemplates.handler;
+import Features.Policy.PolicyView.handler;
+import Features.Policy.PolicyConsole.handler;
+
+pub fn registerPolicy(ctx: AppContext): void {
+    let repo = RuleRepository(ctx.db);
+    ctx.app.get("/policy/view", PolicyViewHandler(ctx));
+    ctx.app.post("/console/policy/save", PolicySaveHandler(repo, ctx));
+    ctx.app.post("/console/policy/delete", PolicyDeleteHandler(repo, ctx));
+    ctx.app.get("/console/policy/rego", PolicyRegoHandler(repo, ctx));
+    ctx.app.post("/console/policy/compile", PolicyCompileConsoleHandler(repo, ctx));
+    ctx.app.post("/console/policy/test", PolicyTestConsoleHandler(repo, ctx));
+    ctx.app.post("/policy/compile", CompileHandler(repo, ctx));
+    ctx.app.get("/policy/rego", RegoHandler(repo, ctx));
+    ctx.app.post("/policy/test", TestHandler(repo, ctx));
+    ctx.app.get("/policy/lint", LintHandler(repo, ctx));
+    ctx.app.get("/policy/current", PolicyCurrentHandler(repo, ctx));
+    ctx.app.get("/policy/templates", PolicyTemplatesHandler(ctx));
+}

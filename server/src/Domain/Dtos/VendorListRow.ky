@@ -1,0 +1,9 @@
+// Row of GET /vendors, field names = acp-server's serialized Vendor struct.
+@serializable pub struct VendorListRow {
+    pub id: string,
+    pub name: string,
+    pub risk_json: string,
+    pub tenant: string,
+    pub review_due_ms: long,
+    pub created_ms: long,
+}

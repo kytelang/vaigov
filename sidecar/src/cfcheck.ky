@@ -1,0 +1,83 @@
+//! The content-firewall ext_authz check handler (content-firewall-design §5).
+//!
+//! Envoy calls this as an ext_authz HTTP service with the original request body
+//! (the prompt) when `with_request_body` is set. The handler evaluates the body
+//! against the compiled rule set and answers 200 (allow) or 403 (deny). On a
+//! non-allow verdict it records a signed violation through the same R1/R4 path
+//! the inbound relay uses, so content violations appear in the console, raise
+//! tickets, and flush/verify exactly like any other violation.
+
+import state;
+import violation;
+import sysresolve;
+import cfengine;
+import canonical;
+import web.routing;
+import web.response;
+import web.status;
+import string;
+
+/// POST /cf/check (Envoy ext_authz HTTP). 200 = allow, 403 = deny.
+pub struct CheckHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: CheckHandler, ctx: routing.Context): response.Response {
+        if (!self.st.cfg.content_firewall) {
+            return allowResp(); // firewall off -> allow
+        }
+        let body = ctx.request.body;
+        let verdict = cfengine.evaluate(self.st.cfSet, body);
+
+        if (string.eql(verdict.decision, "allow")) {
+            return allowResp();
+        }
+
+        // Non-allow: record a signed violation (R1 + R4).
+        let v = violation.Violation();
+        v.tenant = self.st.cfg.tenant;
+        v.endpointHost = firstNonEmpty(ctx.request.getHeader("x-forwarded-host") ?? "", ctx.request.getHeader("host") ?? "");
+        v.principal = ctx.request.getHeader("x-acp-principal") ?? "";
+        // Attribute the violation to a registered AI system: the caller's explicit
+        // x-varman-system tag wins, else the principal is mapped via the pulled
+        // system-identity map, else it stays unattributed.
+        v.systemId = sysresolve.resolve(ctx.request.getHeader("x-varman-system") ?? "", v.principal, self.st.sysMap);
+        v.prompt = violation.promptForMode(body, self.st.cfg.prompt_redact);
+        v.promptSha = canonical.sha256HexOfString(body);
+        v.verdict = verdict.decision;          // deny | step_up | shadow
+        v.policyId = verdict.ruleId;
+        v.policyName = verdict.ruleName;
+        v.ruleRegoPath = "content-firewall";
+        v.decisionId = verdict.severity;       // carry severity where decisionId is unused here
+        v.capturedMs = state.nowMs();
+        let _stored = self.st.recordViolation(v);
+
+        // shadow -> allow through but keep the signed record (trial mode).
+        if (string.eql(verdict.decision, "shadow")) {
+            return allowResp();
+        }
+        // deny / step_up -> block.
+        let r = response.Response(Status.Forbidden, "blocked by content policy: " + verdict.ruleName);
+        r.headers.set("Content-Type", "text/plain");
+        r.headers.set("x-acp-content-verdict", verdict.decision);
+        r.headers.set("x-acp-content-rule", verdict.ruleId);
+        r.headers.set("Access-Control-Allow-Origin", "*");
+        return r;
+    }
+}
+
+/// A 200 allow response carrying the CORS header. The browser-side firewall
+/// (the test Chrome extension) calls /cf/check with a synchronous XHR from the
+/// chat page's origin to block XHR-based sends (e.g. Gemini's batchexecute); a
+/// `text/plain` POST is a CORS "simple request", so only this ACAO header is
+/// needed (no preflight). Harmless for the Envoy ext_authz path.
+fn allowResp(): response.Response {
+    let r = response.Response(Status.Ok, "");
+    r.headers.set("Access-Control-Allow-Origin", "*");
+    return r;
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+    if (!string.eql(a, "")) { return a; }
+    return b;
+}

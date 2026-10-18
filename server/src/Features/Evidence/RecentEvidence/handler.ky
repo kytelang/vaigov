@@ -1,0 +1,25 @@
+// GET /evidence/recent -> {"evidence":[...]}. acp projects the last 25 decision
+// records out of the RFC 6962 evidence ledger (tool/resource/verdict/agent/hlc),
+// gated on SeeArgs. The Kyte ledger-export path is a later core wave, so this
+// returns an empty projection for now (FLAGGED).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct RecentEvidenceHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: RecentEvidenceHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.SeeArgs)) { return Http.forbidden(); }
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("evidence", json.array(list.List<json.JsonValue>()));
+        return Http.okObj(m);
+    }
+}

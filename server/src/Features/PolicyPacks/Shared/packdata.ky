@@ -1,0 +1,158 @@
+// The shipped enforceable policy packs (curated rule templates + parameters + a
+// red-team corpus per act). Definitions live in code, not the DB; only installs
+// are persisted. Ported verbatim from acp-server handlers/policy_packs.rs
+// `builtin_policy_packs()`. Each rule template carries `{{param}}` placeholders
+// resolved at install time from the tenant's parameter values.
+import string;
+import list;
+import map;
+import serde.json;
+
+fn js(s: string): json.JsonValue { return json.str(s); }
+
+fn param(key: string, label: string, ty: string, required: bool, dflt: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("key", js(key)); m.set("label", js(label)); m.set("type", js(ty));
+    m.set("required", json.bool(required)); m.set("default", js(dflt));
+    return json.object(m);
+}
+
+fn cond(target: string, op: string, value: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("target", js(target)); m.set("op", js(op)); m.set("value", js(value));
+    return json.object(m);
+}
+
+fn group(combinator: string, conds: List<json.JsonValue>): json.JsonValue {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("combinator", js(combinator));
+    m.set("conditions", json.array(conds));
+    return json.object(m);
+}
+
+fn matchTree(groups: List<json.JsonValue>): json.JsonValue {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("combinator", js("all"));
+    m.set("groups", json.array(groups));
+    return json.object(m);
+}
+
+fn strList(xs: List<string>): json.JsonValue {
+    let out = list.List<json.JsonValue>();
+    let i = 0;
+    while (i < xs.size()) { out.push(js(xs.at(i))); i = i + 1; }
+    return json.array(out);
+}
+
+// The EU AI Act starter pack (the one shipped pack in acp).
+pub fn euAiActStarter(): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("slug", js("eu-ai-act-starter"));
+    m.set("title", js("EU AI Act starter"));
+    m.set("framework_slug", js("eu-ai-act"));
+    m.set("region", js("EU"));
+    m.set("version", json.number(1));
+    m.set("description", js("Starter enforceable rules for the EU AI Act: block PII in prompts (Art. 5 data practices) and require human oversight for high-impact or high-cost operations (Art. 14)."));
+
+    let params = list.List<json.JsonValue>();
+    params.push(param("pii_regex", "Regex for PII to block in prompts", "string", true, "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"));
+    params.push(param("approver_group", "Human-oversight approver group", "group", true, "risk-oversight"));
+    m.set("parameters", json.array(params));
+
+    let rules = list.List<json.JsonValue>();
+    // Rule 1: art5-no-pii-in-prompt (deny).
+    let g1c = list.List<json.JsonValue>();
+    g1c.push(cond("args.prompt", "matches", "{{pii_regex}}"));
+    let g1 = list.List<json.JsonValue>();
+    g1.push(group("any", g1c));
+    let r1 = Map<string, json.JsonValue>(8, string.hash);
+    r1.set("template_id", js("art5-no-pii-in-prompt"));
+    r1.set("intent", js("prohibited-practice"));
+    r1.set("verdict", js("deny"));
+    r1.set("match", matchTree(g1));
+    r1.set("obligations", json.array(list.List<json.JsonValue>()));
+    let r1c = list.List<string>(); r1c.push("art-5-c");
+    r1.set("controls", strList(r1c));
+    rules.push(json.object(r1));
+    // Rule 2: art14-human-oversight (step_up).
+    let g2c = list.List<json.JsonValue>();
+    g2c.push(cond("operation", "eq", "high_impact"));
+    g2c.push(cond("context.cost_usd", "gt", "10"));
+    let g2 = list.List<json.JsonValue>();
+    g2.push(group("any", g2c));
+    let r2 = Map<string, json.JsonValue>(8, string.hash);
+    r2.set("template_id", js("art14-human-oversight"));
+    r2.set("intent", js("human-oversight"));
+    r2.set("verdict", js("step_up"));
+    r2.set("approver_group", js("{{approver_group}}"));
+    r2.set("match", matchTree(g2));
+    r2.set("obligations", json.array(list.List<json.JsonValue>()));
+    let r2c = list.List<string>(); r2c.push("art-14");
+    r2.set("controls", strList(r2c));
+    rules.push(json.object(r2));
+    m.set("rules", json.array(rules));
+
+    m.set("redteam_corpus", js("- id: pii-email-in-prompt\n  category: pii-evasion\n  description: an email in a prompt must be denied\n  expect: deny\n  input: { args: { prompt: \"contact me at {{payload}}\" } }\n  payload: \"ebella@gmail.com\"\n  mutators: [homoglyph, zero-width, base64, spaced, case-fold]\n- id: high-impact-oversight\n  category: oversight-bypass\n  description: a high-impact operation must step up for approval\n  expect: step_up\n  input: { operation: \"high_impact\" }\n"));
+    return json.object(m);
+}
+
+// All shipped packs.
+pub fn builtinPacks(): List<json.JsonValue> {
+    let out = list.List<json.JsonValue>();
+    out.push(euAiActStarter());
+    return out;
+}
+
+// Find a pack by slug (or undefined).
+pub fn findPack(slug: string): json.JsonValue | undefined {
+    let packs = builtinPacks();
+    let i = 0;
+    while (i < packs.size()) {
+        let p = packs.at(i);
+        if (string.eql(json.asString(json.get(p, "slug")) ?? "", slug)) { return p; }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+// Recursively replace `{{key}}` occurrences inside string values with the
+// resolved parameter value (params: a JSON object of string values).
+pub fn substJson(v: json.JsonValue, params: Map<string, json.JsonValue>): json.JsonValue {
+    if (v.kind == 3) {
+        let s = v.sval;
+        let keys = params.keys();
+        let i = 0;
+        while (i < keys.size()) {
+            let k = keys.at(i);
+            let pv = params.get(k);
+            if (pv != undefined) {
+                let ps = json.asString(pv ?? json.null());
+                if (ps != undefined) {
+                    s = string.replace(s, string.concat(string.concat("{{", k), "}}"), ps ?? "");
+                }
+            }
+            i = i + 1;
+        }
+        return json.str(s);
+    }
+    if (v.kind == 4) {
+        let arr = json.asArray(v) ?? list.List<json.JsonValue>();
+        let out = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) { out.push(substJson(arr.at(i), params)); i = i + 1; }
+        return json.array(out);
+    }
+    if (v.kind == 5) {
+        let obj = json.asObject(v) ?? Map<string, json.JsonValue>(1, string.hash);
+        let out = Map<string, json.JsonValue>(obj.size() + 1, string.hash);
+        let keys = obj.keys();
+        let i = 0;
+        while (i < keys.size()) {
+            let k = keys.at(i);
+            out.set(k, substJson(obj.get(k) ?? json.null(), params));
+            i = i + 1;
+        }
+        return json.object(out);
+    }
+    return v;
+}

@@ -1,0 +1,409 @@
+//! The sidecar's shared runtime state: the in-memory policy cache (mirrored to
+//! disk so last-good survives a restart), the durable violation queue, and the
+//! cached AI-endpoint registry. Route handlers and the background loops all hold
+//! a reference to one `SidecarState`.
+
+import settings;
+import bundle;
+import vstore;
+import violation;
+import cfrule;
+import cfengine;
+import sysresolve;
+import envoy;
+import sign;
+import compress.gzip;
+import serde.source;
+import io.file;
+import string;
+import list;
+import datetime;
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+pub fn nowMs(): long {
+    return datetime.nowNs() / 1000000;
+}
+
+pub class SidecarState {
+    pub cfg: settings.Config,
+    pub vs: vstore.VioStore,
+    pub pubHex: string,            // this edge's signing public key (published to the CP)
+    pub privHex: string,           // this edge's signing private key (from config seed)
+
+    // --- policy cache (mirror of the Rust `Cache`) ---
+    pub bundleGz: string,   // the raw gzip tar bytes; "" when nothing cached
+    pub haveBundle: bool,
+    pub rego: string,
+    pub revision: string,
+    pub lastSyncMs: long,
+    pub cpOk: bool,
+    pub lastError: string,
+    pub lastFlushMs: long,
+    pub lastFlushOk: bool,
+
+    // --- governed endpoint registry (drives Envoy) ---
+    pub endpoints: list.List<envoy.Endpoint>,
+    pub endpointsSig: string,
+
+    // --- R5: installed policy packs pulled from the control plane ---
+    pub packsJson: string,         // raw JSON array of installed packs; "[]" when none
+
+    // --- content firewall: compiled active rule set + its raw JSON ---
+    pub cfSet: list.List<cfengine.Compiled>,
+    pub cfRulesJson: string,       // raw JSON of the active set; "[]" when none
+
+    // --- AI-system attribution: published principal -> system-id map ---
+    pub sysMap: sysresolve.SystemMap,
+
+    init(cfg: settings.Config) {
+        self.cfg = cfg;
+        self.vs = vstore.VioStore(cfg.vstore_path, cfg.vcursor_path);
+        let seed = if (string.eql(cfg.signing_seed, "")) settings.devSeed() else cfg.signing_seed;
+        let kp = sign.keypairFromSeedHex(seed);
+        self.pubHex = kp.pubHex;
+        self.privHex = kp.privHex;
+        self.packsJson = "[]";
+        self.cfSet = list.List<cfengine.Compiled>();
+        self.cfRulesJson = "[]";
+        self.sysMap = sysresolve.SystemMap();
+        self.bundleGz = "";
+        self.haveBundle = false;
+        self.rego = "";
+        self.revision = "";
+        self.lastSyncMs = 0;
+        self.cpOk = false;
+        self.lastError = "";
+        self.lastFlushMs = 0;
+        self.lastFlushOk = false;
+        self.endpoints = list.List<envoy.Endpoint>();
+        self.endpointsSig = "";
+    }
+
+    /// Records an ingested violation: signs it, appends it durably to the store,
+    /// and returns the stored record (now carrying id + signature).
+    pub fn recordViolation(self: SidecarState, v: violation.Violation): violation.Violation {
+        return self.vs.append(v, self.privHex);
+    }
+
+    /// Installs a freshly pulled principal -> system-id map (attribution). The raw
+    /// document is the signed map served by the control plane; signature checking
+    /// happens in the sync path before this is called. An empty/invalid document
+    /// clears to tag-only attribution.
+    pub fn setSystemMap(self: SidecarState, raw: string): void {
+        self.sysMap = sysresolve.loadJson(raw);
+    }
+
+    /// Installs a freshly fetched bundle: unpack it, replace the in-memory cache,
+    /// persist it to disk atomically, and mark the control plane healthy. Returns
+    /// true if the revision changed.
+    pub fn setBundle(self: SidecarState, gz: string): bool {
+        let changed = self.applyBundle(gz);
+        self.persist();
+        self.lastSyncMs = nowMs();
+        self.cpOk = true;
+        self.lastError = "";
+        return changed;
+    }
+
+    /// Installs a bundle into the in-memory cache only (no disk write). Used when
+    /// loading the last-good bundle back from disk at boot.
+    pub fn applyBundle(self: SidecarState, gz: string): bool {
+        let (rev, rego) = bundle.unpack(gz);
+        let changed = !string.eql(rev, self.revision);
+        self.bundleGz = gz;
+        self.haveBundle = true;
+        self.rego = rego;
+        self.revision = rev;
+        return changed;
+    }
+
+    /// Persists the cached bundle to `cache_path` atomically (temp + rename).
+    pub fn persist(self: SidecarState): void {
+        if (!self.haveBundle) { return; }
+        envoy.atomicWrite(self.cfg.cache_path, self.bundleGz);
+    }
+
+    /// Loads the last-good bundle from `cache_path` at boot, if present, so the
+    /// sidecar serves policy even when the control plane is down at start.
+    pub fn loadFromDisk(self: SidecarState): bool {
+        let path = self.cfg.cache_path;
+        if (!File.exists(path)) { return false; }
+        let gz = File.readText(path);
+        if (gz.length == 0) { return false; }
+        self.applyBundle(gz);
+        return true;
+    }
+
+    /// Records a failed sync. The last-good bundle is kept and still served.
+    pub fn markError(self: SidecarState, msg: string): void {
+        self.cpOk = false;
+        self.lastError = msg;
+    }
+
+    /// Replaces the endpoint registry and returns true if the enabled set
+    /// changed (so Envoy config should be regenerated). Persists the registry to
+    /// disk so a cold start with the control plane down renders from last-good.
+    pub fn setEndpoints(self: SidecarState, eps: list.List<envoy.Endpoint>): bool {
+        self.endpoints = eps;
+        let sig = envoy.signature(eps);
+        let changed = !string.eql(sig, self.endpointsSig);
+        self.endpointsSig = sig;
+        self.persistEndpoints();
+        return changed;
+    }
+
+    /// Serialises the endpoint registry as `{"endpoints":[{host,port,enabled}]}`.
+    pub fn endpointsJson(self: SidecarState): string {
+        let parts = list.List<string>();
+        let i = 0;
+        while (i < self.endpoints.size()) {
+            let e = self.endpoints.get(i) ?? envoy.Endpoint("", 443, false);
+            let en = if (e.enabled) "true" else "false";
+            parts.push("{\"host\":\"" + jsonEscape(e.host) + "\",\"port\":" + `${e.port}` + ",\"enabled\":" + en + "}");
+            i = i + 1;
+        }
+        return "{\"endpoints\":[" + string.join(parts, ",") + "]}";
+    }
+
+    /// Writes the endpoint registry to `endpoints_cache` (last-good on disk).
+    pub fn persistEndpoints(self: SidecarState): void {
+        if (string.eql(self.cfg.endpoints_cache, "")) { return; }
+        envoy.atomicWrite(self.cfg.endpoints_cache, self.endpointsJson());
+    }
+
+    /// Loads the last-good endpoint registry from disk at boot. Returns true if a
+    /// non-empty registry was restored.
+    pub fn loadEndpointsFromDisk(self: SidecarState): bool {
+        let path = self.cfg.endpoints_cache;
+        if (string.eql(path, "") || !File.exists(path)) { return false; }
+        let body = File.readText(path);
+        if (body.length == 0) { return false; }
+        let eps = parseEndpointsJson(body);
+        self.endpoints = eps;
+        self.endpointsSig = envoy.signature(eps);
+        return eps.size() > 0;
+    }
+
+    /// Renders the current endpoint registry into the Envoy config dir, if one is
+    /// configured. The single place that turns the stored registry into Envoy
+    /// config, used both on a live change and on boot from last-good.
+    pub fn renderEnvoy(self: SidecarState): void {
+        if (string.eql(self.cfg.envoy_dir, "")) { return; }
+        // Wire the content-firewall ext_authz filter at the sidecar's own listen
+        // address when the firewall is on; "" skips it.
+        let contentAddr = if (self.cfg.content_firewall) self.cfg.listen else "";
+        envoy.writeConfig(self.cfg.envoy_dir, self.cfg.ca_dir, self.cfg.opa_addr, contentAddr, self.cfg.proxy_listen, self.endpoints);
+    }
+
+    /// Replaces the installed-packs cache (R5) and persists it. Returns true if
+    /// the set changed.
+    pub fn setPacks(self: SidecarState, packsJson: string): bool {
+        let changed = !string.eql(packsJson, self.packsJson);
+        self.packsJson = packsJson;
+        if (!string.eql(self.cfg.packs_cache, "")) {
+            envoy.atomicWrite(self.cfg.packs_cache, packsJson);
+        }
+        return changed;
+    }
+
+    /// Loads the last-good installed-packs list from disk at boot.
+    pub fn loadPacksFromDisk(self: SidecarState): void {
+        let path = self.cfg.packs_cache;
+        if (string.eql(path, "") || !File.exists(path)) { return; }
+        let body = File.readText(path);
+        if (body.length > 0) { self.packsJson = body; }
+    }
+
+    /// Installs a content-firewall rule set (content firewall): parses + compiles
+    /// the rules into `cfSet`, persists the raw JSON as last-good, and returns
+    /// true if the set changed.
+    pub fn setContentRules(self: SidecarState, rulesJson: string): bool {
+        let changed = !string.eql(rulesJson, self.cfRulesJson);
+        self.cfRulesJson = rulesJson;
+        let rules = cfrule.parseSet(rulesJson);
+        self.cfSet = cfengine.compileAll(rules);
+        if (!string.eql(self.cfg.cf_rules_cache, "")) {
+            envoy.atomicWrite(self.cfg.cf_rules_cache, rulesJson);
+        }
+        return changed;
+    }
+
+    /// Loads the last-good content-rule set from disk at boot and compiles it so
+    /// the edge enforces last-known content policy even with the CP down.
+    pub fn loadContentRulesFromDisk(self: SidecarState): void {
+        let path = self.cfg.cf_rules_cache;
+        if (string.eql(path, "") || !File.exists(path)) { return; }
+        let body = File.readText(path);
+        if (body.length > 0) {
+            self.cfRulesJson = body;
+            self.cfSet = cfengine.compileAll(cfrule.parseSet(body));
+        }
+    }
+
+    /// The number of active content rules.
+    pub fn cfRuleCount(self: SidecarState): int {
+        return self.cfSet.size();
+    }
+
+    /// The healthz JSON document.
+    pub fn healthJson(self: SidecarState): string {
+        let pending = self.vs.pendingCount();
+        let total = self.vs.total();
+        return "{" +
+            "\"ok\":true" +
+            ",\"control_plane\":\"" + jsonEscape(self.cfg.control_plane) + "\"" +
+            ",\"tenant\":\"" + jsonEscape(self.cfg.tenant) + "\"" +
+            ",\"revision\":\"" + jsonEscape(self.revision) + "\"" +
+            ",\"last_sync_ms\":" + `${self.lastSyncMs}` +
+            ",\"cp_ok\":" + boolStr(self.cpOk) +
+            ",\"last_error\":\"" + jsonEscape(self.lastError) + "\"" +
+            ",\"have_policy\":" + boolStr(self.haveBundle) +
+            ",\"pending_violations\":" + `${pending}` +
+            ",\"total_violations\":" + `${total}` +
+            ",\"signing_pubkey\":\"" + jsonEscape(self.pubHex) + "\"" +
+            ",\"last_flush_ms\":" + `${self.lastFlushMs}` +
+            ",\"last_flush_ok\":" + boolStr(self.lastFlushOk) +
+            "}";
+    }
+}
+
+fn boolStr(b: bool): string {
+    if (b) { return "true"; }
+    return "false";
+}
+
+/// Parses `{"endpoints":[{host,port,enabled}]}` into a list of `Endpoint`. Local
+/// copy (state cannot import sync, which imports state); kept identical in shape
+/// to `sync.parseEndpoints` so the on-disk last-good and the live pull agree.
+pub fn parseEndpointsJson(body: string): list.List<envoy.Endpoint> {
+    let out = list.List<envoy.Endpoint>();
+    let src = source.fromJson(body);
+    let n = src.arrayLen("endpoints");
+    let i = 0;
+    while (i < n) {
+        let e = src.itemChild("endpoints", i);
+        let host = e.getString("host");
+        let port = e.getInt("port");
+        if (port == 0) { port = 443; }
+        let enabled = if (e.has("enabled")) e.getBool("enabled") else true;
+        out.push(envoy.Endpoint(host, port as int, enabled));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Minimal JSON string escaping for the scalar fields we emit (quote, backslash,
+/// and control characters covered by the common cases).
+pub fn jsonEscape(s: string): string {
+    let out = string.replace(s, "\\", "\\\\");
+    out = string.replace(out, "\"", "\\\"");
+    out = string.replace(out, "\n", "\\n");
+    out = string.replace(out, "\r", "\\r");
+    return out;
+}
+
+/// Normalises an inbound violation body into a list of individual JSON record
+/// strings. Accepts a gzip-encoded or plain body, and a single object, a
+/// top-level array, or `{logs|violations:[...]}`.
+///
+/// Matches the Rust `normalize` for the single-object and array shapes; the
+/// `{logs|violations:[...]}` unwrap is handled by scanning for the array. Record
+/// substrings are preserved verbatim so nothing is lost in round-tripping.
+pub fn normalize(contentEncoding: string, raw: string): list.List<string> {
+    let gzipped = string.contains(contentEncoding, "gzip")
+        || (raw.length >= 2 && raw[0] == 0x1f && raw[1] == 0x8b);
+    let body = if (gzipped) gzip.decompress(raw) else raw;
+    let t = string.trim(body);
+    let out = list.List<string>();
+    if (t.length == 0) { return out; }
+    if (t[0] == 91) { // '[' : a top-level array
+        return splitArray(t, 0);
+    }
+    if (t[0] == 123) { // '{' : object; unwrap logs/violations array if present
+        let arrAt = topArrayValue(t, "logs");
+        if (arrAt < 0) { arrAt = topArrayValue(t, "violations"); }
+        if (arrAt >= 0) { return splitArray(t, arrAt); }
+        out.push(t);
+        return out;
+    }
+    out.push(t);
+    return out;
+}
+
+/// Splits a JSON array whose '[' is at `open` into its element substrings,
+/// tracking nested braces/brackets and strings. Elements are trimmed.
+pub fn splitArray(s: string, open: int): list.List<string> {
+    let out = list.List<string>();
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let i = open;
+    let elemStart = -1;
+    while (i < s.length) {
+        let c = s[i];
+        if (inStr) {
+            if (esc) { esc = false; }
+            else if (c == 92) { esc = true; } // backslash
+            else if (c == 34) { inStr = false; } // quote
+        } else {
+            if (c == 34) { inStr = true; }
+            else if (c == 91 || c == 123) { // '[' or '{'
+                depth = depth + 1;
+                if (depth == 1 && c == 91) { elemStart = i + 1; }
+                else if (elemStart == -1) { elemStart = i; }
+            } else if (c == 93 || c == 125) { // ']' or '}'
+                if (depth == 1 && c == 93) {
+                    let piece = string.trim(string.slice(s, elemStart, i));
+                    if (piece.length > 0) { out.push(piece); }
+                    return out;
+                }
+                depth = depth - 1;
+            } else if (c == 44 && depth == 1) { // top-level comma
+                let piece = string.trim(string.slice(s, elemStart, i));
+                if (piece.length > 0) { out.push(piece); }
+                elemStart = i + 1;
+            } else if (elemStart == -1 && c != 32 && c != 9 && c != 10 && c != 13) {
+                elemStart = i;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// If the object `s` has a top-level key `key` whose value is an array, returns
+/// the index of that array's '['; otherwise -1. A minimal scan: it finds the
+/// quoted key at object depth 1 and checks the next non-space value char.
+fn topArrayValue(s: string, key: string): int {
+    let needle = "\"" + key + "\"";
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (inStr) {
+            if (esc) { esc = false; }
+            else if (c == 92) { esc = true; }
+            else if (c == 34) { inStr = false; }
+        } else {
+            if (c == 34) {
+                // Only match a key at object depth 1.
+                if (depth == 1 && i + needle.length <= s.length
+                    && string.eql(string.slice(s, i, i + needle.length), needle)) {
+                    let j = i + needle.length;
+                    while (j < s.length && (s[j] == 32 || s[j] == 9 || s[j] == 10 || s[j] == 13)) { j = j + 1; }
+                    if (j < s.length && s[j] == 58) { // ':'
+                        j = j + 1;
+                        while (j < s.length && (s[j] == 32 || s[j] == 9 || s[j] == 10 || s[j] == 13)) { j = j + 1; }
+                        if (j < s.length && s[j] == 91) { return j; }
+                    }
+                }
+                inStr = true;
+            } else if (c == 123 || c == 91) { depth = depth + 1; }
+            else if (c == 125 || c == 93) { depth = depth - 1; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}

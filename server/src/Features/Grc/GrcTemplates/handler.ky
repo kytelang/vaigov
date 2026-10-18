@@ -1,0 +1,80 @@
+// GET /grc/templates -> {"templates":[...]}: the EU AI Act risk-screening
+// questionnaire plus one conformity checklist per framework (from varman-core
+// controls). NOTE: acp filters to the tenant's enabled acts; here all frameworks
+// are listed (tenant-settings filter is a later wave).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import controls;
+import Shared.AppContext;
+import Shared.Http;
+
+fn grcTplQ(key: string, label: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("key", json.str(key));
+    m.set("label", json.str(label));
+    return json.object(m);
+}
+
+pub struct GrcTemplatesHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: GrcTemplatesHandler, ctx: routing.Context): response.Response {
+        let templates = list.List<json.JsonValue>();
+
+        let qs = list.List<json.JsonValue>();
+        qs.push(grcTplQ("prohibited_practice", "Is this a prohibited practice (social scoring, manipulative or exploitative AI, untargeted scraping)?"));
+        qs.push(grcTplQ("safety_component", "Is the AI a safety component of a product, or an Annex III high-risk use?"));
+        qs.push(grcTplQ("biometric_identification", "Does it perform biometric identification or categorisation?"));
+        qs.push(grcTplQ("critical_infrastructure", "Is it used in critical infrastructure?"));
+        qs.push(grcTplQ("employment_or_education", "Does it make employment or education decisions?"));
+        qs.push(grcTplQ("essential_services", "Does it gate access to essential services (credit, benefits, insurance)?"));
+        qs.push(grcTplQ("law_enforcement", "Is it used for law enforcement?"));
+        qs.push(grcTplQ("interacts_with_humans", "Does it interact directly with people (chatbot)?"));
+        qs.push(grcTplQ("generates_content", "Does it generate or manipulate content (gen-AI, deepfakes)?"));
+        let screening = Map<string, json.JsonValue>(8, string.hash);
+        screening.set("id", json.str("eu-ai-act-screening"));
+        screening.set("kind", json.str("assessment"));
+        screening.set("framework", json.str("eu-ai-act"));
+        screening.set("name", json.str("EU AI Act risk screening"));
+        screening.set("questions", json.array(qs));
+        templates.push(json.object(screening));
+
+        let fws = controls.frameworks();
+        let i = 0;
+        while (i < fws.size()) {
+            let fw = fws.at(i);
+            let ctrls = controls.forFramework(fw.slug);
+            let items = list.List<json.JsonValue>();
+            let j = 0;
+            while (j < ctrls.size()) {
+                let c = ctrls.at(j);
+                let im = Map<string, json.JsonValue>(4, string.hash);
+                im.set("control_id", json.str(c.id));
+                im.set("reference", json.str(c.reference));
+                im.set("title", json.str(c.title));
+                im.set("obligation_type", json.str(c.obligationType));
+                items.push(json.object(im));
+                j = j + 1;
+            }
+            let t = Map<string, json.JsonValue>(8, string.hash);
+            t.set("id", json.str(string.concat(fw.slug, "-checklist")));
+            t.set("kind", json.str("checklist"));
+            t.set("framework", json.str(fw.slug));
+            t.set("framework_type", json.str(fw.frameworkType));
+            t.set("version", json.str(fw.version));
+            t.set("name", json.str(string.concat(fw.label, " conformity checklist")));
+            t.set("items", json.array(items));
+            templates.push(json.object(t));
+            i = i + 1;
+        }
+
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("templates", json.array(templates));
+        return Http.okObj(out);
+    }
+}

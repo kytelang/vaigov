@@ -1,0 +1,152 @@
+//! OPA policy bundle packing and unpacking.
+//!
+//! A policy bundle is a gzip-compressed tar archive, the same shape OPA uses:
+//! a `.manifest` JSON file carrying the `revision`, plus `policy.rego` holding
+//! the compiled policy. The control plane serves this blob at
+//! `GET /v1/bundles/{name}`; the sidecar caches it and serves it locally.
+//!
+//! `unpack` reads a real tar (512-byte headers, octal size fields), so a bundle
+//! produced by any conforming tar writer (including the control plane's)
+//! round-trips. `buildBundle` writes the same format, so tests can hand-build a
+//! bundle and feed it straight back through `unpack`.
+
+import compress.gzip;
+import serde.source;
+import string;
+import bytes;
+
+/// Rounds `n` up to the next multiple of 512 (a tar block boundary).
+fn padTo512(n: int): int {
+    return ((n + 511) / 512) * 512;
+}
+
+/// Writes the bytes of `s` into `buf` at `off`.
+fn putStr(buf: long, off: int, s: string): void {
+    let i = 0;
+    while (i < s.length) {
+        bytes.write_byte(buf, off + i, s[i]);
+        i = i + 1;
+    }
+}
+
+/// Writes `value` as a right-justified, zero-padded octal number into a field
+/// of `width` bytes, terminated by a NUL in the final byte (the tar convention
+/// for the size/mode/mtime fields).
+fn putOctal(buf: long, off: int, width: int, value: int): void {
+    let digits = width - 1;
+    let v = value;
+    let i = digits - 1;
+    while (i >= 0) {
+        bytes.write_byte(buf, off + i, 48 + (v % 8));
+        v = v / 8;
+        i = i - 1;
+    }
+    bytes.write_byte(buf, off + digits, 0);
+}
+
+/// Writes one regular-file tar header + content into `buf` starting at `off`,
+/// and returns the offset just past the content (padded to a block boundary).
+fn writeEntry(buf: long, off: int, name: string, content: string): int {
+    // Header (512 bytes). The buffer is pre-zeroed, so we set only the fields a
+    // tar reader needs: name, mode, size, mtime, checksum, and the type flag.
+    putStr(buf, off, name);
+    putOctal(buf, off + 100, 8, 420);      // mode 0644
+    putOctal(buf, off + 108, 8, 0);        // uid
+    putOctal(buf, off + 116, 8, 0);        // gid
+    putOctal(buf, off + 124, 12, content.length); // size
+    putOctal(buf, off + 136, 12, 0);       // mtime
+    bytes.write_byte(buf, off + 156, 48);  // typeflag '0' (regular file)
+    putStr(buf, off + 257, "ustar");       // magic
+    bytes.write_byte(buf, off + 263, 48);  // version "00"
+    bytes.write_byte(buf, off + 264, 48);
+
+    // Checksum: sum every header byte with the checksum field read as 8 spaces.
+    let k = 148;
+    while (k < 156) { bytes.write_byte(buf, off + k, 32); k = k + 1; }
+    let sum = 0;
+    let j = 0;
+    while (j < 512) { sum = sum + bytes.read_byte(buf, off + j); j = j + 1; }
+    // Six octal digits, a NUL, then a space (the canonical checksum encoding).
+    putOctal(buf, off + 148, 7, sum);
+    bytes.write_byte(buf, off + 155, 32);
+
+    // Content, immediately after the header, then advance past the padding.
+    putStr(buf, off + 512, content);
+    return off + 512 + padTo512(content.length);
+}
+
+/// Builds a gzip-compressed tar bundle holding `.manifest` (with `revision`)
+/// and `policy.rego`. The inverse of `unpack`.
+pub fn buildBundle(revision: string, rego: string): string {
+    let manifest = `{"revision":"${revision}"}`;
+    let total = 512 + padTo512(manifest.length) + 512 + padTo512(rego.length) + 1024;
+    let buf = bytes.alloc(total);
+    let z = 0;
+    while (z < total) { bytes.write_byte(buf, z, 0); z = z + 1; }
+
+    let off = writeEntry(buf, 0, ".manifest", manifest);
+    off = writeEntry(buf, off, "policy.rego", rego);
+    // The two trailing zero blocks are already zeroed.
+
+    let tar = bytes.read_string(buf, total);
+    bytes.free(buf);
+    return gzip.compress(tar);
+}
+
+/// Reads a NUL-terminated (or field-filling) string of up to `max` bytes from
+/// `s` at `off`.
+fn readField(s: string, off: int, max: int): string {
+    let end = off;
+    let limit = off + max;
+    while (end < limit && end < s.length && s[end] != 0) { end = end + 1; }
+    return string.slice(s, off, end);
+}
+
+/// Parses an octal field (digits terminated by NUL or space) to an int.
+fn readOctal(s: string, off: int, max: int): int {
+    let v = 0;
+    let i = off;
+    let limit = off + max;
+    while (i < limit && i < s.length) {
+        let c = s[i];
+        if (c < 48 || c > 55) { break; }
+        v = v * 8 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// True when the 512-byte block at `off` is entirely zero (the archive
+/// terminator).
+fn isZeroBlock(s: string, off: int): bool {
+    let i = 0;
+    while (i < 512) {
+        if (off + i >= s.length) { return true; }
+        if (s[off + i] != 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Unpacks a gzip tar bundle into `(revision, rego)`. Returns empty strings for
+/// anything the archive does not contain.
+pub fn unpack(bundleGz: string): (string, string) {
+    let tar = gzip.decompress(bundleGz);
+    let rev = "";
+    let rego = "";
+    let off = 0;
+    while (off + 512 <= tar.length) {
+        if (isZeroBlock(tar, off)) { break; }
+        let name = readField(tar, off, 100);
+        let size = readOctal(tar, off + 124, 12);
+        let contentOff = off + 512;
+        let content = string.slice(tar, contentOff, contentOff + size);
+        if (string.endsWith(name, ".manifest")) {
+            rev = source.fromJson(content).getString("revision");
+        } else if (string.endsWith(name, "policy.rego")) {
+            rego = content;
+        }
+        off = contentOff + padTo512(size);
+    }
+    return (rev, rego);
+}

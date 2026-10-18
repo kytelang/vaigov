@@ -1,0 +1,75 @@
+// connection: SQLite DSN parsing (SRP: connection string only). Pure string
+// work, no I/O and no db seam. The driver (driver.ky) turns a SqliteDsn into an
+// open database.
+//
+// Accepted forms, in order of convenience:
+//   - a plain filesystem path:            "data/app.db", "/var/app.db", "./x.db"
+//   - the in-memory database:             ":memory:"
+//   - a URL form with options:            "sqlite://path?mode=rwc&cache=shared&uri=1"
+// In the URL form, `mode` is one of ro|rw|rwc (read-only, read-write, or
+// read-write-and-create, the default), `cache` is shared|private, and `uri=1`
+// turns on SQLite's own URI filename handling for the path. The leading
+// "sqlite://" (or "sqlite:") is stripped to recover the path.
+import string;
+import sqlite;
+
+pub struct SqliteDsn {
+    pub path: string,      // the filesystem path, ":memory:", or a SQLite URI
+    pub flags: int,        // the sqlite3_open_v2 flags derived from `mode`/`uri`
+    pub isMemory: bool,    // true for ":memory:" (and mode-less memory URIs)
+    pub cache: string,     // "shared", "private", or "" (engine default)
+    init(path: string, flags: int, isMemory: bool, cache: string) {
+        self.path = path;
+        self.flags = flags;
+        self.isMemory = isMemory;
+        self.cache = cache;
+    }
+}
+
+// Pull `key=value` out of a `?a=b&c=d` query string (returns `dflt` if absent).
+fn queryParam(dsn: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(dsn, needle);
+    if (idx == -1) { return dflt; }
+    let rest = string.slice(dsn, idx + needle.length, dsn.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
+}
+
+// Parse a DSN into a SqliteDsn. A plain path or ":memory:" with no "?query" maps
+// to READWRITE|CREATE (the usual "open or create" behaviour). The URL form reads
+// `mode`, `cache` and `uri`.
+pub fn parse(dsn: string): SqliteDsn {
+    // Strip an optional scheme prefix ("sqlite://" or "sqlite:").
+    let base = dsn;
+    let sep = string.indexOf(base, "://");
+    if (sep != -1) {
+        base = string.slice(base, sep + 3, base.length);
+    } else if (string.indexOf(base, "sqlite:") == 0) {
+        base = string.slice(base, 7, base.length);
+    }
+
+    // Split off the "?query" part; it configures flags, not the path.
+    let qq = string.indexOf(base, "?");
+    let query = "";
+    if (qq != -1) {
+        query = string.slice(base, qq + 1, base.length);
+        base = string.slice(base, 0, qq);
+    }
+
+    let mode = queryParam(query, "mode", "rwc");
+    let cache = queryParam(query, "cache", "");
+    let uriOpt = queryParam(query, "uri", "");
+
+    let flags = 0;
+    if (string.eql(mode, "ro")) { flags = sqlite.SQLITE_OPEN_READONLY; }
+    else if (string.eql(mode, "rw")) { flags = sqlite.SQLITE_OPEN_READWRITE; }
+    else { flags = sqlite.SQLITE_OPEN_READWRITE + sqlite.SQLITE_OPEN_CREATE; }   // rwc (default)
+
+    if (string.eql(uriOpt, "1") || string.eql(uriOpt, "true")) { flags = flags + sqlite.SQLITE_OPEN_URI; }
+
+    let isMemory = string.eql(base, ":memory:");
+
+    return SqliteDsn(base, flags, isMemory, cache);
+}

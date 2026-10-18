@@ -1,0 +1,10 @@
+// One governed AI-endpoint row (shared `acp` db `governed_endpoints` table).
+// `enabled` is an INTEGER column (0/1); serialized to a JSON bool by the handler.
+@serializable
+pub struct EndpointRow {
+    pub id: string,
+    pub host: string,
+    pub port: int,
+    pub enabled: int,
+    pub note: string,
+}

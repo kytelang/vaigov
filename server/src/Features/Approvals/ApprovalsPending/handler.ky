@@ -1,0 +1,33 @@
+// GET /approvals/pending -> {"pending":[{id,tool}]} (the console poll).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Approvals.Shared.ApprovalStore;
+
+pub struct ApprovalsPendingHandler impl RouteHandler {
+    store: ApprovalStore,
+    app: AppContext,
+    init(store: ApprovalStore, app: AppContext) { self.store = store; self.app = app; }
+
+    async fn serve(self: ApprovalsPendingHandler, ctx: routing.Context): response.Response {
+        let items = await self.store.listPending();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < items.size()) {
+            let r = items.at(i);
+            let o = Map<string, json.JsonValue>(2, string.hash);
+            o.set("id", json.str(r.id));
+            o.set("tool", json.str(r.tool));
+            arr.push(json.object(o));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("pending", json.array(arr));
+        return Http.okObj(m);
+    }
+}

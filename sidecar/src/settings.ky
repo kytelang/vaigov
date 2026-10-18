@@ -1,0 +1,155 @@
+//! varman-sidecar configuration.
+//!
+//! The sidecar reads its settings from a YAML file (`--config <path>`, default
+//! `varman-sidecar.yaml` in the working directory), exactly like the Rust
+//! acp-sidecar. Settings come from the file, never from environment variables.
+//! A small set of command-line overrides is honoured for convenience in dev.
+//!
+//! Unlike the framework's `web.config` (which reads a `config:` subtree of an
+//! app manifest), this reads a FLAT top-level mapping, so the file looks like:
+//!
+//!     control_plane: "http://127.0.0.1:8787"
+//!     tenant: "default"
+//!     bundle_name: "policy"
+//!     listen: "127.0.0.1:8899"
+//!     poll_secs: 30
+//!     flush_secs: 10
+//!     store_path: "varman-sidecar.queue"
+//!     cache_path: "varman-sidecar-bundle.tar.gz"
+//!     envoy_dir: "envoy"
+//!     ca_dir: "certs"
+//!     opa_addr: "127.0.0.1:9191"
+//!     proxy_listen: "0.0.0.0:10000"
+
+import serde.source;
+import io.file;
+import string;
+import list;
+import env;
+
+/// The sidecar's configuration. Every field has a built-in default (set in
+/// `init`), so a missing file or a partial file still yields a usable config:
+/// the serde binder fills present keys and leaves the rest at their defaults.
+@serializable
+pub struct Config {
+    pub control_plane: string,
+    pub tenant: string,
+    pub token: string,
+    pub bundle_name: string,
+    pub listen: string,
+    pub poll_secs: int,
+    pub flush_secs: int,
+    pub store_path: string,
+    pub cache_path: string,
+    pub envoy_dir: string,
+    pub ca_dir: string,
+    pub opa_addr: string,
+    pub proxy_listen: string,
+    // --- R1/R4: structured signed violation store ---
+    pub vstore_path: string,     // append-only signed-record log
+    pub vcursor_path: string,    // flush cursor sidecar file
+    pub signing_seed: string,    // 64-hex Ed25519 seed; empty -> a dev default is used
+    pub prompt_redact: bool,     // store a redacted preview + hash instead of the full prompt
+    // --- R5: provisioning ---
+    pub cp_pubkey: string,       // control-plane public key (hex) to verify pulled config; "" = skip
+    pub endpoints_cache: string, // last-good endpoint registry on disk
+    pub packs_cache: string,     // last-good installed-packs list on disk
+    // --- content firewall ---
+    pub content_firewall: bool,  // master on/off for the /cf/check inspector
+    pub cf_rules_cache: string,  // last-good content rule set on disk
+    // --- R3: ticketing ---
+    pub ticketing_url: string,   // base URL of the customer ticketing system; "" = disabled
+    pub ticketing_system: string,// "generic" | "jira" | "servicenow"
+    pub ticketing_token: string,
+    pub ticketing_user: string,  // for Basic auth systems (Jira email, ServiceNow user)
+    pub ticketing_project: string,
+    pub ticket_on: string,       // comma-joined verdicts that auto-raise, e.g. "deny,step_up"
+
+    init() {
+        self.control_plane = "http://127.0.0.1:8787";
+        self.tenant = "default";
+        self.token = "";
+        self.bundle_name = "policy";
+        self.listen = "127.0.0.1:8899";
+        self.poll_secs = 30;
+        self.flush_secs = 10;
+        self.store_path = "varman-sidecar.queue";
+        self.cache_path = "varman-sidecar-bundle.tar.gz";
+        self.envoy_dir = "";
+        self.ca_dir = "certs";
+        self.opa_addr = "127.0.0.1:9191";
+        self.proxy_listen = "0.0.0.0:10000";
+        self.vstore_path = "varman-sidecar.violations";
+        self.vcursor_path = "varman-sidecar.violations.cursor";
+        self.signing_seed = "";
+        self.prompt_redact = true;
+        self.cp_pubkey = "";
+        self.endpoints_cache = "varman-sidecar-endpoints.json";
+        self.packs_cache = "varman-sidecar-packs.json";
+        self.content_firewall = true;
+        self.cf_rules_cache = "varman-sidecar-content-rules.json";
+        self.ticketing_url = "";
+        self.ticketing_system = "generic";
+        self.ticketing_token = "";
+        self.ticketing_user = "";
+        self.ticketing_project = "";
+        self.ticket_on = "deny";
+    }
+}
+
+/// A deterministic dev signing seed (64 hex chars) used only when `signing_seed`
+/// is empty, so a fresh dev sidecar still produces verifiable signatures. In
+/// production the seed must be provisioned via config; a warning is logged.
+pub fn devSeed(): string {
+    return "0000000000000000000000000000000000000000000000000000000000000001";
+}
+
+/// The `--config <path>` argument, or `varman-sidecar.yaml` when absent.
+fn configPath(argv: list.List<string>): string {
+    let i = 0;
+    while (i + 1 < argv.size()) {
+        if (string.eql(argv.get(i) ?? "", "--config")) {
+            return argv.get(i + 1) ?? "varman-sidecar.yaml";
+        }
+        i = i + 1;
+    }
+    return "varman-sidecar.yaml";
+}
+
+/// Removes a single trailing "/" from a base URL so request paths join cleanly.
+pub fn trimTrailingSlash(s: string): string {
+    if (string.endsWith(s, "/")) {
+        return string.slice(s, 0, s.length - 1);
+    }
+    return s;
+}
+
+/// Parses config from a YAML string (the flat top-level form). Used directly by
+/// tests; `load` wraps it with file reading and CLI overrides.
+pub fn fromYaml(text: string): Config {
+    let ys = source.fromYaml(text);
+    let c = serde.bind<Config>(ys);
+    c.control_plane = trimTrailingSlash(c.control_plane);
+    return c;
+}
+
+/// Loads the configuration: reads the manifest file, binds it, then applies the
+/// optional command-line overrides (`--control-plane`, `--tenant`, `--listen`,
+/// `--envoy-dir`). A missing file yields the built-in defaults.
+pub fn load(): Config {
+    let argv = env.args();
+    let path = configPath(argv);
+    let text = if (File.exists(path)) File.readText(path) else "";
+    let c = fromYaml(text);
+
+    let i = 0;
+    while (i + 1 < argv.size()) {
+        let a = argv.get(i) ?? "";
+        if (string.eql(a, "--control-plane")) { c.control_plane = trimTrailingSlash(argv.get(i + 1) ?? c.control_plane); }
+        else if (string.eql(a, "--tenant")) { c.tenant = argv.get(i + 1) ?? c.tenant; }
+        else if (string.eql(a, "--listen")) { c.listen = argv.get(i + 1) ?? c.listen; }
+        else if (string.eql(a, "--envoy-dir")) { c.envoy_dir = argv.get(i + 1) ?? c.envoy_dir; }
+        i = i + 1;
+    }
+    return c;
+}

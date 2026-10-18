@@ -1,0 +1,11 @@
+// Read DTO: the shape the assurance views render for a red-team run.
+@serializable
+pub struct RedteamRunDto {
+    pub id: string,
+    pub target: string,
+    pub status: string,
+    pub total: int,
+    pub passed: int,
+    pub failed: int,
+    @from("created_ms") pub createdMs: long,
+}

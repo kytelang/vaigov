@@ -1,0 +1,239 @@
+//! Core value types shared across the proxy, server, and CLI.
+//!
+//! A faithful port of Rust `acp-core`'s `types.rs` (plus `SignedTreeHead` from
+//! `sign.rs`). The three enums serialise with serde `rename_all = "snake_case"`,
+//! so each carries `toSnake` / `fromSnake` conversions that reproduce exactly
+//! those wire strings ("allow", "step_up", and so on). The structs are value
+//! structs: they are copied by value and carry no manual memory management, and
+//! none of them owns a growable container except `Decision.approvers`.
+//!
+//! The canonical byte image of a `Record` and of a `SignedTreeHead` lives in
+//! `core.canonical`; this module is only the value model. `ActionContext.args`
+//! (a dynamic JSON object in the Rust source) is deliberately NOT modelled as a
+//! field here: a `Record` stores only `argsHash`, the SHA-256 of the canonical
+//! args, which is how the Rust ledger persists it too.
+
+import string;
+import list;
+
+/// The four possible outcomes of evaluating a tool call against policy.
+/// Serde `rename_all = "snake_case"`: allow / deny / step_up / shadow.
+pub enum Verdict {
+    Allow,
+    Deny,
+    StepUp,
+    Shadow,
+
+    /// The snake_case wire string for this verdict.
+    pub fn toSnake(self: Verdict): string {
+        switch (self) {
+            case Verdict.Allow: { return "allow"; }
+            case Verdict.Deny: { return "deny"; }
+            case Verdict.StepUp: { return "step_up"; }
+            case Verdict.Shadow: { return "shadow"; }
+            default: { return "allow"; }
+        }
+    }
+
+    /// Parses a snake_case wire string into a `Verdict`. Unknown input folds to
+    /// `Allow` (the Rust side rejects at the serde layer; here callers pass
+    /// already-validated strings).
+    pub fn fromSnake(s: string): Verdict {
+        if (string.eql(s, "deny")) { return Verdict.Deny; }
+        if (string.eql(s, "step_up")) { return Verdict.StepUp; }
+        if (string.eql(s, "shadow")) { return Verdict.Shadow; }
+        return Verdict.Allow;
+    }
+}
+
+/// Verdict precedence rank: deny > step_up > shadow > allow. Used to fold
+/// several verdicts into the strongest one.
+pub fn rank(v: Verdict): int {
+    switch (v) {
+        case Verdict.Deny: { return 3; }
+        case Verdict.StepUp: { return 2; }
+        case Verdict.Shadow: { return 1; }
+        case Verdict.Allow: { return 0; }
+        default: { return 0; }
+    }
+}
+
+/// Returns the higher-precedence of two verdicts (deny wins over step_up wins
+/// over shadow wins over allow).
+pub fn maxVerdict(a: Verdict, b: Verdict): Verdict {
+    if (rank(b) > rank(a)) { return b; }
+    return a;
+}
+
+/// A coarse impact score derived by the proxy from the call arguments.
+/// Serde `rename_all = "snake_case"`: low / medium / high.
+pub enum BlastRadius {
+    Low,
+    Medium,
+    High,
+
+    pub fn toSnake(self: BlastRadius): string {
+        switch (self) {
+            case BlastRadius.Low: { return "low"; }
+            case BlastRadius.Medium: { return "medium"; }
+            case BlastRadius.High: { return "high"; }
+            default: { return "low"; }
+        }
+    }
+
+    pub fn fromSnake(s: string): BlastRadius {
+        if (string.eql(s, "medium")) { return BlastRadius.Medium; }
+        if (string.eql(s, "high")) { return BlastRadius.High; }
+        return BlastRadius.Low;
+    }
+}
+
+/// The terminal outcome of a decision, distinct from the verdict.
+/// Serde `rename_all = "snake_case"`: forwarded / not_executed / eval_error.
+pub enum OutcomeKind {
+    Forwarded,
+    NotExecuted,
+    EvalError,
+
+    pub fn toSnake(self: OutcomeKind): string {
+        switch (self) {
+            case OutcomeKind.Forwarded: { return "forwarded"; }
+            case OutcomeKind.NotExecuted: { return "not_executed"; }
+            case OutcomeKind.EvalError: { return "eval_error"; }
+            default: { return "forwarded"; }
+        }
+    }
+
+    pub fn fromSnake(s: string): OutcomeKind {
+        if (string.eql(s, "not_executed")) { return OutcomeKind.NotExecuted; }
+        if (string.eql(s, "eval_error")) { return OutcomeKind.EvalError; }
+        return OutcomeKind.Forwarded;
+    }
+}
+
+/// The evaluated impact plus the taxonomy version that produced it.
+pub struct Impact {
+    pub level: BlastRadius,
+    /// Versioned, per-tenant impact taxonomy id, e.g. "impact@1.3".
+    pub taxonomy: string,
+
+    init(level: BlastRadius, taxonomy: string) {
+        self.level = level;
+        self.taxonomy = taxonomy;
+    }
+}
+
+/// The human on whose behalf the agent acts. `verified` is false when the id
+/// came from the agent-set header and is never signed as verified.
+pub struct Principal {
+    pub id: string,
+    pub verified: bool,
+
+    init(id: string, verified: bool) {
+        self.id = id;
+        self.verified = verified;
+    }
+}
+
+/// Reproducibility + crypto-agility provenance stamped into every record.
+pub struct Provenance {
+    /// Named, swappable algorithms, e.g. "sha256" and "ed25519".
+    pub algoHash: string,
+    pub algoSig: string,
+    pub evaluator: string,
+    pub compiler: string,
+    /// Deterministic proxy-side context derivation version.
+    pub contextDerivation: string,
+
+    init(algoHash: string, algoSig: string, evaluator: string, compiler: string, contextDerivation: string) {
+        self.algoHash = algoHash;
+        self.algoSig = algoSig;
+        self.evaluator = evaluator;
+        self.compiler = compiler;
+        self.contextDerivation = contextDerivation;
+    }
+}
+
+/// The resolved policy decision for an action.
+pub struct Decision {
+    pub verdict: Verdict,
+    pub ruleId: string | undefined,
+    /// Redaction-safe fired condition, for explainability and replay.
+    pub matched: string | undefined,
+    pub policyHash: string,
+    pub approvers: List<string>,
+    pub reason: string | undefined,
+    pub impact: Impact,
+
+    init(verdict: Verdict, ruleId: string | undefined, matched: string | undefined, policyHash: string, approvers: List<string>, reason: string | undefined, impact: Impact) {
+        self.verdict = verdict;
+        self.ruleId = ruleId;
+        self.matched = matched;
+        self.policyHash = policyHash;
+        self.approvers = approvers;
+        self.reason = reason;
+        self.impact = impact;
+    }
+}
+
+/// One evidence record: a leaf in the verifiable log. The canonical bytes of
+/// this value (see `core.canonical`) are what the RFC 6962 leaf hash is computed
+/// over; the hash is not stored inside the record itself.
+pub struct Record {
+    /// Versioned record schema, for mixed-fleet safety.
+    pub schema: int,
+    pub seq: long,
+    pub tsMs: long,
+    /// Hybrid logical clock for cross-proxy causal ordering.
+    pub hlc: string,
+    /// Verified identity of the launched/dialled tool server.
+    pub toolServerFingerprint: string | undefined,
+    pub agentId: string,
+    pub principal: Principal,
+    pub sessionId: string,
+    pub tool: string,
+    /// SHA-256 of the canonical args; the full args live in a separate blob.
+    pub argsHash: string,
+    pub impact: Impact,
+    pub verdict: Verdict,
+    pub ruleId: string | undefined,
+    /// Redaction-safe fired condition.
+    pub matched: string | undefined,
+    pub policyHash: string,
+    pub reason: string | undefined,
+    pub provenance: Provenance,
+
+    init(schema: int, seq: long, tsMs: long, hlc: string, toolServerFingerprint: string | undefined, agentId: string, principal: Principal, sessionId: string, tool: string, argsHash: string, impact: Impact, verdict: Verdict, ruleId: string | undefined, matched: string | undefined, policyHash: string, reason: string | undefined, provenance: Provenance) {
+        self.schema = schema;
+        self.seq = seq;
+        self.tsMs = tsMs;
+        self.hlc = hlc;
+        self.toolServerFingerprint = toolServerFingerprint;
+        self.agentId = agentId;
+        self.principal = principal;
+        self.sessionId = sessionId;
+        self.tool = tool;
+        self.argsHash = argsHash;
+        self.impact = impact;
+        self.verdict = verdict;
+        self.ruleId = ruleId;
+        self.matched = matched;
+        self.policyHash = policyHash;
+        self.reason = reason;
+        self.provenance = provenance;
+    }
+}
+
+/// The head of the verifiable log at a point in time. Its canonical bytes
+/// (see `core.canonical.sthBytes`) are what gets signed.
+pub struct SignedTreeHead {
+    pub treeSize: long,
+    pub rootHashHex: string,
+    pub timestampMs: long,
+
+    init(treeSize: long, rootHashHex: string, timestampMs: long) {
+        self.treeSize = treeSize;
+        self.rootHashHex = rootHashHex;
+        self.timestampMs = timestampMs;
+    }
+}

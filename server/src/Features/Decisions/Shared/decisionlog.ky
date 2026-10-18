@@ -1,0 +1,94 @@
+//! Shared helpers for the OPA decision-log sink and the coverage read-side.
+import string;
+import list;
+import map;
+import serde.json;
+import compress.gzip;
+import types;
+import web.routing;
+
+// Decode the request body, gunzipping when Content-Encoding says so or the gzip
+// magic is present (OPA sends Content-Encoding: gzip).
+pub fn decodeBody(ctx: routing.Context): string {
+    let raw = ctx.request.body;
+    let ce = ctx.request.getHeader("content-encoding") ?? "";
+    let gzipped = string.contains(ce, "gzip") || (raw.length >= 2 && raw[0] == 0x1f && raw[1] == 0x8b);
+    if (gzipped) { return gzip.decompress(raw); }
+    return raw;
+}
+
+// The log entries of a parsed body: a bare array, or {logs:[...]}.
+pub fn entriesOf(body: json.JsonValue): List<json.JsonValue> {
+    if (body.kind == 4) { return json.asArray(body) ?? List<json.JsonValue>(); }
+    if (body.kind == 5 && json.has(body, "logs")) {
+        return json.asArray(json.get(body, "logs")) ?? List<json.JsonValue>();
+    }
+    return List<json.JsonValue>();
+}
+
+pub fn hasVerdict(v: json.JsonValue): bool {
+    if (v.kind != 5 || !json.has(v, "verdict")) { return false; }
+    let s = json.asString(json.get(v, "verdict")) ?? "";
+    return s.length > 0;
+}
+
+// The decision object inside an entry's `result` (unwrapping an ext_authz
+// `result.report` when that carries the verdict).
+pub fn decisionOf(entry: json.JsonValue): json.JsonValue {
+    let result = if (json.has(entry, "result")) (json.get(entry, "result")) else (json.null());
+    if (result.kind == 5 && json.has(result, "report") && hasVerdict(json.get(result, "report"))) {
+        return json.get(result, "report");
+    }
+    return result;
+}
+
+pub fn controlKeys(dec: json.JsonValue): List<string> {
+    let out = List<string>();
+    let cs = json.asArray(json.get(dec, "controls"));
+    if (cs != undefined) {
+        let i = 0;
+        while (i < cs.size()) {
+            let s = json.asString(cs.at(i));
+            if (s != undefined) { out.push(s); }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// A field from `input`: a bare string, or its `.id` when an object.
+pub fn flatOrId(v: json.JsonValue): string {
+    if (v.kind == 3) { return v.sval; }
+    if (v.kind == 5 && json.has(v, "id")) { return json.asString(json.get(v, "id")) ?? ""; }
+    return "";
+}
+
+pub fn provenance(): types.Provenance {
+    return types.Provenance("sha256", "ed25519", "varman-rego", "kyte", "ctx@1");
+}
+
+// Authored control keys ("act:control_id") -> the rule ids tagged to them.
+pub fn authoredKeys(rules: List<json.JsonValue>): Map<string, List<string>> {
+    let out = Map<string, List<string>>(16, string.hash);
+    let i = 0;
+    while (i < rules.size()) {
+        let r = rules.at(i);
+        let rid = json.asString(json.get(r, "rule_id")) ?? "";
+        let cs = json.asArray(json.get(r, "controls"));
+        if (cs != undefined) {
+            let j = 0;
+            while (j < cs.size()) {
+                let c = cs.at(j);
+                let act = json.asString(json.get(c, "act")) ?? "";
+                let cid = json.asString(json.get(c, "control_id")) ?? "";
+                let key = string.concat(string.concat(act, ":"), cid);
+                let existing = out.get(key) ?? List<string>();
+                existing.push(rid);
+                out.set(key, existing);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}

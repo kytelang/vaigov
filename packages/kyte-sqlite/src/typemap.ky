@@ -1,0 +1,136 @@
+// typemap: the bridge between the driver-neutral `db` value model and SQLite's
+// own binding/column API (SRP: types and values only). Three jobs:
+//   - bound db.DbValue -> the right sqlite3_bind_*   (bindValue)
+//   - a stepped column -> a typed db.DbValue         (cellFromColumn)
+//   - a declared type / dynamic type -> db.DbType    (dbTypeFromDecl, dbTypeFromColumnType)
+//   - a SQLite (extended) result code -> a neutral DbError kind (classifyCode)
+//
+// Pure over the sqlite low-level module and the db model; no DSN parsing, no
+// connection lifecycle. The Connection class in driver.ky calls into here.
+import string;
+import list;
+import db;
+import sqlite;
+
+// --- Bind a db.DbValue onto a prepared statement -----------------------------
+// Dispatches on the value's logical kind to the matching sqlite3_bind_*:
+//   Null          -> bind_null
+//   Bool          -> bind_int64 (0/1)
+//   Int4/Uint4    -> bind_int64 (widened; SQLite integers are always 64-bit)
+//   Int8/Uint8    -> bind_int64
+//   Float4/Float8 -> bind_text (numeric text; see the float note below)
+//   Decimal/Text/Timestamp/Uuid/Json -> bind_text with an EXPLICIT byte length
+//   Blob          -> bind_blob with an EXPLICIT byte length (embedded NULs safe)
+// Text and blob binds pass the byte length (never NUL-terminated) and use
+// SQLITE_TRANSIENT inside the low-level wrapper, so a value with an embedded NUL
+// round-trips intact and the Kyte string need not outlive the bind.
+pub fn bindValue(stmt: sqlite.Stmt, idx: int, v: DbValue): void {
+    let k = v.kind;
+    if (v.isNull()) { stmt.bindNull(idx); return; }
+    if (k == DbType.Bool) { stmt.bindLong(idx, if (v.asBool()) 1 else 0); return; }
+    if (k == DbType.Int4 || k == DbType.Uint4 || k == DbType.Int8 || k == DbType.Uint8) {
+        stmt.bindLong(idx, v.asLong());
+        return;
+    }
+    if (k == DbType.Float4 || k == DbType.Float8) {
+        stmt.bindDouble(idx, v.asDouble());
+        return;
+    }
+    if (k == DbType.Blob) {
+        let b = v.asText();
+        stmt.bindBlob(idx, b, b.length);
+        return;
+    }
+    // Decimal, Text, Timestamp, Uuid, Json and any fallback travel as text. They
+    // are carried textually in the db model, so text binding is exact.
+    let t = v.asText();
+    stmt.bindTextN(idx, t, t.length);
+}
+
+// Bind a whole positional parameter list (1-based on the SQLite side). Binds at
+// most `parameterCount` slots so a short list leaves the rest unbound (NULL) and
+// an over-long list is ignored past what the SQL declares.
+pub fn bindAll(stmt: sqlite.Stmt, params: List<DbValue>): void {
+    let want = stmt.parameterCount();
+    let i = 0;
+    while (i < params.size() && i < want) {
+        bindValue(stmt, i + 1, params.get(i) ?? db.dbNull());
+        i = i + 1;
+    }
+}
+
+// --- Decode a stepped column into a typed db.DbValue -------------------------
+// SQLite is dynamically typed, so the authoritative type is the per-row storage
+// class reported by sqlite3_column_type, not the declared column type:
+//   INTEGER -> dbLong, FLOAT -> dbDouble, TEXT -> dbText, BLOB -> dbBlob (exact
+//   bytes), NULL -> dbNull. Only valid after `step` has landed on a row.
+pub fn cellFromColumn(stmt: sqlite.Stmt, col: int): DbValue {
+    let ct = stmt.columnType(col);
+    if (ct == sqlite.SQLITE_NULL) { return db.dbNull(); }
+    if (ct == sqlite.SQLITE_INTEGER) { return db.dbLong(stmt.columnLong(col)); }
+    if (ct == sqlite.SQLITE_FLOAT) { return db.dbDouble(stmt.columnDouble(col)); }
+    if (ct == sqlite.SQLITE_BLOB) { return db.dbBlob(stmt.columnBlob(col)); }
+    return db.dbText(stmt.columnText(col));   // SQLITE_TEXT and any fallback
+}
+
+// Map a dynamic storage class (sqlite3_column_type) to a neutral DbType, for a
+// column's schema entry. Used when a result has rows to inspect.
+pub fn dbTypeFromColumnType(ct: int): DbType {
+    if (ct == sqlite.SQLITE_INTEGER) { return DbType.Int8; }
+    if (ct == sqlite.SQLITE_FLOAT) { return DbType.Float8; }
+    if (ct == sqlite.SQLITE_BLOB) { return DbType.Blob; }
+    if (ct == sqlite.SQLITE_NULL) { return DbType.Null; }
+    return DbType.Text;
+}
+
+// Map a DECLARED column type (from sqlite3_column_decltype, for example "INTEGER",
+// "VARCHAR(32)", "REAL", "BLOB", "NUMERIC") to a neutral DbType. SQLite applies
+// loose type affinity rules; this mirrors them well enough for a schema label and
+// is the fallback when a result has no rows to sniff a storage class from. An
+// unknown or empty declaration maps to Text.
+pub fn dbTypeFromDecl(decl: string): DbType {
+    let d = string.toUpperCase(decl);
+    if (string.eql(d, "")) { return DbType.Text; }
+    if (string.indexOf(d, "INT") >= 0) { return DbType.Int8; }
+    if (string.indexOf(d, "REAL") >= 0 || string.indexOf(d, "FLOA") >= 0 || string.indexOf(d, "DOUB") >= 0) { return DbType.Float8; }
+    if (string.indexOf(d, "BLOB") >= 0) { return DbType.Blob; }
+    if (string.indexOf(d, "BOOL") >= 0) { return DbType.Bool; }
+    if (string.indexOf(d, "DATE") >= 0 || string.indexOf(d, "TIME") >= 0) { return DbType.Timestamp; }
+    if (string.indexOf(d, "NUM") >= 0 || string.indexOf(d, "DEC") >= 0) { return DbType.Decimal; }
+    // CHAR / CLOB / TEXT / VARCHAR and anything else default to text.
+    return DbType.Text;
+}
+
+// --- Error classification -----------------------------------------------------
+// Map a SQLite EXTENDED result code to a neutral db DBERR_* kind so callers can
+// react to the category (`err.isUniqueViolation()`, `err.isTransient()`) without
+// string-matching SQLite's message.
+pub fn classifyCode(extended: int): int {
+    if (extended == sqlite.SQLITE_CONSTRAINT_UNIQUE || extended == sqlite.SQLITE_CONSTRAINT_PRIMARYKEY) {
+        return db.DBERR_UNIQUE_VIOLATION;
+    }
+    if (extended == sqlite.SQLITE_CONSTRAINT_NOTNULL) { return db.DBERR_NOT_NULL; }
+    if (extended == sqlite.SQLITE_CONSTRAINT_FOREIGNKEY) { return db.DBERR_FOREIGN_KEY; }
+    if (extended == sqlite.SQLITE_CONSTRAINT_CHECK) { return db.DBERR_CHECK; }
+    // The primary code is the low byte of the extended code.
+    let primary = extended % 256;
+    if (primary == sqlite.SQLITE_BUSY || primary == sqlite.SQLITE_LOCKED) { return db.DBERR_LOCK_TIMEOUT; }
+    if (primary == sqlite.SQLITE_CONSTRAINT) { return db.DBERR_CHECK; }   // generic constraint
+    return db.DBERR_UNKNOWN;
+}
+
+// Build a db.DbError from a connection's current error state. `code` carries the
+// numeric extended code as text (SQLite has no SQLSTATE), `number` the extended
+// code, and `kind` the neutral classification.
+pub fn errorFrom(dbh: sqlite.Db): DbError {
+    let ext = dbh.extendedErrcode();
+    let e = db.DbError(`${ext}`, dbh.errmsg());
+    return e.with(ext, classifyCode(ext));
+}
+
+// Build a db.DbError from a bare result code (when there is no connection handy,
+// for example a bind/step code), using sqlite3_errstr for the message.
+pub fn errorFromCode(rc: int): DbError {
+    let e = db.DbError(`${rc}`, sqlite.errstr(rc));
+    return e.with(rc, classifyCode(rc));
+}

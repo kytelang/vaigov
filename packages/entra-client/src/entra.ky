@@ -1,0 +1,176 @@
+//! Microsoft Entra ID (Azure AD) client: OAuth2 client-credentials token plus a
+//! few Microsoft Graph reads for user / group lookup (role mapping). Uses the
+//! Kyte web HTTP client; no external dependency.
+import web.client;
+import web.response;
+import web.url;
+import crypto.base64;
+import serde.json;
+import string;
+import map;
+
+/// A token exchange result.
+pub class TokenResult {
+    pub ok: bool,
+    pub status: int,
+    pub accessToken: string,
+    pub expiresIn: int,
+    pub body: string,
+    init(ok: bool, status: int, accessToken: string, expiresIn: int, body: string) {
+        self.ok = ok; self.status = status; self.accessToken = accessToken; self.expiresIn = expiresIn; self.body = body;
+    }
+}
+
+/// A generic Graph response.
+pub class GraphResult {
+    pub ok: bool,
+    pub status: int,
+    pub body: string,
+    init(ok: bool, status: int, body: string) { self.ok = ok; self.status = status; self.body = body; }
+}
+
+pub class Entra {
+    pub tenantId: string,
+    pub clientId: string,
+    pub clientSecret: string,
+    init(tenantId: string, clientId: string, clientSecret: string) {
+        self.tenantId = tenantId; self.clientId = clientId; self.clientSecret = clientSecret;
+    }
+
+    /// Client-credentials grant for the Microsoft Graph default scope.
+    pub fn token(self: Entra): TokenResult {
+        let url = "https://login.microsoftonline.com/" + self.tenantId + "/oauth2/v2.0/token";
+        let body = "client_id=" + self.clientId + "&client_secret=" + self.clientSecret +
+            "&grant_type=client_credentials&scope=https%3A%2F%2Fgraph.microsoft.com%2F.default";
+        let h = Map<string, string>(2, string.hash);
+        h.set("content-type", "application/x-www-form-urlencoded");
+        let resp = client.Http.request("POST", url, h, body);
+        let code = resp.status.toCode();
+        let tok = "";
+        let exp = 0;
+        let v = json.tryParse(resp.body);
+        if (v != undefined) {
+            let o = v ?? json.null();
+            if (o.kind == 5) {
+                tok = json.asString(json.get(o, "access_token")) ?? "";
+                let e = json.asNumber(json.get(o, "expires_in"));
+                if (e != undefined) { exp = (e ?? 0.0) as int; }
+            }
+        }
+        return TokenResult(code == 200 && tok.length > 0, code, tok, exp, resp.body);
+    }
+
+    fn graphGet(self: Entra, token: string, path: string): GraphResult {
+        let url = "https://graph.microsoft.com/v1.0" + path;
+        let h = Map<string, string>(2, string.hash);
+        h.set("authorization", client.bearer(token));
+        h.set("accept", "application/json");
+        let resp = client.Http.request("GET", url, h, "");
+        let code = resp.status.toCode();
+        return GraphResult(code >= 200 && code < 300, code, resp.body);
+    }
+
+    /// GET /users/{id} (id or userPrincipalName).
+    pub fn getUser(self: Entra, token: string, id: string): GraphResult {
+        return self.graphGet(token, "/users/" + id);
+    }
+
+    /// GET /users/{id}/memberOf (group membership for role mapping).
+    pub fn userGroups(self: Entra, token: string, id: string): GraphResult {
+        return self.graphGet(token, "/users/" + id + "/memberOf");
+    }
+
+    // --- OIDC Authorization Code flow (interactive user sign-in) --------------
+
+    /// The Microsoft Entra `/authorize` URL to redirect the browser to. `state`
+    /// and `nonce` are opaque anti-forgery/replay values the caller generates and
+    /// checks on return. Scope is the OpenID Connect set for a sign-in.
+    pub fn authorizeUrl(self: Entra, redirectUri: string, state: string, nonce: string, loginHint: string): string {
+        let u = "https://login.microsoftonline.com/" + self.tenantId + "/oauth2/v2.0/authorize" +
+            "?client_id=" + url.encode(self.clientId) +
+            "&response_type=code" +
+            "&redirect_uri=" + url.encode(redirectUri) +
+            "&response_mode=query" +
+            "&scope=" + url.encode("openid profile email") +
+            "&state=" + url.encode(state) +
+            "&nonce=" + url.encode(nonce);
+        // Pre-fill the account picker with the address the user typed on our
+        // login screen (RFC: login_hint). Optional; empty means "ask".
+        if (loginHint.length > 0) { u = u + "&login_hint=" + url.encode(loginHint); }
+        return u;
+    }
+
+    /// Exchanges an authorization `code` for tokens (confidential client: the
+    /// secret is sent server-to-server over TLS, never to the browser). Returns
+    /// the id_token (and access_token) on success.
+    pub fn exchangeCode(self: Entra, code: string, redirectUri: string): CodeResult {
+        let urlStr = "https://login.microsoftonline.com/" + self.tenantId + "/oauth2/v2.0/token";
+        let body = "client_id=" + url.encode(self.clientId) +
+            "&client_secret=" + url.encode(self.clientSecret) +
+            "&grant_type=authorization_code" +
+            "&code=" + url.encode(code) +
+            "&redirect_uri=" + url.encode(redirectUri) +
+            "&scope=" + url.encode("openid profile email");
+        let h = Map<string, string>(1, string.hash);
+        h.set("content-type", "application/x-www-form-urlencoded");
+        let resp = client.Http.request("POST", urlStr, h, body);
+        let codeN = resp.status.toCode();
+        let idt = "";
+        let at = "";
+        let v = json.tryParse(resp.body);
+        if (v != undefined) {
+            let o = v ?? json.null();
+            if (o.kind == 5) {
+                idt = json.asString(json.get(o, "id_token")) ?? "";
+                at = json.asString(json.get(o, "access_token")) ?? "";
+            }
+        }
+        return CodeResult(codeN == 200 && idt.length > 0, codeN, idt, at, resp.body);
+    }
+}
+
+/// Result of an authorization-code exchange.
+pub class CodeResult {
+    pub ok: bool,
+    pub status: int,
+    pub idToken: string,
+    pub accessToken: string,
+    pub body: string,
+    init(ok: bool, status: int, idToken: string, accessToken: string, body: string) {
+        self.ok = ok; self.status = status; self.idToken = idToken; self.accessToken = accessToken; self.body = body;
+    }
+}
+
+/// The subset of OpenID Connect id_token claims we use for sign-in.
+pub class IdClaims {
+    pub oid: string,
+    pub email: string,
+    pub preferredUsername: string,
+    pub name: string,
+    pub tid: string,
+    init(oid: string, email: string, preferredUsername: string, name: string, tid: string) {
+        self.oid = oid; self.email = email; self.preferredUsername = preferredUsername; self.name = name; self.tid = tid;
+    }
+}
+
+/// Decodes the claims from an id_token's payload segment. NOTE: this decodes, it
+/// does not verify the JWT signature. The id_token here comes straight from the
+/// Entra token endpoint over TLS during a confidential-client code exchange (not
+/// via the browser), so the transport authenticates it. For defence in depth,
+/// production should additionally verify the RS256 signature against the tenant's
+/// JWKS and check iss/aud/exp/nonce.
+pub fn decodeIdClaims(idToken: string): IdClaims {
+    let c = IdClaims("", "", "", "", "");
+    let parts = string.split(idToken, ".");
+    if (parts.size() < 2) { return c; }
+    let v = json.tryParse(base64.decode(parts.at(1)));
+    if (v == undefined) { return c; }
+    let o = v ?? json.null();
+    if (o.kind != 5) { return c; }
+    c.oid = json.asString(json.get(o, "oid")) ?? "";
+    c.email = json.asString(json.get(o, "email")) ?? "";
+    c.preferredUsername = json.asString(json.get(o, "preferred_username")) ?? "";
+    c.name = json.asString(json.get(o, "name")) ?? "";
+    c.tid = json.asString(json.get(o, "tid")) ?? "";
+    return c;
+}

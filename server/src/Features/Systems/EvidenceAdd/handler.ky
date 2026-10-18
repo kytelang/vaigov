@@ -1,0 +1,45 @@
+// POST /systems/{id}/evidence {framework,control_id,title,source,owner,produced_ms,valid_until_ms,artefact_ref,note} -> {"ok":true,"id":"ev-.."}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+
+pub struct EvidenceAddHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EvidenceAddHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str(string.concat(string.concat("unknown system '", id), "'")));
+            return Http.okObj(e);
+        }
+        let body = Http.bodyJson(ctx);
+        let controlId = systemhelp.sysStr(body, "control_id");
+        let framework = systemhelp.sysStr(body, "framework");
+        if (controlId.length == 0 || framework.length == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str("framework and control_id are required"));
+            return Http.okObj(e);
+        }
+        let eid = string.concat("ev-", random.randomHex(6));
+        let now = Http.nowMs();
+        await self.repo.addEvidence(eid, id, framework, controlId, systemhelp.sysStr(body, "title"), systemhelp.sysStr(body, "source"), systemhelp.sysStr(body, "owner"), systemhelp.sysNum(body, "produced_ms"), systemhelp.sysNum(body, "valid_until_ms"), systemhelp.sysStr(body, "artefact_ref"), systemhelp.sysStr(body, "note"), tenant, now);
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "evidence-added", "system", string.concat(string.concat(framework, ":"), controlId), tenant, now);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true)); m.set("id", json.str(eid));
+        return Http.okObj(m);
+    }
+}

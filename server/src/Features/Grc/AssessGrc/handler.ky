@@ -1,0 +1,56 @@
+// POST /grc/assess {kind,subject,title?,status?,body?,linked_refs?} ->
+//   {"ok":true,"id":"grc-<hex>","kind"}. Mirrors acp grc_create: sign the doc with
+//   the control-plane key and store it.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+
+pub fn grcErr(msg: string): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return Http.okObj(m);
+}
+
+pub fn grcOkId(id: string, kind: string): response.Response {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("ok", json.bool(true));
+    m.set("id", json.str(id));
+    m.set("kind", json.str(kind));
+    return Http.okObj(m);
+}
+
+pub struct AssessGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: AssessGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let kind = string.trim(grcsign.grcStr(body, "kind"));
+        if (!grcsign.grcKindAllowed(kind)) { return grcErr(string.concat(string.concat("unknown kind '", kind), "'")); }
+        let subject = string.trim(grcsign.grcStr(body, "subject"));
+        if (subject.length == 0) { return grcErr("subject is required"); }
+        let title = grcsign.grcStr(body, "title");
+        let status = grcsign.grcStr(body, "status");
+        if (status.length == 0) { status = "open"; }
+        let docBody = grcsign.grcBodyString(body);
+        let linkedRefs = grcsign.grcLinkedRefs(body);
+        let id = string.concat("grc-", random.randomHex(6));
+        let now = Http.nowMs();
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let doc = grcsign.grcDoc(id, kind, subject, title, status, docBody);
+        let sig = grcsign.grcSignHex(self.app.trust.keypair.privHex, doc);
+        await self.repo.add(id, kind, subject, title, status, docBody, "console", now, self.app.trust.keypair.pubHex, sig, linkedRefs, "{}", "", 0, status, tenant);
+        return grcOkId(id, kind);
+    }
+}

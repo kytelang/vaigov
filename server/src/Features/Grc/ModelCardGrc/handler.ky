@@ -1,0 +1,46 @@
+// POST /grc/model-card {subject,title?,model_id?,use_case_id?,risk_id?,card?} ->
+//   {"ok":true,"id"}. A signed model-card GRC record (kind=model-card).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+import Features.Grc.AssessGrc.handler;
+
+pub struct ModelCardGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelCardGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let subject = string.trim(grcsign.grcStr(body, "subject"));
+        if (subject.length == 0) { return grcErr("subject is required"); }
+        let title = grcsign.grcStr(body, "title");
+        if (title.length == 0) { title = "Model card"; }
+        let db = Map<string, json.JsonValue>(8, string.hash);
+        db.set("kind", json.str("model-card"));
+        db.set("model_id", json.str(grcsign.grcStr(body, "model_id")));
+        db.set("use_case_id", json.str(grcsign.grcStr(body, "use_case_id")));
+        db.set("risk_id", json.str(grcsign.grcStr(body, "risk_id")));
+        if (body.kind == 5 && json.has(body, "card")) { db.set("card", json.get(body, "card")); }
+        let docBody = json.stringify(json.object(db));
+        let id = string.concat("grc-", random.randomHex(6));
+        let now = Http.nowMs();
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let doc = grcsign.grcDoc(id, "model-card", subject, title, "open", docBody);
+        let sig = grcsign.grcSignHex(self.app.trust.keypair.privHex, doc);
+        await self.repo.add(id, "model-card", subject, title, "open", docBody, "console", now, self.app.trust.keypair.pubHex, sig, "[]", "{}", "", 0, "open", tenant);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

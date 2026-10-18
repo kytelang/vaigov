@@ -1,0 +1,40 @@
+// POST /approvals/register -> {"ok":true,"id","created"}. A PEP registers a
+// step-up hold raised in the field. Idempotent. acp gates this on the shared
+// report token (PEP identity); open here until the auth wave.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Approvals.Shared.ApprovalStore;
+
+pub struct RegisterApprovalHandler impl RouteHandler {
+    store: ApprovalStore,
+    app: AppContext,
+    init(store: ApprovalStore, app: AppContext) { self.store = store; self.app = app; }
+
+    async fn serve(self: RegisterApprovalHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let id = json.asString(json.get(body, "id")) ?? "";
+        if (id.length == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false));
+            e.set("error", json.str("id is required"));
+            return Http.okObj(e);
+        }
+        let session = json.asString(json.get(body, "session")) ?? "";
+        let principal = json.asString(json.get(body, "principal")) ?? "";
+        let tool = json.asString(json.get(body, "tool")) ?? "";
+        let argHash = json.asString(json.get(body, "arg_hash")) ?? "";
+        let presented = if (json.has(body, "presented")) (json.stringify(json.get(body, "presented"))) else ("{}");
+        let ttl = json.asNumber(json.get(body, "ttl_ms")) ?? 900000;
+        let created = await self.store.request(id, session, principal, tool, argHash, presented, ttl);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("created", json.bool(created));
+        return Http.okObj(m);
+    }
+}

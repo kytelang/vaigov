@@ -1,0 +1,11 @@
+control_plane: "http://127.0.0.1:8080"
+tenant: "eu-demo"
+listen: "127.0.0.1:8899"
+poll_secs: 5
+flush_secs: 30
+content_firewall: true
+cp_pubkey: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+vstore_path: "/Users/kamlesh/kytelang/varman/.e2e/violations"
+vcursor_path: "/Users/kamlesh/kytelang/varman/.e2e/violations.cur"
+cf_rules_cache: "/Users/kamlesh/kytelang/varman/.e2e/cfrules.json"
+prompt_redact: false

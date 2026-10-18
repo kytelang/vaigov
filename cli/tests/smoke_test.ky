@@ -1,0 +1,13 @@
+import assert;
+import types;
+import sign;
+
+@test
+fn core_dependency_resolves(): void {
+    // varman-core types reachable from a component project.
+    assert.equalInt(types.rank(Verdict.Deny), 3);
+    assert.equalStr(Verdict.StepUp.toSnake(), "step_up");
+    // and the signing seam.
+    let kp = sign.keypairFromSeedHex("9d61b19deffebc3f0dca8b11ad8f0d17a6b5a2b5a7a8b9c0d1e2f30415263748");
+    assert.equalInt(string.len(kp.pubHex), 64);
+}

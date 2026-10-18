@@ -1,0 +1,52 @@
+// Assurance routes: the acp-server assurance.rs surface (violation feed, red-team
+// attestations, content-firewall threat packs, and the agent-safety primitives -
+// memory write-gate, retrieval filter, delegation verify, credential stamp, incident
+// promote) as acp-compatible JSON over the shared `acp` db.
+//
+// Routes in assurance.rs that are OWNED BY OTHER FEATURES and therefore NOT
+// registered here, to avoid double-registration:
+//   - GET  /alerts, /oversight, POST /oversight/*   -> Monitoring feature
+//   - GET  /inbox                                    -> Approvals feature
+//   - GET  /audit/pack, /meta-audit                  -> Health/Admin features
+//   - GET  /trust, POST /verify                      -> Admin feature
+import web.app;
+import Shared.AppContext;
+import Features.Assurance.Shared.AssuranceRepository;
+import Features.Assurance.EventsRecent.handler;
+import Features.Assurance.RecordEvent.handler;
+import Features.Assurance.Timeline.handler;
+import Features.Assurance.RedteamRun.handler;
+import Features.Assurance.RedteamRuns.handler;
+import Features.Assurance.RedteamTarget.handler;
+import Features.Assurance.ThreatPackAvailable.handler;
+import Features.Assurance.ThreatPackLoad.handler;
+import Features.Assurance.MemoryWrite.handler;
+import Features.Assurance.RetrievalCheck.handler;
+import Features.Assurance.DelegationVerify.handler;
+import Features.Assurance.CredentialStamp.handler;
+import Features.Assurance.IncidentPromote.handler;
+
+pub fn registerAssurance(ctx: AppContext): void {
+    let repo = AssuranceRepository(ctx.db);
+
+    // Violation / decision feed.
+    ctx.app.get("/events/recent", EventsRecentHandler(repo, ctx));
+    ctx.app.post("/event/{kind}", RecordEventHandler(repo, ctx));
+    ctx.app.get("/timeline", TimelineHandler(ctx));
+
+    // Red-team attestations over the content firewall.
+    ctx.app.post("/redteam/run", RedteamRunHandler(repo, ctx));
+    ctx.app.get("/redteam/runs", RedteamRunsHandler(repo, ctx));
+    ctx.app.post("/redteam/target", RedteamTargetHandler(ctx));
+
+    // Content-firewall threat packs (signed by the control-plane key).
+    ctx.app.get("/firewall/threat-pack/available", ThreatPackAvailableHandler(ctx));
+    ctx.app.post("/firewall/threat-pack", ThreatPackLoadHandler(repo, ctx));
+
+    // Agent-safety primitives.
+    ctx.app.post("/memory/write", MemoryWriteHandler(ctx));
+    ctx.app.post("/retrieval/check", RetrievalCheckHandler(ctx));
+    ctx.app.post("/delegation/verify", DelegationVerifyHandler(ctx));
+    ctx.app.post("/credential/stamp", CredentialStampHandler(ctx));
+    ctx.app.post("/incident/promote", IncidentPromoteHandler(repo, ctx));
+}

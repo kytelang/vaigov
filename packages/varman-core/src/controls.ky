@@ -1,0 +1,560 @@
+//! Control catalogue (compliance layer).
+//!
+//! A port of Rust `acp-core`'s `controls.rs`. In Rust the catalogue is versioned
+//! YAML data, one file per framework-version, embedded at build time and parsed.
+//! Here we embed a REPRESENTATIVE but real subset as data: the loader (`library`)
+//! calls one builder per framework, and each builder pushes real controls with
+//! their real normative references ("Art. 14", "GOVERN 1.1", "A.9.2", "CC6.1").
+//! The shape is deliberately data-driven: adding a framework is adding a builder
+//! and one call in `library`, and adding a control is one `makeControl` line.
+//!
+//! The embedded subset is: eu-ai-act@2024, nist-ai-rmf@1.0, iso-42001@2023 and
+//! soc-2@2017. See the `// TODO: full catalogue` marker in `library` for where
+//! the remaining frameworks and the full per-framework control sets attach.
+//!
+//! Each `Control` carries the exhaustive-conformance fields from the Rust source
+//! (hierarchy path, normative reference, obligation type, bound roles,
+//! applicability predicate, evidence type, assessment method, crosswalk and
+//! citation). Control ids are the one source of truth the assessment and
+//! conformance engines draw from.
+
+import string;
+import list;
+
+/// One control (a single normative obligation) in a framework. A reference type:
+/// it owns three growable lists (`path`, `roles`, `crosswalk`), so it is modelled
+/// as a class to carry those containers without per-copy ownership concerns.
+pub class Control {
+    pub framework: string,
+    pub id: string,
+    pub title: string,
+    pub description: string,
+    pub requiredEvidence: string,
+    /// Hierarchy path, for example ["Chapter III", "Section 2", "Article 14"].
+    pub path: List<string>,
+    /// Normative reference, for example "Art. 14", "A.8.2", "CC6.1", "GOVERN 1.1".
+    pub reference: string,
+    /// govern | document | technical | process | transparency | oversight |
+    /// record-keeping | prohibition.
+    pub obligationType: string,
+    /// The roles this obligation binds. Empty means it binds any role.
+    pub roles: List<string>,
+    /// Applicability predicate over a subject profile, for example
+    /// "risk_tier in [high]", "role=deployer", "asset_type=gpai". Default "always".
+    pub applicability: string,
+    /// attestation | artefact | test | ledger.
+    pub assessmentMethod: string,
+    /// Equivalent controls in other frameworks, as "framework:id".
+    pub crosswalk: List<string>,
+    /// Citation to the official source (regulation article, standard clause).
+    pub citation: string,
+
+    init(framework: string, id: string, title: string, description: string, requiredEvidence: string, path: List<string>, reference: string, obligationType: string, roles: List<string>, applicability: string, assessmentMethod: string, crosswalk: List<string>, citation: string) {
+        self.framework = framework;
+        self.id = id;
+        self.title = title;
+        self.description = description;
+        self.requiredEvidence = requiredEvidence;
+        self.path = path;
+        self.reference = reference;
+        self.obligationType = obligationType;
+        self.roles = roles;
+        self.applicability = applicability;
+        self.assessmentMethod = assessmentMethod;
+        self.crosswalk = crosswalk;
+        self.citation = citation;
+    }
+}
+
+/// Framework-level metadata (one per catalogue file in the Rust source).
+pub struct Framework {
+    pub slug: string,
+    pub label: string,
+    pub version: string,
+    /// statutory_conformity | principles_based | standard | sectoral.
+    pub frameworkType: string,
+    pub effectiveDate: string,
+    /// The record-keeping (or equivalent) reference used in the signed envelope.
+    pub recordKeepingReference: string,
+    pub source: string,
+
+    init(slug: string, label: string, version: string, frameworkType: string, effectiveDate: string, recordKeepingReference: string, source: string) {
+        self.slug = slug;
+        self.label = label;
+        self.version = version;
+        self.frameworkType = frameworkType;
+        self.effectiveDate = effectiveDate;
+        self.recordKeepingReference = recordKeepingReference;
+        self.source = source;
+    }
+}
+
+/// A resolved crosswalk edge: a (framework, id) that maps to a (framework, id)
+/// in another framework. Produced by `crosswalkEdges`.
+pub struct CrosswalkEdge {
+    pub fromFramework: string,
+    pub fromId: string,
+    pub toFramework: string,
+    pub toId: string,
+
+    init(fromFramework: string, fromId: string, toFramework: string, toId: string) {
+        self.fromFramework = fromFramework;
+        self.fromId = fromId;
+        self.toFramework = toFramework;
+        self.toId = toId;
+    }
+}
+
+/// Split a comma-separated field ("a, b, c") into a trimmed, non-empty list. An
+/// empty or whitespace-only input yields the empty list (binds any / no edges).
+fn splitCsv(s: string): List<string> {
+    let out = List<string>();
+    let t = string.trim(s);
+    if (string.len(t) == 0) { return out; }
+    let parts = string.split(t, ",");
+    let i = 0;
+    while (i < parts.size()) {
+        let p = string.trim(parts.at(i));
+        if (string.len(p) > 0) { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Build a `Control` from the common scalar fields, taking `roles` and
+/// `crosswalk` as comma-separated strings. This is the data-driven unit the
+/// framework builders (and tests) use; the less-common fields default to empty.
+pub fn makeControl(framework: string, id: string, title: string, reference: string, obligationType: string, applicability: string, rolesCsv: string, crosswalkCsv: string): Control {
+    return Control(framework, id, title, "", "", List<string>(), reference, obligationType, splitCsv(rolesCsv), applicability, "", splitCsv(crosswalkCsv), "");
+}
+
+// --- embedded framework builders -------------------------------------------
+
+// EU AI Act (Regulation (EU) 2024/1689): statutory conformity. Art. 5
+// prohibitions always apply; the Chapter III high-risk duties gate on the high
+// tier; Art. 27 (FRIA) binds deployers, not a pure provider.
+fn addEuAiAct(out: List<Control>): void {
+    out.push(makeControl("eu-ai-act", "art-5-a", "Prohibited AI practices", "Art. 5", "prohibition", "always", "provider,deployer", ""));
+    out.push(makeControl("eu-ai-act", "art-9", "Risk management system", "Art. 9", "process", "risk_tier in [high]", "provider", ""));
+    out.push(makeControl("eu-ai-act", "art-10", "Data and data governance", "Art. 10", "process", "risk_tier in [high]", "provider", "iso-42001:A.7.2"));
+    out.push(makeControl("eu-ai-act", "art-11", "Technical documentation", "Art. 11", "document", "risk_tier in [high]", "provider", ""));
+    out.push(makeControl("eu-ai-act", "art-12", "Record-keeping", "Art. 12", "record-keeping", "risk_tier in [high]", "provider", "soc-2:CC7.2"));
+    out.push(makeControl("eu-ai-act", "art-13", "Transparency and provision of information", "Art. 13", "transparency", "risk_tier in [high, limited]", "provider", ""));
+    out.push(makeControl("eu-ai-act", "art-14", "Human oversight", "Art. 14", "oversight", "risk_tier in [high]", "provider", "nist-ai-rmf:MANAGE 2.2"));
+    out.push(makeControl("eu-ai-act", "art-15", "Accuracy, robustness and cybersecurity", "Art. 15", "technical", "risk_tier in [high]", "provider", ""));
+    out.push(makeControl("eu-ai-act", "art-27", "Fundamental rights impact assessment", "Art. 27", "process", "risk_tier in [high]", "deployer", "iso-42001:A.5.2"));
+    out.push(makeControl("eu-ai-act", "annex-iv-1", "Technical documentation content", "Annex IV", "document", "risk_tier in [high]", "provider", ""));
+}
+
+// NIST AI RMF 1.0 (NIST AI 100-1): principles based, GOVERN/MAP/MEASURE/MANAGE.
+fn addNistAiRmf(out: List<Control>): void {
+    out.push(makeControl("nist-ai-rmf", "govern-1.1", "Legal and regulatory requirements understood and managed", "GOVERN 1.1", "govern", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "govern-2.1", "Roles, responsibilities and lines of communication", "GOVERN 2.1", "govern", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "map-1.1", "Context is established and understood", "MAP 1.1", "process", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "map-2.3", "Scientific integrity and TEVV considerations", "MAP 2.3", "process", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "measure-2.1", "Test sets and metrics are documented", "MEASURE 2.1", "technical", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "measure-2.7", "AI security and resilience are evaluated", "MEASURE 2.7", "technical", "always", "", "eu-ai-act:art-15"));
+    out.push(makeControl("nist-ai-rmf", "manage-1.1", "Risks are prioritised and responded to", "MANAGE 1.1", "process", "always", "", ""));
+    out.push(makeControl("nist-ai-rmf", "manage-2.2", "Mechanisms for human oversight are in place", "MANAGE 2.2", "oversight", "always", "", ""));
+}
+
+// ISO/IEC 42001:2023: AI management system, Annex A controls.
+fn addIso42001(out: List<Control>): void {
+    out.push(makeControl("iso-42001", "A.2.2", "AI policy", "A.2.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-42001", "A.4.2", "Documentation of AI system resources", "A.4.2", "document", "always", "", ""));
+    out.push(makeControl("iso-42001", "A.5.2", "AI system impact assessment process", "A.5.2", "process", "always", "", "eu-ai-act:art-27"));
+    out.push(makeControl("iso-42001", "A.6.2", "AI system life cycle management", "A.6.2", "process", "always", "", ""));
+    out.push(makeControl("iso-42001", "A.7.2", "Data for AI systems", "A.7.2", "process", "always", "", ""));
+    out.push(makeControl("iso-42001", "A.9.2", "Information for interested parties", "A.9.2", "transparency", "always", "", ""));
+    out.push(makeControl("iso-42001", "A.10.2", "Allocating responsibilities with suppliers", "A.10.2", "process", "always", "", ""));
+}
+
+// SOC 2 (AICPA Trust Services Criteria 2017): the common criteria.
+fn addSoc2(out: List<Control>): void {
+    out.push(makeControl("soc-2", "CC1.1", "Integrity and ethical values", "CC1.1", "govern", "always", "", ""));
+    out.push(makeControl("soc-2", "CC6.1", "Logical access security controls", "CC6.1", "technical", "always", "", ""));
+    out.push(makeControl("soc-2", "CC6.6", "Protection against external threats", "CC6.6", "technical", "always", "", ""));
+    out.push(makeControl("soc-2", "CC7.2", "System monitoring for anomalies", "CC7.2", "process", "always", "", ""));
+    out.push(makeControl("soc-2", "CC8.1", "Change management", "CC8.1", "process", "always", "", ""));
+    out.push(makeControl("soc-2", "A1.2", "Availability: recovery and backup", "A1.2", "process", "always", "", ""));
+}
+
+fn addGdpr(out: List<Control>): void {
+    out.push(makeControl("gdpr", "art-5-1-a", "Lawfulness, fairness and transparency", "Art. 5(1)(a)", "govern", "always", "controller", "eu-ai-act:art-10,dpdp-2023:s4"));
+    out.push(makeControl("gdpr", "art-5-1-b", "Purpose limitation", "Art. 5(1)(b)", "govern", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-5-1-c", "Data minimisation", "Art. 5(1)(c)", "technical", "always", "controller", "dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-5-1-d", "Accuracy", "Art. 5(1)(d)", "process", "always", "controller", "dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-5-1-e", "Storage limitation", "Art. 5(1)(e)", "process", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-5-1-f", "Integrity and confidentiality", "Art. 5(1)(f)", "technical", "always", "controller,processor", "iso-27001:A.5.1,dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-5-2", "Accountability", "Art. 5(2)", "govern", "always", "controller", "eu-ai-act:art-17,iso-42001:8.1"));
+    out.push(makeControl("gdpr", "art-6", "Lawfulness of processing", "Art. 6", "govern", "always", "controller", "dpdp-2023:s4"));
+    out.push(makeControl("gdpr", "art-9", "Processing of special categories of personal data", "Art. 9", "govern", "always", "controller", "eu-ai-act:art-10"));
+    out.push(makeControl("gdpr", "art-12", "Transparent information, communication and modalities", "Art. 12", "transparency", "always", "controller", "dpdp-2023:s5"));
+    out.push(makeControl("gdpr", "art-13", "Information where data is collected from the subject", "Art. 13", "transparency", "always", "controller", "dpdp-2023:s5"));
+    out.push(makeControl("gdpr", "art-14", "Information where data is not obtained from the subject", "Art. 14", "transparency", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-15", "Right of access by the data subject", "Art. 15", "process", "always", "controller", "dpdp-2023:s11"));
+    out.push(makeControl("gdpr", "art-16", "Right to rectification", "Art. 16", "process", "always", "controller", "dpdp-2023:s12"));
+    out.push(makeControl("gdpr", "art-17", "Right to erasure (right to be forgotten)", "Art. 17", "process", "always", "controller", "dpdp-2023:s12"));
+    out.push(makeControl("gdpr", "art-18", "Right to restriction of processing", "Art. 18", "process", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-20", "Right to data portability", "Art. 20", "technical", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-21", "Right to object", "Art. 21", "process", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-22", "Automated individual decision-making, including profiling", "Art. 22", "oversight", "always", "controller", "eu-ai-act:art-14,dpdp-2023:s11"));
+    out.push(makeControl("gdpr", "art-24", "Responsibility of the controller", "Art. 24", "govern", "always", "controller", "dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-25", "Data protection by design and by default", "Art. 25", "technical", "always", "controller", "eu-ai-act:art-9,iso-42001:6.1"));
+    out.push(makeControl("gdpr", "art-28", "Processor obligations and processing agreements", "Art. 28", "govern", "always", "controller,processor", "dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-30", "Records of processing activities", "Art. 30", "record-keeping", "always", "controller,processor", "eu-ai-act:art-12"));
+    out.push(makeControl("gdpr", "art-32", "Security of processing", "Art. 32", "technical", "always", "controller,processor", "iso-27001:A.8.7,eu-ai-act:art-15,dpdp-2023:s8"));
+    out.push(makeControl("gdpr", "art-33", "Notification of a personal data breach to the supervisory authority", "Art. 33", "process", "always", "controller,processor", "eu-ai-act:art-73"));
+    out.push(makeControl("gdpr", "art-34", "Communication of a personal data breach to the data subject", "Art. 34", "process", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-35", "Data protection impact assessment", "Art. 35", "process", "always", "controller", "eu-ai-act:art-27,dpdp-2023:s10"));
+    out.push(makeControl("gdpr", "art-36", "Prior consultation", "Art. 36", "process", "always", "controller", ""));
+    out.push(makeControl("gdpr", "art-44", "General principle for transfers", "Art. 44", "govern", "always", "controller,processor", "dpdp-2023:s16"));
+}
+
+fn addIso23894(out: List<Control>): void {
+    out.push(makeControl("iso-23894", "clause-5.1", "Value creation and protection", "5.1", "govern", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-5.2", "Integration into organisational activities", "5.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-5.3", "Structured, comprehensive and customised approach", "5.3", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-5.4", "Inclusive and best-available-information based", "5.4", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-5.5", "Attention to human and cultural factors", "5.5", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-5.6", "Dynamic and continually improving", "5.6", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.1.1", "Leadership and commitment", "6.1.1", "govern", "always", "", "iso-42001:5.1"));
+    out.push(makeControl("iso-23894", "clause-6.1.2", "Integration of the framework", "6.1.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.1.3", "Design of the framework", "6.1.3", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.1.4", "Implementation of the framework", "6.1.4", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.1.5", "Evaluation of the framework", "6.1.5", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.1.6", "Improvement of the framework", "6.1.6", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.2", "Communication and consultation", "6.2", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.3", "Scope, context and criteria", "6.3", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.4", "Risk assessment", "6.4", "process", "always", "", "eu-ai-act:Art. 9"));
+    out.push(makeControl("iso-23894", "clause-6.4.2", "Risk identification", "6.4.2", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.4.3", "Risk analysis", "6.4.3", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.4.4", "Risk evaluation", "6.4.4", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.5", "Risk treatment", "6.5", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "clause-6.6", "Monitoring and review", "6.6", "process", "always", "", "eu-ai-act:Art. 72"));
+    out.push(makeControl("iso-23894", "clause-6.7", "Recording and reporting", "6.7", "record-keeping", "always", "", "eu-ai-act:Art. 12"));
+    out.push(makeControl("iso-23894", "annex-a", "Annex A: AI risk sources and considerations", "Annex A", "process", "always", "", ""));
+    out.push(makeControl("iso-23894", "annex-b", "Annex B: risk management across the AI lifecycle", "Annex B", "process", "always", "", ""));
+}
+
+fn addIso27001(out: List<Control>): void {
+    out.push(makeControl("iso-27001", "clause-4.1", "Understanding the organisation and its context", "4.1", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-4.2", "Understanding the needs and expectations of interested parties", "4.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-4.3", "Determining the scope of the information security management system", "4.3", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-4.4", "Information security management system", "4.4", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-5.1", "Leadership and commitment", "5.1", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-5.2", "Policy", "5.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-5.3", "Organisational roles, responsibilities and authorities", "5.3", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-6.1", "Actions to address risks and opportunities", "6.1", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-6.2", "Information security objectives and planning to achieve them", "6.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-6.3", "Planning of changes", "6.3", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-7.1", "Resources", "7.1", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-7.2", "Competence", "7.2", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-7.3", "Awareness", "7.3", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-7.4", "Communication", "7.4", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-7.5", "Documented information", "7.5", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-8.1", "Operational planning and control", "8.1", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-8.2", "Information security risk assessment", "8.2", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-8.3", "Information security risk treatment", "8.3", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-9.1", "Monitoring, measurement, analysis and evaluation", "9.1", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-9.2", "Internal audit", "9.2", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-9.3", "Management review", "9.3", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-10.1", "Continual improvement", "10.1", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "clause-10.2", "Nonconformity and corrective action", "10.2", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.1", "Policies for information security", "A.5.1", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.2", "Information security roles and responsibilities", "A.5.2", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.3", "Segregation of duties", "A.5.3", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.4", "Management responsibilities", "A.5.4", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.5", "Contact with authorities", "A.5.5", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.6", "Contact with special interest groups", "A.5.6", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.7", "Threat intelligence", "A.5.7", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.8", "Information security in project management", "A.5.8", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.9", "Inventory of information and other associated assets", "A.5.9", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.10", "Acceptable use of information and other associated assets", "A.5.10", "govern", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.11", "Return of assets", "A.5.11", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.12", "Classification of information", "A.5.12", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.13", "Labelling of information", "A.5.13", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.14", "Information transfer", "A.5.14", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.15", "Access control", "A.5.15", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.16", "Identity management", "A.5.16", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.17", "Authentication information", "A.5.17", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.18", "Access rights", "A.5.18", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.19", "Information security in supplier relationships", "A.5.19", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.20", "Addressing information security within supplier agreements", "A.5.20", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.21", "Managing information security in the ICT supply chain", "A.5.21", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.22", "Monitoring, review and change management of supplier services", "A.5.22", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.23", "Information security for use of cloud services", "A.5.23", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.24", "Information security incident management planning and preparation", "A.5.24", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.25", "Assessment and decision on information security events", "A.5.25", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.26", "Response to information security incidents", "A.5.26", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.27", "Learning from information security incidents", "A.5.27", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.28", "Collection of evidence", "A.5.28", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.29", "Information security during disruption", "A.5.29", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.30", "ICT readiness for business continuity", "A.5.30", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.31", "Legal, statutory, regulatory and contractual requirements", "A.5.31", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.32", "Intellectual property rights", "A.5.32", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.33", "Protection of records", "A.5.33", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.34", "Privacy and protection of personal identifiable information (PII)", "A.5.34", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.35", "Independent review of information security", "A.5.35", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.36", "Compliance with policies, rules and standards for information security", "A.5.36", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.5.37", "Documented operating procedures", "A.5.37", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.1", "Screening", "A.6.1", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.2", "Terms and conditions of employment", "A.6.2", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.3", "Information security awareness, education and training", "A.6.3", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.4", "Disciplinary process", "A.6.4", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.5", "Responsibilities after termination or change of employment", "A.6.5", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.6", "Confidentiality or non-disclosure agreements", "A.6.6", "document", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.7", "Remote working", "A.6.7", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.6.8", "Information security event reporting", "A.6.8", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.1", "Physical security perimeters", "A.7.1", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.2", "Physical entry", "A.7.2", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.3", "Securing offices, rooms and facilities", "A.7.3", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.4", "Physical security monitoring", "A.7.4", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.5", "Protecting against physical and environmental threats", "A.7.5", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.6", "Working in secure areas", "A.7.6", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.7", "Clear desk and clear screen", "A.7.7", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.8", "Equipment siting and protection", "A.7.8", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.9", "Security of assets off-premises", "A.7.9", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.10", "Storage media", "A.7.10", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.11", "Supporting utilities", "A.7.11", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.12", "Cabling security", "A.7.12", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.13", "Equipment maintenance", "A.7.13", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.7.14", "Secure disposal or re-use of equipment", "A.7.14", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.1", "User endpoint devices", "A.8.1", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.2", "Privileged access rights", "A.8.2", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.3", "Information access restriction", "A.8.3", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.4", "Access to source code", "A.8.4", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.5", "Secure authentication", "A.8.5", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.6", "Capacity management", "A.8.6", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.7", "Protection against malware", "A.8.7", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.8", "Management of technical vulnerabilities", "A.8.8", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.9", "Configuration management", "A.8.9", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.10", "Information deletion", "A.8.10", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.11", "Data masking", "A.8.11", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.12", "Data leakage prevention", "A.8.12", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.13", "Information backup", "A.8.13", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.14", "Redundancy of information processing facilities", "A.8.14", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.15", "Logging", "A.8.15", "record-keeping", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.16", "Monitoring activities", "A.8.16", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.17", "Clock synchronisation", "A.8.17", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.18", "Use of privileged utility programs", "A.8.18", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.19", "Installation of software on operational systems", "A.8.19", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.20", "Networks security", "A.8.20", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.21", "Security of network services", "A.8.21", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.22", "Segregation of networks", "A.8.22", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.23", "Web filtering", "A.8.23", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.24", "Use of cryptography", "A.8.24", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.25", "Secure development life cycle", "A.8.25", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.26", "Application security requirements", "A.8.26", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.27", "Secure system architecture and engineering principles", "A.8.27", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.28", "Secure coding", "A.8.28", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.29", "Security testing in development and acceptance", "A.8.29", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.30", "Outsourced development", "A.8.30", "oversight", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.31", "Separation of development, test and production environments", "A.8.31", "technical", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.32", "Change management", "A.8.32", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.33", "Test information", "A.8.33", "process", "always", "", ""));
+    out.push(makeControl("iso-27001", "annex-a.8.34", "Protection of information systems during audit testing", "A.8.34", "process", "always", "", ""));
+}
+
+fn addCanadaAida(out: List<Control>): void {
+    out.push(makeControl("canada-aida", "s7", "Anonymised data governance", "s7", "document", "role=provider", "provider", "gdpr:art-5"));
+    out.push(makeControl("canada-aida", "s8", "Assessment of high-impact status", "s8", "govern", "role=provider", "provider", "eu-ai-act:Art. 6"));
+    out.push(makeControl("canada-aida", "s9", "Risk mitigation measures", "s9", "process", "role=provider", "provider", "eu-ai-act:Art. 9"));
+    out.push(makeControl("canada-aida", "s9-monitoring", "Monitoring of mitigation measures", "s9(monitoring)", "process", "role=provider", "provider", "eu-ai-act:Art. 72"));
+    out.push(makeControl("canada-aida", "s10", "Record-keeping obligations", "s10", "record-keeping", "role=provider", "provider", "eu-ai-act:Art. 12"));
+    out.push(makeControl("canada-aida", "s11", "Plain-language public description", "s11", "transparency", "role=provider", "provider", "eu-ai-act:Art. 13"));
+    out.push(makeControl("canada-aida", "s12", "Notification of material harm", "s12", "process", "role=provider", "provider", "eu-ai-act:Art. 73"));
+}
+
+fn addColoradoAiAct(out: List<Control>): void {
+    out.push(makeControl("colorado-ai-act", "def-1701-1", "High-risk AI system definition", "6-1-1701(9)", "govern", "always", "", "eu-ai-act:Art. 6"));
+    out.push(makeControl("colorado-ai-act", "def-1701-2", "Consequential decision scope", "6-1-1701(3)", "govern", "always", "", ""));
+    out.push(makeControl("colorado-ai-act", "def-1701-3", "Algorithmic discrimination scope", "6-1-1701(1)", "govern", "always", "", ""));
+    out.push(makeControl("colorado-ai-act", "dev-1702-1", "Reasonable care to avoid algorithmic discrimination", "6-1-1702(1)", "govern", "role=developer", "developer", "eu-ai-act:Art. 9"));
+    out.push(makeControl("colorado-ai-act", "dev-1702-2", "Documentation and disclosures to deployers", "6-1-1702(2)", "document", "role=developer", "developer", "eu-ai-act:Art. 13"));
+    out.push(makeControl("colorado-ai-act", "dev-1702-3", "Public statement on high-risk systems", "6-1-1702(4)", "transparency", "role=developer", "developer", ""));
+    out.push(makeControl("colorado-ai-act", "dev-1702-4", "Disclosure of known discrimination to the Attorney General", "6-1-1702(5)", "process", "role=developer", "developer", "eu-ai-act:Art. 73"));
+    out.push(makeControl("colorado-ai-act", "dep-1703-1", "Risk management policy and programme", "6-1-1703(2)", "process", "role=deployer", "deployer", "nist-ai-rmf:GOVERN-1.1"));
+    out.push(makeControl("colorado-ai-act", "dep-1703-2", "Impact assessment of the high-risk system", "6-1-1703(3)", "document", "role=deployer", "deployer", "eu-ai-act:Art. 27"));
+    out.push(makeControl("colorado-ai-act", "dep-1703-3", "Consumer notice before a consequential decision", "6-1-1703(4)", "transparency", "role=deployer", "deployer", "eu-ai-act:Art. 50(1)"));
+    out.push(makeControl("colorado-ai-act", "dep-1703-4", "Right to correct data and to appeal", "6-1-1703(4)(b)", "process", "role=deployer", "deployer", "eu-ai-act:Art. 14"));
+    out.push(makeControl("colorado-ai-act", "dep-1703-5", "Public statement on deployed high-risk systems", "6-1-1703(5)", "transparency", "role=deployer", "deployer", ""));
+    out.push(makeControl("colorado-ai-act", "dep-1703-6", "Disclosure of discrimination to the Attorney General", "6-1-1703(7)", "process", "role=deployer", "deployer", "eu-ai-act:Art. 73"));
+}
+
+fn addDpdp2023(out: List<Control>): void {
+    out.push(makeControl("dpdp-2023", "s4", "Grounds for processing personal data", "s4", "govern", "always", "controller", "gdpr:art-6,eu-ai-act:art-10"));
+    out.push(makeControl("dpdp-2023", "s5", "Notice to the data principal", "s5", "transparency", "always", "controller", "gdpr:art-13"));
+    out.push(makeControl("dpdp-2023", "s6", "Consent", "s6", "process", "always", "controller", "gdpr:art-6"));
+    out.push(makeControl("dpdp-2023", "s7", "Certain legitimate uses", "s7", "govern", "always", "controller", "gdpr:art-6"));
+    out.push(makeControl("dpdp-2023", "s8", "General obligations of the data fiduciary", "s8", "govern", "always", "controller", "gdpr:art-24,gdpr:art-5-2"));
+    out.push(makeControl("dpdp-2023", "s8-3", "Completeness, accuracy and consistency of data", "s8(3)", "technical", "always", "controller", "gdpr:art-5-1-d"));
+    out.push(makeControl("dpdp-2023", "s8-4", "Reasonable security safeguards", "s8(4)", "technical", "always", "controller,processor", "gdpr:art-32,iso-27001:A.8.7"));
+    out.push(makeControl("dpdp-2023", "s8-5", "Personal data breach intimation", "s8(5)", "process", "always", "controller", "gdpr:art-33,gdpr:art-34"));
+    out.push(makeControl("dpdp-2023", "s8-7", "Erasure on withdrawal or end of purpose", "s8(7)", "process", "always", "controller", "gdpr:art-5-1-e,gdpr:art-17"));
+    out.push(makeControl("dpdp-2023", "s8-10", "Grievance redressal and contact", "s8(10)", "process", "always", "controller", "gdpr:art-12"));
+    out.push(makeControl("dpdp-2023", "s9", "Processing personal data of children and persons with disability", "s9", "process", "always", "controller", "gdpr:art-9"));
+    out.push(makeControl("dpdp-2023", "s10", "Additional obligations of a significant data fiduciary", "s10", "govern", "always", "controller", "gdpr:art-35,eu-ai-act:art-27"));
+    out.push(makeControl("dpdp-2023", "s11", "Right to access information about personal data", "s11", "process", "always", "controller", "gdpr:art-15,gdpr:art-22"));
+    out.push(makeControl("dpdp-2023", "s12", "Right to correction, completion, updating and erasure", "s12", "process", "always", "controller", "gdpr:art-16,gdpr:art-17"));
+    out.push(makeControl("dpdp-2023", "s13", "Right of grievance redressal", "s13", "process", "always", "controller", "gdpr:art-12"));
+    out.push(makeControl("dpdp-2023", "s14", "Right to nominate", "s14", "process", "always", "controller", ""));
+    out.push(makeControl("dpdp-2023", "s16", "Processing of personal data outside India", "s16", "govern", "always", "controller,processor", "gdpr:art-44"));
+}
+
+fn addNycLl144(out: List<Control>): void {
+    out.push(makeControl("nyc-ll144", "bias-audit", "Annual independent bias audit", "bias-audit", "process", "role=deployer", "deployer", "eu-ai-act:Art. 10"));
+    out.push(makeControl("nyc-ll144", "bias-audit-independence", "Auditor independence", "bias-audit-independence", "govern", "role=deployer", "deployer", ""));
+    out.push(makeControl("nyc-ll144", "publication-summary", "Publication of bias audit summary results", "publication-summary", "transparency", "role=deployer", "deployer", ""));
+    out.push(makeControl("nyc-ll144", "publication-retention", "Availability of published results", "publication-retention", "record-keeping", "role=deployer", "deployer", ""));
+    out.push(makeControl("nyc-ll144", "notice-candidate", "Ten business-day candidate notice", "notice-candidate", "transparency", "role=deployer", "deployer", "eu-ai-act:Art. 50(1)"));
+    out.push(makeControl("nyc-ll144", "notice-qualifications", "Notice of job qualifications and characteristics", "notice-qualifications", "transparency", "role=deployer", "deployer", ""));
+    out.push(makeControl("nyc-ll144", "notice-datatype", "Notice of data collected and data source", "notice-datatype", "transparency", "role=deployer", "deployer", ""));
+    out.push(makeControl("nyc-ll144", "notice-alternative", "Alternative process and accommodation notice", "notice-alternative", "process", "role=deployer", "deployer", "eu-ai-act:Art. 14"));
+}
+
+fn addUkAi(out: List<Control>): void {
+    out.push(makeControl("uk-ai", "p1-1", "Continuous safety risk assessment", "P1.1", "process", "always", "", "eu-ai-act:Art. 9"));
+    out.push(makeControl("uk-ai", "p1-2", "Technical robustness and reliability", "P1.2", "technical", "always", "", "eu-ai-act:Art. 15"));
+    out.push(makeControl("uk-ai", "p1-3", "Security against adversarial manipulation", "P1.3", "technical", "always", "", "iso-27001:A.8.7"));
+    out.push(makeControl("uk-ai", "p1-4", "Ongoing monitoring in operation", "P1.4", "process", "always", "", ""));
+    out.push(makeControl("uk-ai", "p2-1", "Disclosure of AI use", "P2.1", "transparency", "always", "", "eu-ai-act:Art. 50(1)"));
+    out.push(makeControl("uk-ai", "p2-2", "Explainability of outputs", "P2.2", "transparency", "always", "", "eu-ai-act:Art. 13"));
+    out.push(makeControl("uk-ai", "p2-3", "Information about capabilities and limitations", "P2.3", "document", "always", "", ""));
+    out.push(makeControl("uk-ai", "p2-4", "Traceability of data and design decisions", "P2.4", "record-keeping", "always", "", ""));
+    out.push(makeControl("uk-ai", "p3-1", "Compliance with relevant law and rights", "P3.1", "govern", "always", "", "gdpr:art-5"));
+    out.push(makeControl("uk-ai", "p3-2", "Bias detection and mitigation", "P3.2", "technical", "always", "", "eu-ai-act:Art. 10"));
+    out.push(makeControl("uk-ai", "p3-3", "Fairness metrics appropriate to context", "P3.3", "document", "always", "", ""));
+    out.push(makeControl("uk-ai", "p3-4", "Consistent and justifiable outcomes", "P3.4", "process", "always", "", ""));
+    out.push(makeControl("uk-ai", "p4-1", "Clear allocation of responsibility", "P4.1", "govern", "always", "", "iso-42001:5.3"));
+    out.push(makeControl("uk-ai", "p4-2", "Governance processes across the lifecycle", "P4.2", "govern", "always", "", "iso-42001:8.1"));
+    out.push(makeControl("uk-ai", "p4-3", "Risk management and internal controls", "P4.3", "process", "always", "", "iso-23894:6.4"));
+    out.push(makeControl("uk-ai", "p4-4", "Record-keeping and auditability", "P4.4", "record-keeping", "always", "", "eu-ai-act:Art. 12"));
+    out.push(makeControl("uk-ai", "p5-1", "Route to contest a decision", "P5.1", "process", "always", "", ""));
+    out.push(makeControl("uk-ai", "p5-2", "Human review of contested outcomes", "P5.2", "oversight", "always", "", "eu-ai-act:Art. 14"));
+    out.push(makeControl("uk-ai", "p5-3", "Timely and effective redress", "P5.3", "process", "always", "", ""));
+    out.push(makeControl("uk-ai", "p5-4", "Communication of contest and redress rights", "P5.4", "transparency", "always", "", ""));
+}
+
+// --- accessors --------------------------------------------------------------
+
+/// The full built-in control library across every embedded framework. The Rust
+/// source parses this from embedded YAML and caches it; here it is rebuilt from
+/// the framework builders on each call (cheap for this bounded subset).
+pub fn library(): List<Control> {
+    let out = List<Control>();
+    addEuAiAct(out);
+    addNistAiRmf(out);
+    addIso42001(out);
+    addSoc2(out);
+    // The remaining frameworks, ported faithfully from the acp catalogue YAML so
+    // the full 12-act catalogue is present (every node a paraphrase + citation).
+    addGdpr(out);
+    addIso23894(out);
+    addIso27001(out);
+    addCanadaAida(out);
+    addColoradoAiAct(out);
+    addDpdp2023(out);
+    addNycLl144(out);
+    addUkAi(out);
+    return out;
+}
+
+/// Controls for one framework.
+pub fn forFramework(framework: string): List<Control> {
+    let out = List<Control>();
+    let all = library();
+    let i = 0;
+    while (i < all.size()) {
+        let c = all.at(i);
+        if (string.eql(c.framework, framework)) { out.push(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Look up a control by (framework, id). Returns undefined when absent.
+pub fn get(framework: string, id: string): Control | undefined {
+    let all = library();
+    let i = 0;
+    while (i < all.size()) {
+        let c = all.at(i);
+        if (string.eql(c.framework, framework) && string.eql(c.id, id)) { return c; }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+/// All framework metadata (label, version, type, record-keeping reference).
+pub fn frameworks(): List<Framework> {
+    let out = List<Framework>();
+    out.push(Framework("eu-ai-act", "EU AI Act", "2024", "statutory_conformity", "2024-08-01", "Art. 12", "Regulation (EU) 2024/1689"));
+    out.push(Framework("nist-ai-rmf", "NIST AI Risk Management Framework", "1.0", "principles_based", "2023-01-26", "MANAGE 1.1", "NIST AI 100-1"));
+    out.push(Framework("iso-42001", "ISO/IEC 42001", "2023", "standard", "2023-12-18", "A.4.2", "ISO/IEC 42001:2023"));
+    out.push(Framework("soc-2", "SOC 2", "2017", "standard", "2017-05-01", "CC7.2", "AICPA TSC 2017"));
+    out.push(Framework("gdpr", "GDPR", "2016", "statutory_conformity", "2018-05-25", "Art. 30 (records of processing)", "Regulation (EU) 2016/679"));
+    out.push(Framework("iso-23894", "ISO/IEC 23894", "2023", "standard", "2023-02-01", "Clause 6 (risk management process)", "ISO/IEC 23894:2023"));
+    out.push(Framework("iso-27001", "ISO/IEC 27001", "2022", "standard", "2022-10-25", "A.8.15 (logging)", "ISO/IEC 27001:2022"));
+    out.push(Framework("canada-aida", "Canada AIDA", "2022", "statutory_conformity", "", "Record-keeping obligations", "Artificial Intelligence and Data Act (Bill C-27, as introduced 2022)"));
+    out.push(Framework("colorado-ai-act", "Colorado AI Act (SB 24-205)", "2024", "statutory_conformity", "2026-06-30", "6-1-1703 (risk management policy and programme)", "Colorado SB 24-205"));
+    out.push(Framework("dpdp-2023", "India DPDP Act 2023", "2023", "statutory_conformity", "2023-08-11", "s8 (data fiduciary obligations)", "Digital Personal Data Protection Act, 2023 (India)"));
+    out.push(Framework("nyc-ll144", "NYC Local Law 144", "2023", "sectoral", "2023-07-05", "Bias audit publication", "NYC Local Law 144 of 2021; DCWP final rules"));
+    out.push(Framework("uk-ai", "UK AI principles", "2023", "principles_based", "2023-03-29", "Accountability and governance", "UK pro-innovation AI regulation white paper (2023)"));
+    return out;
+}
+
+/// Metadata for one framework slug, or undefined when absent.
+pub fn framework(slug: string): Framework | undefined {
+    let fws = frameworks();
+    let i = 0;
+    while (i < fws.size()) {
+        let f = fws.at(i);
+        if (string.eql(f.slug, slug)) { return f; }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+// Resolve a crosswalk target token within a framework: match a control whose id
+// OR reference equals the token (the catalogue uses both forms). Returns the
+// resolved control id, or undefined when nothing matches.
+fn resolveTarget(targetFramework: string, token: string): string | undefined {
+    let cs = forFramework(targetFramework);
+    let i = 0;
+    while (i < cs.size()) {
+        let c = cs.at(i);
+        if (string.eql(c.id, token) || string.eql(c.reference, token)) { return c.id; }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+/// Resolved crosswalk edges across the whole catalogue. For each control that
+/// declares crosswalk targets ("framework:token"), the resolved (from) -> (to)
+/// pair as (framework, control id). The token may be a control id or a reference;
+/// it is resolved against the target framework's controls. Unresolvable targets
+/// are dropped (mirrors the Rust `filter_map`).
+pub fn crosswalkEdges(): List<CrosswalkEdge> {
+    let out = List<CrosswalkEdge>();
+    let all = library();
+    let i = 0;
+    while (i < all.size()) {
+        let c = all.at(i);
+        let j = 0;
+        while (j < c.crosswalk.size()) {
+            let x = c.crosswalk.at(j);
+            let colon = string.indexOf(x, ":");
+            if (colon > 0) {
+                let fw = string.trim(string.slice(x, 0, colon));
+                let token = string.trim(string.slice(x, colon + 1, string.len(x)));
+                let targetId = resolveTarget(fw, token);
+                if (targetId != undefined) {
+                    out.push(CrosswalkEdge(c.framework, c.id, fw, targetId ?? ""));
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}

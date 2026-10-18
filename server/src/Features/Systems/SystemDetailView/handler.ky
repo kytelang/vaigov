@@ -1,0 +1,31 @@
+// GET /systems/detail/{id}/view -> the AI system detail hypermedia fragment
+// (acp/console SystemDetail.vue): aggregates the system, its roles, Statement of
+// Applicability, evidence, governance records and change history into the six-card
+// detail panel. Rendered into #systems so it swaps in place of the registry.
+import ds_response;
+import list;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.views.systemdetail;
+import Domain.Dtos.SystemDtos;
+
+pub struct SystemDetailViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: SystemRepository,
+    init(app: AppContext) { self.app = app; self.repo = SystemRepository(app.db); }
+
+    async fn serve(self: SystemDetailViewHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        let sys = srows.items.getOr(0, SystemRow{ id:"", name:"(not found)", purpose:"", owner:"", lifecycle_state:"", risk_tier:"", sector:"", asset_type:"", jurisdictions:"", tenant:"", created_ms:0, updated_ms:0 });
+        let roles = (await self.repo.listRoles(id, tenant)).items;
+        let soa = (await self.repo.listAllSoa(id, tenant)).items;
+        let ev = (await self.repo.listEvidence(id, tenant)).items;
+        let recs = (await self.repo.grcForSubject(sys.name, tenant)).items;
+        let audit = (await self.repo.listAudit(id, tenant)).items;
+        return await ds_response.patch(systemdetail.systemDetailPanel(sys, roles, soa, ev, recs, audit));
+    }
+}

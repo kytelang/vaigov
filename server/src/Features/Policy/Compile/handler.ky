@@ -1,0 +1,35 @@
+// POST /policy/compile -> compile the tenant's enabled policy_rules to Rego;
+// returns {ok, revision, rule_count, rego}. EditPolicy.
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Features.Policy.Shared.policyrules;
+import Features.Opa.Shared.bundle;
+import Features.Rules.Shared.RuleRepository;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct CompileHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CompileHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let regoSrc = rego.compileRules(rules, self.app.trustCfg.defaultVerdict);
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("revision", json.str(bundle.revision(regoSrc)));
+        m.set("rule_count", json.number(rules.size() as long));
+        m.set("rego", json.str(regoSrc));
+        return Http.okObj(m);
+    }
+}

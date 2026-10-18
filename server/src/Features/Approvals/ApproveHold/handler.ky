@@ -1,0 +1,23 @@
+// POST /approvals/{id}/approve -> 303 redirect to /inbox (acp form flow).
+import web.routing;
+import web.response;
+import list;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Approvals.Shared.ApprovalStore;
+
+pub struct ApproveHoldHandler impl RouteHandler {
+    store: ApprovalStore,
+    app: AppContext,
+    init(store: ApprovalStore, app: AppContext) { self.store = store; self.app = app; }
+
+    async fn serve(self: ApproveHoldHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.Approve)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let p = Http.principalOf(self.app, ctx);
+        let actor = if (p == undefined) ("web") else ((p ?? Auth.AuthPrincipal("", "", "", list.List<string>())).username);
+        await self.store.resolve(id, true, actor);
+        return Http.redirectTo("/inbox");
+    }
+}

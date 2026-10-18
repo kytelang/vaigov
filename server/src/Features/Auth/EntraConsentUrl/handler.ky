@@ -1,0 +1,20 @@
+// GET /auth/entra/consent-url -> the admin-consent URL (not configured in dev).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct EntraConsentUrlHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraConsentUrlHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("url", json.str(""));
+        m.set("configured", json.bool(false));
+        return Http.okObj(m);
+    }
+}

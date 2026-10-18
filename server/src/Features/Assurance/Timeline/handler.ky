@@ -1,0 +1,22 @@
+// GET /timeline -> {"count":n,"timeline":[{seq,hlc}]}. acp reads the HLC verifiable
+// ledger; the Kyte MemStore does not expose the HLC timeline yet, so this returns
+// an empty timeline (FLAG: ledger-timeline export is an acp-core wave).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct TimelineHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: TimelineHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("count", json.number(0));
+        m.set("timeline", json.array(list.List<json.JsonValue>()));
+        return Http.okObj(m);
+    }
+}

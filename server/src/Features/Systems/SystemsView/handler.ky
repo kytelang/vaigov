@@ -1,0 +1,23 @@
+// GET /systems/view -> the AI systems hypermedia view (Datastar fragment),
+// matching acp/console SystemsView.vue. Reads the governed systems for the tenant
+// from the shared SystemRepository and renders them as a table.
+import ds_response;
+import list;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.views.systems;
+import Domain.Dtos.SystemDtos;
+
+pub struct SystemsViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: SystemRepository,
+    init(app: AppContext) { self.app = app; self.repo = SystemRepository(app.db); }
+
+    async fn serve(self: SystemsViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rs = await self.repo.listSystems(tenant);
+        return await ds_response.patch(systems.systemsPanel(rs.items));
+    }
+}

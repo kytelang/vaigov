@@ -1,0 +1,86 @@
+// AgentRepository: the `agents` table in the shared `acp` Postgres db. SQL mirrors
+// acp-server store.rs exactly (tenant_id column, active INTEGER, token_sha256).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.AgentListRow;
+import Domain.Dtos.PrincipalListRow;
+
+pub struct AgentRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: AgentRepository, tenant: string): Rows<AgentListRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<AgentListRow>(conn, "agents").query(
+            "SELECT id, app_id, name, owner, metadata_json, active, tenant_id AS tenant, created_ms FROM agents WHERE tenant_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn appExists(self: AgentRepository, appId: string, tenant: string): bool {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(appId)); p.push(db.dbText(tenant));
+        let r = await Repository<ProbeRow>(conn, "apps").query("SELECT 1 AS one FROM apps WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+        return r.items.size() > 0;
+    }
+
+    pub async fn add(self: AgentRepository, id: string, appId: string, name: string, tokenSha: string, owner: string, metadataJson: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(appId)); p.push(db.dbText(name)); p.push(db.dbText(tokenSha));
+        p.push(db.dbText(owner)); p.push(db.dbText(metadataJson)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO agents (id, app_id, name, token_sha256, active, owner, metadata_json, tenant_id, created_ms) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn update(self: AgentRepository, id: string, name: string, owner: string, metadataJson: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(owner)); p.push(db.dbText(metadataJson)); p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE agents SET name = $1, owner = $2, metadata_json = $3 WHERE id = $4 AND tenant_id = $5", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: AgentRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM agents WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn deactivate(self: AgentRepository, id: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id));
+        let _r = await conn.exec("UPDATE agents SET active = 0 WHERE id = $1", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn resolveByTokenSha(self: AgentRepository, tokenSha: string): Rows<AgentAuthRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tokenSha));
+        let r = await Repository<AgentAuthRow>(conn, "agents").query(
+            "SELECT id, name, app_id, tenant_id AS tenant FROM agents WHERE token_sha256 = $1 AND active <> 0", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn verifyIdentity(self: AgentRepository, id: string, tokenSha: string): Rows<AgentVerifyRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tokenSha));
+        let r = await Repository<AgentVerifyRow>(conn, "agents").query(
+            "SELECT a.name AS an, a.app_id AS aid, ap.name AS apn FROM agents a LEFT JOIN apps ap ON a.app_id = ap.id WHERE a.id = $1 AND a.token_sha256 = $2 AND a.active <> 0", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+}

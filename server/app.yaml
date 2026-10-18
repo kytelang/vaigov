@@ -1,0 +1,59 @@
+# app.yaml -- this app's manifest and configuration, in one file.
+#
+# The framework reads the `config:` section into `app.config` at startup (never environment
+# variables, which collide when several apps share a machine). A local run reads this file from the
+# project root; a deployed replica is pointed at its own copy by the orchestrator via `--config`.
+config:
+  # The listen port. `--port N` on the command line overrides this (the orchestrator sets it per
+  # replica, so co-located replicas never clash).
+  port: 8080
+
+  # The Postgres control-plane store (bound by Shared/AppConfig DbConfig).
+  # Shared with acp-server: the Rust server run with
+  #   --store postgres://kamlesh@127.0.0.1:5432/acp
+  # owns the canonical 43-table schema (docs/acp-schema.sql). Kyte reads/writes
+  # the SAME database, with the SAME schema and JSON contracts.
+  db:
+    dsn: "postgres://kamlesh@127.0.0.1:5432/acp"
+    poolSize: 8
+
+  # TLS 1.3 termination (self-hosted stack, bound by Shared/AppConfig WebTlsConfig).
+  # Entra requires an https redirect URI, so the control plane is served over https.
+  # The dev cert is a self-signed localhost cert (certs/dev-cert.pem); for a real
+  # deployment point these at a CA-issued cert + key (the key is gitignored).
+  tls:
+    enabled: true
+    certPath: "certs/dev-cert.pem"
+    keyPath: "certs/dev-key.pem"
+
+  # Microsoft Entra app registration for interactive sign-in (bound by
+  # Shared/AppConfig EntraConfig). The primary contact and DPO of the org sign in
+  # here. For a single-workspace deploy, `tenantId` is the app's home tenant; for
+  # multi-org SaaS make the app multitenant in Azure and set tenantId: organizations.
+  # SECRET: leave `clientSecret` EMPTY here and never commit it. The server reads
+  # it from the ENTRA_CLIENT_SECRET environment variable (see server/.entra.env,
+  # gitignored) or from the delivered manifest when deployed via the orchestrator.
+  entra:
+    tenantId: "aa8e24e5-47a1-4361-adf9-37fb6c83e438"
+    clientId: "525717ed-ff24-43d6-b1ad-27157b063a41"
+    clientSecret: ""
+    redirectUri: "https://127.0.0.1:8080/auth/callback"
+
+  # Add your own typed sections here and read each with `app.config.bind<T>("name")` from an
+  # @serializable struct. For example, a database section:
+  # db:
+  #   dsn: "novadb://127.0.0.1:3009?db=app"
+  #   poolSize: 16
+
+# The sections below are read by the ORCHESTRATOR when you deploy this app (it ignores `config:`
+# above, just as the app ignores these). They are commented out so a local `kyte build && run`
+# needs nothing. Uncomment and fill in when you deploy -- see the "Deploying with the orchestrator"
+# guide chapter.
+# metadata: { name: my-app }
+# workload: { binary: ./bin/my-app, args: [], restartPolicy: always }
+# replicas: { min: 1, max: 3 }
+#
+# Pre-rollout database migration gate. When present, the orchestrator runs this binary once in
+# `--migrate` mode (see src/migrations.ky + main.ky) and only rolls out new replicas if it exits 0,
+# so the schema is ready before any new code serves traffic. timeoutMs bounds the one-shot.
+# migrate: { args: ["--migrate"], timeoutMs: 120000 }

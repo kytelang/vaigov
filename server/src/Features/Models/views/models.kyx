@@ -1,0 +1,99 @@
+// Models view as KYX (full parity with acp/console ModelsView.vue): the model
+// registry with New model / edit / delete and a modal form. The card_json is
+// parsed in the handler into a ModelCard (modality + description); the view stays
+// JSON-free. Datastar forms post to /console/models/*.
+import list;
+import string;
+
+pub class ModelCard {
+    pub id: string,
+    pub name: string,
+    pub provider: string,
+    pub version: string,
+    pub modality: string,
+    pub description: string,
+    init(id: string, name: string, provider: string, version: string, modality: string, description: string) {
+        self.id = id; self.name = name; self.provider = provider; self.version = version;
+        self.modality = modality; self.description = description;
+    }
+}
+
+fn jsq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "'", "\\'"); }
+fn dash(s: string): string { if (s.length == 0) { return "-"; } return s; }
+
+fn modelRow(m: ModelCard): Html {
+    let openEdit = "$mdlId='" + jsq(m.id) + "'; $mdlName='" + jsq(m.name) + "'; $mdlProvider='" + jsq(m.provider)
+        + "'; $mdlVersion='" + jsq(m.version) + "'; $mdlModality='" + jsq(m.modality) + "'; $mdlDesc='" + jsq(m.description)
+        + "'; $mdlErr=''; $mdlModal='open'";
+    let delExpr = "$mdlId='" + jsq(m.id) + "'; @post('/console/models/delete')";
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{m.id}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{dash(m.name)}</td>
+        <td class="py-2 pr-4 text-dim text-sm">{dash(m.provider)}</td>
+        <td class="py-2 pr-4 text-sm">{dash(m.version)}</td>
+        <td class="py-2 pr-4 text-right whitespace-nowrap">
+            <button class="text-xs text-dim hover:text-txt mr-3" data-on:click={openEdit}>Edit</button>
+            <button class="text-xs text-bad hover:underline" data-on:click={delExpr}>Delete</button>
+        </td>
+    </tr>;
+}
+
+fn mField(labelText: string, bind: string, placeholder: string): Html {
+    return <label class="text-xs text-dim">{labelText}
+        <input type="text" data-bind={bind} class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder={placeholder} />
+    </label>;
+}
+
+pub fn modelsPanel(rows: list.List<ModelCard>): Html {
+    return <div id="models" class="grid gap-4">
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{`${rows.size()} models`}</span>
+            <span class="text-dim text-sm">The AI models in use, with their cards and vendor.</span>
+            <div class="ml-auto">
+                <button class="rounded-lg bg-accent text-white px-3.5 py-1.5 text-sm font-medium hover:opacity-90"
+                    data-on:click="$mdlId=''; $mdlName=''; $mdlProvider=''; $mdlVersion=''; $mdlModality='text'; $mdlDesc=''; $mdlErr=''; $mdlModal='open'">New model</button>
+            </div>
+        </div>
+        <div data-show="$mdlErr != ''" class="text-bad text-sm" data-text="$mdlErr"></div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                        <th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Name</th><th class="py-2 pr-4">Provider</th><th class="py-2 pr-4">Version</th><th class="py-2 pr-4"></th>
+                    </tr></thead>
+                    <tbody>
+                        {for (i in 0..rows.size()) { modelRow(rows.at(i)); }}
+                        {if (rows.size() == 0) {
+                            <tr><td colspan="5" class="py-10 text-center text-dim">No models registered.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div data-show="$mdlModal === 'open'" class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-panel border border-line rounded-2xl p-6 w-full max-w-lg">
+                <h3 class="font-semibold text-txt" data-text="$mdlId == '' ? 'New model' : 'Edit model'">New model</h3>
+                <div class="grid sm:grid-cols-2 gap-3 mt-4">
+                    {mField("Name", "mdlName", "e.g. gpt-4o")}
+                    {mField("Provider", "mdlProvider", "e.g. OpenAI")}
+                    {mField("Version", "mdlVersion", "e.g. 2024-08")}
+                    <label class="text-xs text-dim">Modality
+                        <select data-bind="mdlModality" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="text">text</option><option value="vision">vision</option><option value="multimodal">multimodal</option><option value="embedding">embedding</option><option value="audio">audio</option>
+                        </select>
+                    </label>
+                    <label class="text-xs text-dim sm:col-span-2">Description
+                        <input type="text" data-bind="mdlDesc" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="notes / model card summary" />
+                    </label>
+                    <div class="col-span-full flex justify-end gap-2 pt-1">
+                        <button class="rounded-lg border border-line2 px-4 py-2 text-sm hover:bg-panel2" data-on:click="$mdlModal=''">Cancel</button>
+                        <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90"
+                            data-on:click="@post('/console/models/save')" data-text="$mdlId == '' ? 'Register' : 'Save'">Register</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>;
+}

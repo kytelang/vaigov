@@ -1,0 +1,85 @@
+//! varman-cli: evidence commands `verify`, `verify-pack`, `export`. A port of
+//! the offline, file-first parts of Rust `acp-cli`'s `commands/evidence.rs`.
+//!
+//! What verifies offline with a public key alone is a detached-signature pack
+//! `{ body, pubkey_hex, sig_hex }`: an Ed25519 signature over the canonical
+//! bytes of `body` (the shape behind the signed audit and compliance packs).
+//! `verify-pack` checks exactly that via `sign.verifyDetachedPack`.
+//!
+//! Deviation from the Rust CLI: the Rust `verify` / `export` read a SQLite
+//! ledger file and a Merkle evidence pack. The Kyte ledger is in-memory and the
+//! file persistence seam is a LATER slice (see `ledger.ky`'s header), so there is
+//! no on-disk ledger to open here. `export` therefore signs a supplied JSON body
+//! into a detached pack (a coherent offline, regulator-ready artefact that reuses
+//! the same signing seam), and `verify` dispatches to the detached-pack check.
+
+import string;
+import list;
+import map;
+import serde.json;
+import io.file;
+import sign;
+import canonical;
+
+/// Build a detached-signature pack over `body`: sign its canonical bytes with the
+/// 64-hex seed and wrap it as `{ body, pubkey_hex, sig_hex }`.
+pub fn makeDetachedPack(body: json.JsonValue, seedHex: string): json.JsonValue {
+    let kp = sign.keypairFromSeedHex(seedHex);
+    let msg = canonical.canonicalBytesOfJson(body);
+    let sig = sign.signHex(kp.privHex, msg as ptr, msg.length);
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("body", body);
+    m.set("pubkey_hex", json.str(kp.pubHex));
+    m.set("sig_hex", json.str(sig));
+    return json.object(m);
+}
+
+/// Verify a pack value. A detached pack (`sig_hex` present) is checked with the
+/// embedded public key alone. Returns true on success.
+pub fn verifyPackValue(pack: json.JsonValue): bool {
+    if (json.has(pack, "sig_hex")) {
+        return sign.verifyDetachedPack(pack);
+    }
+    return false;
+}
+
+fn loadPack(path: string): json.JsonValue | undefined {
+    if (!File.exists(path)) { return undefined; }
+    return json.tryParse(File.readText(path));
+}
+
+/// CLI: `verify-pack <pack.json>`. 0 if it verifies, 1 otherwise.
+pub fn cmdVerifyPack(path: string): int {
+    let pack = loadPack(path);
+    if (pack == undefined) { console.log(`varman: cannot read or parse pack ${path}`); return 1; }
+    if (!json.has(pack, "sig_hex")) {
+        console.log("varman: unsupported pack shape (expected a detached pack with sig_hex; Merkle/ledger export verification is a later slice)");
+        return 1;
+    }
+    if (verifyPackValue(pack)) {
+        console.log("OK: signed pack verifies (detached Ed25519 over the canonical body)");
+        return 0;
+    }
+    console.log("FAIL: signature does not verify");
+    return 1;
+}
+
+/// CLI: `verify <pack.json>`. Offline this dispatches to the detached-pack check
+/// (file-backed ledger verification is a later slice).
+pub fn cmdVerify(path: string): int {
+    return cmdVerifyPack(path);
+}
+
+/// CLI: `export <body.json> <keyfile>`. Signs the JSON body into a detached pack
+/// and prints it. The keyfile holds a 64-hex seed.
+pub fn cmdExport(bodyPath: string, keyfile: string): int {
+    if (!File.exists(bodyPath)) { console.log(`varman: cannot read ${bodyPath}`); return 1; }
+    if (!File.exists(keyfile)) { console.log(`varman: cannot read keyfile ${keyfile}`); return 1; }
+    let body = json.tryParse(File.readText(bodyPath));
+    if (body == undefined) { console.log(`varman: ${bodyPath} is not valid JSON`); return 1; }
+    let seedHex = string.trim(File.readText(keyfile));
+    if (seedHex.length != 64) { console.log("varman: keyfile must hold a 32-byte seed as 64 hex chars"); return 2; }
+    let pack = makeDetachedPack(body, seedHex);
+    console.log(json.stringify(pack));
+    return 0;
+}

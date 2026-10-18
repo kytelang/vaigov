@@ -1,0 +1,14 @@
+// Vendors registry routes (acp-compatible JSON over the shared `acp` db).
+import web.app;
+import Shared.AppContext;
+import Features.Vendors.Shared.VendorRepository;
+import Features.Vendors.ListVendors.handler;
+import Features.Vendors.CreateVendor.handler;
+import Features.Vendors.ReviewVendor.handler;
+
+pub fn registerVendors(ctx: AppContext): void {
+    let repo = VendorRepository(ctx.db);
+    ctx.app.get("/vendors", ListVendorsHandler(repo, ctx));
+    ctx.app.post("/vendors", CreateVendorHandler(repo, ctx));
+    ctx.app.post("/vendors/{id}/review", ReviewVendorHandler(repo, ctx));
+}

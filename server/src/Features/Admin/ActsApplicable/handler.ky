@@ -1,0 +1,52 @@
+// GET /acts/applicable?country=XX -> {"country","region","acts":[{slug,label,framework_type,applicability,reason}]}.
+// Maps the act_countries applicability rows to framework metadata from the
+// varman-core controls catalogue.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import controls;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+
+pub struct ActsApplicableHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ActsApplicableHandler, ctx: routing.Context): response.Response {
+        let country = ctx.query("country");
+        let region = await self.repo.countryRegion(country);
+        let pairs = await self.repo.actsForCountry(country);
+        let fws = controls.frameworks();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < pairs.items.size()) {
+            let pr = pairs.items.getOr(i, ActApplRow{ act_slug: "", applicability: "" });
+            let label = pr.act_slug;
+            let ftype = "";
+            let j = 0;
+            while (j < fws.size()) {
+                let f = fws.at(j);
+                if (string.eql(f.slug, pr.act_slug)) { label = f.label; ftype = f.frameworkType; }
+                j = j + 1;
+            }
+            let om = Map<string, json.JsonValue>(8, string.hash);
+            om.set("slug", json.str(pr.act_slug));
+            om.set("label", json.str(label));
+            om.set("framework_type", json.str(ftype));
+            om.set("applicability", json.str(pr.applicability));
+            om.set("reason", json.str(string.concat(string.concat("applies in ", region), " by jurisdiction mapping")));
+            arr.push(json.object(om));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("country", json.str(country));
+        m.set("region", json.str(region));
+        m.set("acts", json.array(arr));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,29 @@
+// Evidence feature: central fleet-evidence ingest/list + versioned artifacts +
+// audit pack. acp-compatible JSON over the shared `acp` db. Only registration here.
+import web.app;
+import Shared.AppContext;
+import Features.Evidence.Shared.EvidenceRepository;
+import Features.Evidence.IngestEvidence.handler;
+import Features.Evidence.IngestedEvidence.handler;
+import Features.Evidence.RecentEvidence.handler;
+import Features.Evidence.ListArtifacts.handler;
+import Features.Evidence.ArtifactVersions.handler;
+import Features.Evidence.ArtifactActivate.handler;
+import Features.Evidence.ArtifactBaseline.handler;
+import Features.Evidence.AuditPack.handler;
+import Features.Evidence.PolicyVersionsView.handler;
+
+pub fn registerEvidence(ctx: AppContext): void {
+    let repo = EvidenceRepository(ctx.db);
+    ctx.app.get("/policy-versions/view", PolicyVersionsViewHandler(ctx));
+    ctx.app.post("/console/policy-versions/activate", PvActivateHandler(ctx));
+    ctx.app.post("/console/policy-versions/baseline", PvBaselineHandler(ctx));
+    ctx.app.post("/evidence/ingest", IngestEvidenceHandler(repo, ctx));
+    ctx.app.get("/evidence/ingested", IngestedEvidenceHandler(repo, ctx));
+    ctx.app.get("/evidence/recent", RecentEvidenceHandler(ctx));
+    ctx.app.get("/artifacts", ListArtifactsHandler(repo, ctx));
+    ctx.app.get("/artifacts/{id}/versions", ArtifactVersionsHandler(repo, ctx));
+    ctx.app.post("/artifacts/{id}/activate", ArtifactActivateHandler(repo, ctx));
+    ctx.app.post("/artifacts/{id}/baseline", ArtifactBaselineHandler(repo, ctx));
+    ctx.app.get("/audit/pack", AuditPackHandler(repo, ctx));
+}

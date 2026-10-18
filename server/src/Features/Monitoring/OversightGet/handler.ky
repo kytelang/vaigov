@@ -1,0 +1,33 @@
+// GET /oversight -> {"config":cfg,"approvers":[],"flagged":0}. The per-approver
+// oversight-quality profile (EU AI Act Art. 14).
+// NOTE: approver analysis (acp_core::oversight over the resolved approvals store)
+// is not ported; `approvers` is empty and `flagged` 0. The config round-trips.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Monitoring.Shared.MonitorRepository;
+import Features.Monitoring.Shared.monitorjson;
+
+pub struct OversightGetHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: OversightGetHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.Export)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let stateJson = await self.repo.getState(string.concat("oversight:config:", tenant));
+        let cfg = monitorjson.oversightConfigOf(stateJson);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("config", cfg);
+        m.set("approvers", json.array(list.List<json.JsonValue>()));
+        m.set("flagged", json.number(0));
+        return Http.okObj(m);
+    }
+}

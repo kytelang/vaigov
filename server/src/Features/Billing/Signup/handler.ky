@@ -1,0 +1,84 @@
+// POST /signup -> self-serve SaaS onboarding: create the tenant, set the chosen
+// plan, and drop the new user into the console. Datastar form on the public
+// signup page; the response patches a status line and flips the app route to the
+// console. A paid plan would then be sent to Stripe checkout (stripe package).
+import list;
+import string;
+import serde.json;
+import crypto.random;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Admin.Shared.AdminRepository;
+import Features.Billing.Shared.BillingRepository;
+import Features.Billing.Shared.plans;
+
+fn suSig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+
+pub struct SignupHandler impl RouteHandler {
+    app: AppContext,
+    admin: AdminRepository,
+    billing: BillingRepository,
+    init(app: AppContext) { self.app = app; self.admin = AdminRepository(app.db); self.billing = BillingRepository(app.db); }
+
+    async fn serve(self: SignupHandler, ctx: routing.Context): Response {
+        let body = Http.bodyJson(ctx);
+        let org = suSig(body, "suOrg");
+        if (org.length == 0) {
+            return await ConsoleDs.patchAndSignals(<div id="su-status" class="text-bad text-sm mt-2">Organisation name is required.</div>, "{}");
+        }
+        let line1 = suSig(body, "suLine1");
+        let line2 = suSig(body, "suLine2");
+        let city = suSig(body, "suCity");
+        let postcode = suSig(body, "suPostcode");
+        let country = suSig(body, "suCountry");
+        let jurisdiction = suSig(body, "suJurisdiction");
+        let contactName = suSig(body, "suName");
+        let email = suSig(body, "suEmail");
+        let phone = suSig(body, "suPhone");
+        // registration_number / industry / company_size / website / dpo_email have
+        // no dedicated columns; fold them into profile_json (same shape the org
+        // profile editor uses).
+        let pm = Map<string, json.JsonValue>(5, string.hash);
+        pm.set("registration_number", json.str(suSig(body, "suReg")));
+        pm.set("industry", json.str(suSig(body, "suIndustry")));
+        pm.set("company_size", json.str(suSig(body, "suSize")));
+        pm.set("website", json.str(suSig(body, "suWebsite")));
+        pm.set("dpo_email", json.str(suSig(body, "suDpo")));
+        let profileJson = json.stringify(json.object(pm));
+        // Selected regulations: the signup form holds them as a `suActs` signal
+        // object keyed by a signal-safe slug ('-' -> '_'); collect the ticked ones
+        // and map the keys back to real act slugs.
+        let actsArr = list.List<json.JsonValue>();
+        if (json.has(body, "suActs")) {
+            let ao = json.get(body, "suActs");
+            if (ao.kind == 5) {
+                let om = json.asObject(ao) ?? Map<string, json.JsonValue>(1, string.hash);
+                let keys = om.keys();
+                let ki = 0;
+                while (ki < keys.size()) {
+                    let k = keys.at(ki);
+                    let vv = om.get(k) ?? json.null();
+                    if (vv.kind == 1 && vv.bval) { actsArr.push(json.str(string.replace(k, "_", "-"))); }
+                    ki = ki + 1;
+                }
+            }
+        }
+        let actsJson = json.stringify(json.array(actsArr));
+        let plan = plans.bySlug(suSig(body, "suPlan"));
+        let now = Http.nowMs();
+        // Single-workspace model (multi-tenancy is dropped for the local build):
+        // signup configures THE tenant the console reads (trustCfg.tenant), as an
+        // upsert, so the Organisation screen and every other console view see the
+        // details entered here immediately.
+        let id = self.app.trustCfg.tenant;
+        await self.admin.registerTenantFull(id, org, jurisdiction, actsJson, line1, line2, city, postcode, country, profileJson, contactName, email, phone, now);
+        await self.billing.setPlan(id, plan.slug, "active", "", "", 0 as long, now);
+        // Enter the console on the new tenant. (A paid plan would first go to Stripe
+        // checkout; that redirect is wired by the stripe client package.)
+        let sig = "{\"route\":\"console\",\"view\":\"overview\",\"suErr\":\"\",\"suOrg\":\"\",\"suEmail\":\"\"}";
+        return await ConsoleDs.patchAndSignals(<div id="su-status" class="text-ok text-sm mt-2">Account created.</div>, sig);
+    }
+}

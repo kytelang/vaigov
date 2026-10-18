@@ -1,0 +1,39 @@
+// GET /auth/session -> the current principal, or 401 when unauthenticated.
+// Mirrors acp bff::auth_session; login_available is false in dev-auth mode.
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Auth.Shared.authhelp;
+
+pub struct SessionHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: SessionHandler, ctx: routing.Context): response.Response {
+        let p = Http.principalOf(self.app, ctx);
+        if (p == undefined) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("authenticated", json.bool(false));
+            e.set("login_available", json.bool(authhelp.entraConfigured(self.app.entra)));
+            return Http.jsonStatus(Status.Unauthorized, json.stringify(json.object(e)));
+        }
+        let pr = p ?? Auth.AuthPrincipal("", "", "", list.List<string>());
+        let tenantId = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let m = Map<string, json.JsonValue>(10, string.hash);
+        m.set("authenticated", json.bool(true));
+        m.set("username", json.str(pr.username));
+        m.set("entra_tid", json.str(pr.tenant));
+        m.set("tenant_id", json.str(tenantId));
+        m.set("roles", Http.strList(pr.roles));
+        m.set("capabilities", Http.strList(authhelp.authCapsForRoles(pr.roles)));
+        m.set("login_available", json.bool(authhelp.entraConfigured(self.app.entra)));
+        return Http.okObj(m);
+    }
+}

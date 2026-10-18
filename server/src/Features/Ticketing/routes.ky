@@ -1,0 +1,29 @@
+// Ticketing feature route table (acp-compatible JSON over the shared `acp` db).
+// Only registration lives here; each handler is in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Ticketing.Shared.TicketRepository;
+import Features.Ticketing.ListTicketRules.handler;
+import Features.Ticketing.CreateTicketRule.handler;
+import Features.Ticketing.ToggleTicketRule.handler;
+import Features.Ticketing.DeleteTicketRule.handler;
+import Features.Ticketing.ListTickets.handler;
+import Features.Ticketing.JiraCallback.handler;
+import Features.Ticketing.TicketCallback.handler;
+import Features.Ticketing.TicketingView.handler;
+import Features.Ticketing.TicketingConsole.handler;
+
+pub fn registerTicketing(ctx: AppContext): void {
+    let repo = TicketRepository(ctx.db);
+    ctx.app.get("/ticketing/view", TicketingViewHandler(ctx));
+    ctx.app.post("/console/ticketing/save", TicketingSaveHandler(ctx));
+    ctx.app.post("/console/ticketing/toggle", TicketingToggleHandler(ctx));
+    ctx.app.post("/console/ticketing/delete", TicketingDeleteHandler(ctx));
+    ctx.app.get("/ticket-rules", ListTicketRulesHandler(repo, ctx));
+    ctx.app.post("/ticket-rules", CreateTicketRuleHandler(repo, ctx));
+    ctx.app.post("/ticket-rules/{id}/toggle", ToggleTicketRuleHandler(repo, ctx));
+    ctx.app.post("/ticket-rules/{id}/delete", DeleteTicketRuleHandler(repo, ctx));
+    ctx.app.get("/tickets", ListTicketsHandler(repo, ctx));
+    ctx.app.post("/tickets/jira", JiraCallbackHandler(ctx));
+    ctx.app.post("/tickets/callback", TicketCallbackHandler(ctx));
+}

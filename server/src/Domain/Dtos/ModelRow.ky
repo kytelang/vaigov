@@ -1,0 +1,13 @@
+// Model row: fields match acp-server's `#[derive(Serialize)] struct Model` exactly
+// (the `tenant` field maps the `tenant_id` column via `SELECT ... AS tenant`).
+@serializable pub struct ModelRow {
+    pub id: string,
+    pub name: string,
+    pub provider: string,
+    pub version: string,
+    pub card_json: string,
+    pub scan_status: string,
+    pub aibom_json: string,
+    pub tenant: string,
+    pub created_ms: long,
+}

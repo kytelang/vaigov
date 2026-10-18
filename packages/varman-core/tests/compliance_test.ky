@@ -1,0 +1,268 @@
+//! Behavioural gate for the Varman compliance layer (controls + conformance +
+//! assessment). These asserts are the definition of done: a known control
+//! resolves to the expected title and reference, the applicability DSL excludes
+//! and includes the right subjects with reasons, `assessFramework` is exhaustive,
+//! and the EU AI Act tiering lands on the expected tier with real obligation ids.
+
+import list;
+import string;
+import assert;
+import controls;
+import conformance;
+import assessment;
+
+// --- helpers ----------------------------------------------------------------
+
+fn roles(a: string): List<string> {
+    let r = List<string>();
+    if (string.len(a) > 0) { r.push(a); }
+    return r;
+}
+
+fn roles2(a: string, b: string): List<string> {
+    let r = List<string>();
+    r.push(a); r.push(b);
+    return r;
+}
+
+fn emptyRoles(): List<string> {
+    return List<string>();
+}
+
+// A subject with just a role and a tier (the common EU case).
+fn subject(role: string, tier: string): conformance.SubjectProfile {
+    return conformance.SubjectProfile(roles(role), tier, undefined, undefined, undefined);
+}
+
+// --- catalogue --------------------------------------------------------------
+
+@test
+fn catalogue_loads(): void {
+    let all = controls.library();
+    // Pins the shipped catalogue total so a truncated catalogue cannot be rendered
+    // as complete. Must match `controls.ky` (the full 12-framework library).
+    assert.equalInt(all.size(), 264);
+}
+
+@test
+fn get_returns_expected_title_and_reference(): void {
+    let oversight = controls.get("eu-ai-act", "art-14") ?? controls.makeControl("", "", "x", "", "", "always", "", "");
+    assert.isTrue(string.eql(oversight.title, "Human oversight"));
+    assert.isTrue(string.eql(oversight.reference, "Art. 14"));
+
+    let govern = controls.get("nist-ai-rmf", "govern-1.1") ?? controls.makeControl("", "", "", "x", "", "always", "", "");
+    assert.isTrue(string.eql(govern.reference, "GOVERN 1.1"));
+
+    let iso = controls.get("iso-42001", "A.9.2") ?? controls.makeControl("", "", "x", "", "", "always", "", "");
+    assert.isTrue(string.eql(iso.reference, "A.9.2"));
+    assert.isTrue(string.eql(iso.title, "Information for interested parties"));
+
+    let soc = controls.get("soc-2", "CC6.1") ?? controls.makeControl("", "", "x", "", "", "always", "", "");
+    assert.isTrue(string.eql(soc.reference, "CC6.1"));
+
+    // A missing control resolves to undefined.
+    assert.isTrue(controls.get("eu-ai-act", "art-999") == undefined);
+}
+
+@test
+fn frameworks_lists_the_embedded_set(): void {
+    let fws = controls.frameworks();
+    // Pins the shipped framework count (the full catalogue), so a reduced set is
+    // caught by the gate. The four below are a sampled presence check, not the total.
+    assert.equalInt(fws.size(), 12);
+    let slugs = List<string>();
+    let i = 0;
+    while (i < fws.size()) { slugs.push(fws.at(i).slug); i = i + 1; }
+    assert.isTrue(slugs.contains("eu-ai-act"));
+    assert.isTrue(slugs.contains("nist-ai-rmf"));
+    assert.isTrue(slugs.contains("iso-42001"));
+    assert.isTrue(slugs.contains("soc-2"));
+    // Every framework carries label, version and type.
+    let j = 0;
+    while (j < fws.size()) {
+        let f = fws.at(j);
+        assert.isTrue(string.len(f.label) > 0 && string.len(f.version) > 0 && string.len(f.frameworkType) > 0);
+        j = j + 1;
+    }
+}
+
+@test
+fn crosswalk_edge_resolves_to_expected_target(): void {
+    let edges = controls.crosswalkEdges();
+    assert.isTrue(edges.size() > 0);
+    // eu-ai-act:art-10 (data governance) crosswalks to iso-42001:A.7.2 (data for AI).
+    let found = false;
+    let i = 0;
+    while (i < edges.size()) {
+        let e = edges.at(i);
+        if (string.eql(e.fromFramework, "eu-ai-act") && string.eql(e.fromId, "art-10") && string.eql(e.toFramework, "iso-42001") && string.eql(e.toId, "A.7.2")) {
+            found = true;
+        }
+        i = i + 1;
+    }
+    assert.isTrue(found);
+    // Every resolved edge target is a real control in its framework.
+    let j = 0;
+    while (j < edges.size()) {
+        let e = edges.at(j);
+        assert.isTrue(controls.get(e.toFramework, e.toId) != undefined);
+        j = j + 1;
+    }
+}
+
+// --- applicability DSL ------------------------------------------------------
+
+@test
+fn always_applies_to_any_subject(): void {
+    let c = controls.makeControl("eu-ai-act", "art-5-a", "Prohibited", "Art. 5", "prohibition", "always", "", "");
+    // Even an empty profile (no roles, no tier) is covered by "always".
+    let p = conformance.SubjectProfile(emptyRoles(), undefined, undefined, undefined, undefined);
+    assert.isTrue(conformance.applies(c, p).ok);
+}
+
+@test
+fn risk_tier_list_excludes_minimal_with_reason(): void {
+    let c = controls.makeControl("eu-ai-act", "art-9", "RMS", "Art. 9", "process", "risk_tier in [high, unacceptable]", "provider", "");
+    let minimal = subject("provider", "minimal");
+    let r = minimal.riskTier;
+    let res = conformance.applies(c, minimal);
+    assert.isTrue(!res.ok);
+    assert.isTrue(string.len(res.reason) > 0);
+    assert.isTrue(string.contains(res.reason, "predicate not met"));
+    // The same control DOES apply at the high tier.
+    let high = subject("provider", "high");
+    assert.isTrue(conformance.applies(c, high).ok);
+    let _ = r;
+}
+
+@test
+fn role_binding_overlaps(): void {
+    // A deployer-only control.
+    let c = controls.makeControl("eu-ai-act", "art-27", "FRIA", "Art. 27", "process", "risk_tier in [high]", "deployer", "");
+    // A pure provider is excluded with a role reason.
+    let provider = subject("provider", "high");
+    let r1 = conformance.applies(c, provider);
+    assert.isTrue(!r1.ok);
+    assert.isTrue(string.contains(r1.reason, "binds roles"));
+    // A subject that is both deployer and provider overlaps and is bound.
+    let both = conformance.SubjectProfile(roles2("deployer", "provider"), "high", undefined, undefined, undefined);
+    assert.isTrue(conformance.applies(c, both).ok);
+}
+
+@test
+fn unrecognised_conjunct_is_permissive(): void {
+    // "quantum_ready=yes" is not a recognised predicate -> treated as satisfied.
+    let c = controls.makeControl("eu-ai-act", "x", "X", "Art. X", "process", "quantum_ready=yes", "", "");
+    let p = conformance.SubjectProfile(emptyRoles(), undefined, undefined, undefined, undefined);
+    assert.isTrue(conformance.applies(c, p).ok);
+    // And it still combines with a recognised conjunct via " and ".
+    let c2 = controls.makeControl("eu-ai-act", "y", "Y", "Art. Y", "process", "risk_tier in [high] and quantum_ready=yes", "", "");
+    assert.isTrue(conformance.applies(c2, subject("provider", "high")).ok);
+    assert.isTrue(!conformance.applies(c2, subject("provider", "minimal")).ok);
+}
+
+// --- exhaustive assessment --------------------------------------------------
+
+@test
+fn assess_framework_is_exhaustive_and_summarises(): void {
+    let p = subject("provider", "high");
+    let satisfied = List<string>();
+    satisfied.push("art-14");
+    let rows = conformance.assessFramework("eu-ai-act", p, satisfied, List<string>());
+    let s = conformance.summarise(rows);
+
+    // Every control is assessed: total == full framework size.
+    assert.equalInt(s.total, controls.forFramework("eu-ai-act").size());
+    // Exhaustiveness: applicable + not-applicable == total.
+    assert.equalInt(s.applicable + s.notApplicable, s.total);
+    // art-14 was marked satisfied -> exactly one conformant.
+    assert.equalInt(s.conformant, 1);
+    // Other applicable controls remain not-assessed.
+    assert.isTrue(s.notAssessed > 0);
+
+    // Every excluded (not-applicable) control carries a non-empty reason, and
+    // every applicable one carries none.
+    let i = 0;
+    while (i < rows.size()) {
+        let r = rows.at(i);
+        if (r.applicable) {
+            assert.isTrue(string.len(r.exclusionReason) == 0);
+        } else {
+            assert.isTrue(string.len(r.exclusionReason) > 0);
+        }
+        i = i + 1;
+    }
+
+    // A pure provider at high tier must NOT be assessed against art-27 (deployer
+    // only): it is present but recorded not-applicable.
+    let art27 = rows.findIndex((r) => { return string.eql(r.controlId, "art-27"); });
+    assert.isTrue(art27 >= 0);
+    assert.isTrue(!rows.at(art27).applicable);
+}
+
+@test
+fn minimal_tier_excludes_high_risk_but_keeps_prohibition(): void {
+    let rows = conformance.assessFramework("eu-ai-act", subject("provider", "minimal"), List<string>(), List<string>());
+    // art-9 (risk management, high-only) is not applicable at minimal.
+    let a9 = rows.findIndex((r) => { return string.eql(r.controlId, "art-9"); });
+    assert.isTrue(a9 >= 0 && !rows.at(a9).applicable);
+    // art-5-a (prohibition, applicability "always") stays applicable at any tier.
+    let a5 = rows.findIndex((r) => { return string.eql(r.controlId, "art-5-a"); });
+    assert.isTrue(a5 >= 0 && rows.at(a5).applicable);
+}
+
+// --- EU AI Act tiering ------------------------------------------------------
+
+@test
+fn classify_prohibited_is_unacceptable(): void {
+    let s = assessment.emptyScreening();
+    s.prohibitedPractice = true;
+    let c = assessment.classifyTier(s);
+    assert.isTrue(string.eql(c.tier.toSnake(), "unacceptable"));
+    assert.isTrue(c.reasons.size() > 0);
+}
+
+@test
+fn classify_annex_iii_is_high(): void {
+    let s = assessment.emptyScreening();
+    s.employmentOrEducation = true;
+    let c = assessment.classifyTier(s);
+    assert.isTrue(string.eql(c.tier.toSnake(), "high"));
+}
+
+@test
+fn classify_transparency_is_limited(): void {
+    let s = assessment.emptyScreening();
+    s.interactsWithHumans = true;
+    let c = assessment.classifyTier(s);
+    assert.isTrue(string.eql(c.tier.toSnake(), "limited"));
+}
+
+@test
+fn classify_benign_is_minimal(): void {
+    let c = assessment.classifyTier(assessment.emptyScreening());
+    assert.isTrue(string.eql(c.tier.toSnake(), "minimal"));
+}
+
+@test
+fn obligations_for_high_are_real_catalogue_ids(): void {
+    let obs = assessment.obligationsFor(RiskTier.High);
+    // The full EU AI Act high-risk set.
+    assert.equalInt(obs.size(), 7);
+    let ids = List<string>();
+    let i = 0;
+    while (i < obs.size()) {
+        let o = obs.at(i);
+        ids.push(o.controlId);
+        // Each obligation resolves to a real control in the catalogue.
+        assert.isTrue(controls.get("eu-ai-act", o.controlId) != undefined);
+        i = i + 1;
+    }
+    assert.isTrue(ids.contains("art-14"));
+    assert.isTrue(ids.contains("art-9"));
+    assert.isTrue(ids.contains("art-15"));
+
+    // Limited pulls only the transparency obligation; Minimal pulls none.
+    assert.equalInt(assessment.obligationsFor(RiskTier.Limited).size(), 1);
+    assert.equalInt(assessment.obligationsFor(RiskTier.Minimal).size(), 0);
+}

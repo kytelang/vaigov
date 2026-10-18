@@ -1,0 +1,27 @@
+// Row DTOs for the monitoring feature over the shared `acp` db.
+// `class` is a reserved word, so drift rows SELECT it `AS cls`.
+@serializable pub struct DriftRow {
+    pub cls: string,
+    pub hits: long,
+    pub total: long,
+    pub baseline: double,
+}
+
+@serializable pub struct LineageRow {
+    pub data_class: string,
+    pub tool: string,
+    pub count: long,
+}
+
+@serializable pub struct DriftProbeRow {
+    pub hits: long,
+    pub total: long,
+}
+
+@serializable pub struct CountProbeRow {
+    pub count: long,
+}
+
+@serializable pub struct StateRow {
+    pub v: string,
+}

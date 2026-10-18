@@ -1,0 +1,33 @@
+// POST /artifacts/{id}/baseline {version_id} -> {"ok":true} | {"ok":false,"error":...}.
+// Pins a version as the baseline to diff and roll back to. EditPolicy.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Evidence.Shared.EvidenceRepository;
+import Features.Evidence.IngestEvidence.handler;
+
+pub struct ArtifactBaselineHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ArtifactBaselineHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let vid = evStr(Http.bodyJson(ctx), "version_id", "");
+        let ok = await self.repo.setPointer(id, "baseline", vid, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        if (ok) {
+            m.set("ok", json.bool(true));
+        } else {
+            m.set("ok", json.bool(false));
+            m.set("error", json.str("version does not belong to artifact"));
+        }
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,40 @@
+// Admin feature route table: organisation/acts-catalogue/tenancy/SCIM/trust.
+// Only registration lives here. GET /acts is served by the Compliance feature, so
+// it is NOT registered here (no double-registration).
+import web.app;
+import Shared.AppContext;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Countries.handler;
+import Features.Admin.ActChecklist.handler;
+import Features.Admin.ActsApplicable.handler;
+import Features.Admin.Orgs.handler;
+import Features.Admin.TenantsList.handler;
+import Features.Admin.TenantSettingsGet.handler;
+import Features.Admin.TenantSettingsSet.handler;
+import Features.Admin.TenantRegister.handler;
+import Features.Admin.MetaAudit.handler;
+import Features.Admin.Scim.handler;
+import Features.Admin.Trust.handler;
+import Features.Admin.OrganisationView.handler;
+import Features.Admin.OrganisationConsole.handler;
+
+pub fn registerAdmin(ctx: AppContext): void {
+    let repo = AdminRepository(ctx.db);
+    ctx.app.get("/organisation/view", OrganisationViewHandler(ctx));
+    ctx.app.post("/console/organisation/toggle-act", OrgToggleActHandler(ctx));
+    ctx.app.post("/console/organisation/save-profile", OrgSaveProfileHandler(ctx));
+    ctx.app.get("/countries", CountriesHandler(repo, ctx));
+    ctx.app.get("/acts/applicable", ActsApplicableHandler(repo, ctx));
+    ctx.app.get("/acts/{id}/checklist", ActChecklistHandler(repo, ctx));
+    ctx.app.get("/orgs", OrgsHandler(repo, ctx));
+    ctx.app.get("/tenants", TenantsListHandler(repo, ctx));
+    ctx.app.get("/tenant/settings", TenantSettingsGetHandler(repo, ctx));
+    ctx.app.post("/tenant/settings", TenantSettingsSetHandler(repo, ctx));
+    ctx.app.post("/tenants/register", TenantRegisterHandler(repo, ctx));
+    ctx.app.post("/admin/meta", RecordMetaHandler(ctx));
+    ctx.app.get("/meta-audit", MetaAuditHandler(ctx));
+    ctx.app.get("/scim/v2/Users", ScimUsersHandler(ctx));
+    ctx.app.get("/scim/v2/Groups", ScimGroupsHandler(ctx));
+    ctx.app.get("/trust", TrustHandler(ctx));
+    ctx.app.get("/verify", VerifyHandler(ctx));
+}

@@ -1,0 +1,18 @@
+//! Db: the shared Postgres connection pool, built once at startup and held by the
+//! AppContext. Repositories take it by constructor injection and acquire/release
+//! connections from its pool, so the whole app shares one pool. This mirrors the
+//! kyte-pg-web reference app; the control plane's single store is Postgres (the
+//! design doc drops the sqlx Any/SQLite layer).
+
+import postgres;
+import pool;
+
+pub struct Db {
+    pub pool: Pool,
+
+    init(dsn: string, poolSize: int) {
+        let sz = if (poolSize < 1) 1 else poolSize;
+        self.pool = pool.Pool(postgres.PgDriver(), dsn, sz);
+        self.pool.configure(sz, 0, false);
+    }
+}

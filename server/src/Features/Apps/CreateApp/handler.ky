@@ -1,0 +1,51 @@
+// POST /apps {name, owner?, metadata?} -> {"ok":true,"id":"app-...","name":...}.
+// Mirrors acp-server handlers/identity.rs::app_register.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Apps.Shared.AppRepository;
+
+// Shared JSON body helpers for the registry handlers.
+pub fn bodyStr(body: json.JsonValue, key: string): string {
+    if (!json.has(body, key)) { return ""; }
+    return json.asString(json.get(body, key)) ?? "";
+}
+pub fn bodyMeta(body: json.JsonValue): string {
+    if (!json.has(body, "metadata")) { return "{}"; }
+    return json.stringify(json.get(body, "metadata"));
+}
+pub fn okFalse(msg: string): response.Response {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return Http.okObj(m);
+}
+
+pub struct CreateAppHandler impl RouteHandler {
+    repo: AppRepository,
+    app: AppContext,
+    init(repo: AppRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateAppHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterApp)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(bodyStr(body, "name"));
+        if (name.length == 0) { return okFalse("name is required"); }
+        let owner = bodyStr(body, "owner");
+        let metadata = bodyMeta(body);
+        let id = string.concat("app-", random.randomHex(6));
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.add(id, name, owner, metadata, tenant, Http.nowMs());
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("name", json.str(name));
+        return Http.okObj(m);
+    }
+}

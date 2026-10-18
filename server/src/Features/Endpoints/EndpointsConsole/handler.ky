@@ -1,0 +1,114 @@
+// First-party console mutation handlers for the Endpoints screen. These back the
+// Datastar forms in views/endpoints.kyx: they read the posted signals, mutate via
+// the shared EndpointRepository, and answer with the REFRESHED #endpoints fragment
+// plus a signal patch (close the modal / set an error). They are trusted console
+// endpoints under /console/* and do NOT require a bearer (unlike the machine
+// /ai-endpoints JSON API, which stays for the CLI/external callers). The data is
+// the same `acp` Postgres rows either way.
+import web.routing;
+import web.response;
+import string;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Endpoints.Shared.EndpointRepository;
+import Features.Endpoints.views.endpoints;
+import Domain.Dtos.EndpointRow;
+
+fn epTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+
+fn readBool(body: json.JsonValue, key: string, dflt: bool): bool {
+    let b = json.asBool(json.get(body, key));
+    if (b != undefined) { return b ?? dflt; }
+    let s = json.asString(json.get(body, key)) ?? "";
+    if (string.eql(s, "true")) { return true; }
+    if (string.eql(s, "false")) { return false; }
+    return dflt;
+}
+
+fn readPort(body: json.JsonValue): int {
+    let n = json.asNumber(json.get(body, "epPort"));
+    if (n != undefined) { return (n ?? 443.0) as int; }
+    let s = json.asString(json.get(body, "epPort")) ?? "443";
+    return string.parseInt(s) ?? 443;
+}
+
+// POST /console/endpoints/save -> create (epId empty) or update (epId set), then
+// refresh the table and close the modal. Empty host keeps the modal open w/ error.
+pub struct EndpointsSaveHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EndpointsSaveHandler, ctx: routing.Context): Response {
+        let tenant = epTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let host = string.trim(json.asString(json.get(body, "epHost")) ?? "");
+        if (host.length == 0) {
+            let rows = await self.repo.list(tenant);
+            return await ConsoleDs.patchAndSignals(endpoints.endpointsPanel(rows.items), "{\"epErr\":\"Host is required.\"}");
+        }
+        let port = readPort(body);
+        let note = string.trim(json.asString(json.get(body, "epNote")) ?? "");
+        let enabled = readBool(body, "epEnabled", true);
+        let id = string.trim(json.asString(json.get(body, "epId")) ?? "");
+        if (id.length == 0) {
+            let newId = string.concat("ep-", random.randomHex(6));
+            await self.repo.add(newId, tenant, host, port, note, Http.nowMs());
+            // A fresh endpoint starts intercepting; honour the chosen status.
+            if (!enabled) { await self.repo.update(newId, tenant, host, port, 0, note); }
+        } else {
+            await self.repo.update(id, tenant, host, port, if (enabled) (1) else (0), note);
+        }
+        let rows = await self.repo.list(tenant);
+        return await ConsoleDs.patchAndSignals(endpoints.endpointsPanel(rows.items),
+            "{\"epModal\":\"\",\"epErr\":\"\",\"epId\":\"\",\"epHost\":\"\",\"epPort\":\"443\",\"epNote\":\"\",\"epEnabled\":true}");
+    }
+}
+
+// POST /console/endpoints/delete {epId}
+pub struct EndpointsDeleteHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EndpointsDeleteHandler, ctx: routing.Context): Response {
+        let tenant = epTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = string.trim(json.asString(json.get(body, "epId")) ?? "");
+        if (id.length > 0) { await self.repo.remove(id, tenant); }
+        let rows = await self.repo.list(tenant);
+        return await ConsoleDs.patchAndSignals(endpoints.endpointsPanel(rows.items), "{\"epModal\":\"\",\"epErr\":\"\"}");
+    }
+}
+
+// POST /console/endpoints/toggle {epId} -> flip enabled, preserving host/port/note.
+pub struct EndpointsToggleHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EndpointsToggleHandler, ctx: routing.Context): Response {
+        let tenant = epTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = string.trim(json.asString(json.get(body, "epId")) ?? "");
+        let rows = await self.repo.list(tenant);
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, EndpointRow{ id: "", host: "", port: 443, enabled: 0, note: "" });
+            if (string.eql(r.id, id)) {
+                let next = if (r.enabled != 0) (0) else (1);
+                await self.repo.update(r.id, tenant, r.host, r.port, next, r.note);
+                i = rows.items.size();
+            } else {
+                i = i + 1;
+            }
+        }
+        let rows2 = await self.repo.list(tenant);
+        return await ConsoleDs.patchAndSignals(endpoints.endpointsPanel(rows2.items), "{\"epModal\":\"\",\"epErr\":\"\"}");
+    }
+}

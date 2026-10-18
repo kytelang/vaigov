@@ -1,0 +1,108 @@
+// Governed AI endpoints view as KYX (full parity with acp/console EndpointsView.vue):
+// count + "Add endpoint", a table with click-to-edit host, a click-to-toggle status
+// badge, per-row edit/delete, and an add/edit MODAL form. Interactivity is Datastar:
+// signals on the fragment root carry the form state; buttons set signals + `@post`
+// a first-party `/console/endpoints/*` handler, which mutates via the repo and
+// morphs this fragment back in (closing the modal). Themed classes; no literal
+// braces inside attribute values except the Datastar expressions themselves.
+import list;
+import string;
+import Domain.Dtos.EndpointRow;
+
+// Escape a value for safe inlining into a Datastar JS expression string literal
+// (single-quoted). Hosts are domains, but notes are free text.
+fn jsq(s: string): string {
+    let a = string.replace(s, "\\", "\\\\");
+    return string.replace(a, "'", "\\'");
+}
+
+fn epStatusLabel(enabled: int): string { if (enabled != 0) { return "intercepting"; } return "disabled"; }
+
+fn endpointRow(r: EndpointRow): Html {
+    let en = r.enabled != 0;
+    let openEdit = string.concat(string.concat(string.concat(string.concat(string.concat(string.concat(
+        "$epId='", jsq(r.id)), "'; $epHost='"), jsq(r.host)),
+        string.concat(string.concat("'; $epPort='", `${r.port}`), "'; $epNote='")), jsq(r.note)),
+        string.concat(string.concat("'; $epEnabled=", if (en) ("true") else ("false")), "; $epErr=''; $epModal='open'"));
+    let toggleExpr = string.concat(string.concat("$epId='", jsq(r.id)), "'; @post('/console/endpoints/toggle')");
+    let delExpr = string.concat(string.concat("$epId='", jsq(r.id)), "'; @post('/console/endpoints/delete')");
+    let badgeCls = if (en) ("text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok")
+        else ("text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-muted");
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs"><button class="text-accent hover:underline" data-on:click={openEdit}>{r.host}</button></td>
+        <td class="py-2 pr-4 text-sm">{`${r.port}`}</td>
+        <td class="py-2 pr-4"><button data-on:click={toggleExpr}><span class={badgeCls}>{epStatusLabel(r.enabled)}</span></button></td>
+        <td class="py-2 pr-4 text-xs text-dim">{if (r.note.length > 0) { r.note; } else { <span>-</span>; }}</td>
+        <td class="py-2 pr-4 text-right whitespace-nowrap">
+            <button class="text-xs text-dim hover:text-txt mr-3" data-on:click={openEdit}>Edit</button>
+            <button class="text-xs text-bad hover:underline" data-on:click={delExpr}>Delete</button>
+        </td>
+    </tr>;
+}
+
+pub fn endpointsPanel(rows: list.List<EndpointRow>): Html {
+    return <div id="endpoints" class="grid gap-4">
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{`${rows.size()} endpoints`}</span>
+            <span class="text-dim text-sm">The proxy intercepts and applies policy to these hosts only; everything else is passed through untouched.</span>
+            <div class="ml-auto">
+                <button class="rounded-lg bg-accent text-white px-3.5 py-1.5 text-sm font-medium hover:opacity-90"
+                    data-on:click="$epId=''; $epHost=''; $epPort='443'; $epNote=''; $epEnabled=true; $epErr=''; $epModal='open'">Add endpoint</button>
+            </div>
+        </div>
+        <div data-show="$epErr != ''" class="text-bad text-sm" data-text="$epErr"></div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Governed AI endpoints</h2>
+                <p class="text-xs text-dim">Bump (inspect) these hosts; splice (pass through) everything else.</p>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                            <th class="py-2 pr-4">Host</th>
+                            <th class="py-2 pr-4">Port</th>
+                            <th class="py-2 pr-4">Status</th>
+                            <th class="py-2 pr-4">Note</th>
+                            <th class="py-2 pr-4"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {for (i in 0..rows.size()) { endpointRow(rows.at(i)); }}
+                        {if (rows.size() == 0) {
+                            <tr><td colspan="5" class="py-10 text-center text-dim">No governed endpoints yet. Add one (for example api.openai.com) to start intercepting it.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-3 border-t border-line">
+                <p class="text-xs text-dim">Changes are picked up by the sidecar; the edge proxy's bump / splice config and per-host certificate are regenerated from this list.</p>
+            </div>
+        </div>
+
+        <div data-show="$epModal === 'open'" class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-panel border border-line rounded-2xl p-6 w-full max-w-md">
+                <h3 class="font-semibold text-txt" data-text="$epId == '' ? 'Add endpoint' : 'Edit endpoint'">Add endpoint</h3>
+                <div class="grid gap-3 mt-4">
+                    <label class="text-xs text-dim">Host<input type="text" data-bind="epHost" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm font-mono" placeholder="api.openai.com" /></label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <label class="text-xs text-dim">Port<input type="number" data-bind="epPort" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" /></label>
+                        <label class="text-xs text-dim">Status
+                            <select data-bind="epEnabled" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                                <option value="true">intercepting</option>
+                                <option value="false">disabled</option>
+                            </select>
+                        </label>
+                    </div>
+                    <label class="text-xs text-dim">Note (optional)<input type="text" data-bind="epNote" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="OpenAI chat API" /></label>
+                    <div class="flex justify-end gap-2 pt-1">
+                        <button class="rounded-lg border border-line2 px-4 py-2 text-sm hover:bg-panel2" data-on:click="$epModal=''">Cancel</button>
+                        <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90"
+                            data-on:click="@post('/console/endpoints/save')" data-text="$epId == '' ? 'Add' : 'Save'">Add</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>;
+}

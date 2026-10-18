@@ -1,0 +1,94 @@
+// MonitorRepository: drift_counts, lineage_edges and control_state in the shared
+// `acp` Postgres db. SQL mirrors acp-server store.rs (report_drift/list_drift,
+// report_lineage/list_lineage, put_state/get_state). Counts-only, never raw values.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.MonitorRows;
+
+pub struct MonitorRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    // --- drift ---------------------------------------------------------------
+    pub async fn listDrift(self: MonitorRepository): Rows<DriftRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        let r = await Repository<DriftRow>(conn, "drift_counts").query(
+            "SELECT class AS cls, hits, total, baseline FROM drift_counts ORDER BY class", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn reportDrift(self: MonitorRepository, cls: string, hits: long, total: long, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let probe = list.List<DbValue>();
+        probe.push(db.dbText(cls));
+        let ex = await Repository<DriftProbeRow>(conn, "drift_counts").query("SELECT hits, total FROM drift_counts WHERE class = $1", probe);
+        if (ex.items.size() > 0) {
+            let cur = ex.items.getOr(0, DriftProbeRow{ hits: 0, total: 0 });
+            let p = list.List<DbValue>();
+            p.push(db.dbLong(cur.hits + hits)); p.push(db.dbLong(cur.total + total)); p.push(db.dbLong(nowMs)); p.push(db.dbText(cls));
+            let _u = await conn.exec("UPDATE drift_counts SET hits = $1, total = $2, updated_ms = $3 WHERE class = $4", p);
+        } else {
+            let p = list.List<DbValue>();
+            p.push(db.dbText(cls)); p.push(db.dbLong(hits)); p.push(db.dbLong(total)); p.push(db.dbLong(nowMs));
+            // First report sets the baseline rate for this class (computed in SQL to avoid a float bind).
+            let _i = await conn.exec("INSERT INTO drift_counts (class, hits, total, baseline, updated_ms) VALUES ($1, $2, $3, (CASE WHEN $3 > 0 THEN $2::float8 / $3::float8 ELSE 0 END), $4)", p);
+        }
+        self.db.pool.release(conn);
+    }
+
+    // --- lineage -------------------------------------------------------------
+    pub async fn listLineage(self: MonitorRepository): Rows<LineageRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        let r = await Repository<LineageRow>(conn, "lineage_edges").query(
+            "SELECT data_class, tool, count FROM lineage_edges ORDER BY data_class, tool", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn reportLineage(self: MonitorRepository, dc: string, tool: string, count: long, nowMs: long): void {
+        let id = string.concat(string.concat(dc, ":"), tool);
+        let conn = await self.db.pool.acquire();
+        let probe = list.List<DbValue>();
+        probe.push(db.dbText(id));
+        let ex = await Repository<CountProbeRow>(conn, "lineage_edges").query("SELECT count FROM lineage_edges WHERE id = $1", probe);
+        if (ex.items.size() > 0) {
+            let cur = ex.items.getOr(0, CountProbeRow{ count: 0 });
+            let p = list.List<DbValue>();
+            p.push(db.dbLong(cur.count + count)); p.push(db.dbLong(nowMs)); p.push(db.dbText(id));
+            let _u = await conn.exec("UPDATE lineage_edges SET count = $1, updated_ms = $2 WHERE id = $3", p);
+        } else {
+            let p = list.List<DbValue>();
+            p.push(db.dbText(id)); p.push(db.dbText(dc)); p.push(db.dbText(tool)); p.push(db.dbLong(count)); p.push(db.dbLong(nowMs));
+            let _i = await conn.exec("INSERT INTO lineage_edges (id, data_class, tool, count, updated_ms) VALUES ($1, $2, $3, $4, $5)", p);
+        }
+        self.db.pool.release(conn);
+    }
+
+    // --- control_state (heartbeat liveness + oversight config) ---------------
+    pub async fn putState(self: MonitorRepository, k: string, v: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let d = list.List<DbValue>();
+        d.push(db.dbText(k));
+        let _del = await conn.exec("DELETE FROM control_state WHERE k = $1", d);
+        let p = list.List<DbValue>();
+        p.push(db.dbText(k)); p.push(db.dbText(v)); p.push(db.dbLong(nowMs));
+        let _ins = await conn.exec("INSERT INTO control_state (k, v, updated_ms) VALUES ($1, $2, $3)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn getState(self: MonitorRepository, k: string): string {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(k));
+        let r = await Repository<StateRow>(conn, "control_state").query("SELECT v FROM control_state WHERE k = $1", p);
+        self.db.pool.release(conn);
+        if (r.items.size() == 0) { return ""; }
+        return (r.items.getOr(0, StateRow{ v: "" })).v;
+    }
+}

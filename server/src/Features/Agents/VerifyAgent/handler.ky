@@ -1,0 +1,39 @@
+// POST /agents/verify {id, token} -> {ok,verified,agent,app_id,app}. Mirrors acp agent_verify
+// (ungated; confirms a token the caller already holds).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import canonical;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Agents.Shared.AgentRepository;
+import Features.Apps.CreateApp.handler;
+import Domain.Dtos.PrincipalListRow;
+
+pub struct VerifyAgentHandler impl RouteHandler {
+    repo: AgentRepository,
+    app: AppContext,
+    init(repo: AgentRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: VerifyAgentHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let id = bodyStr(body, "id");
+        let token = bodyStr(body, "token");
+        let tokenSha = canonical.sha256HexOfString(token);
+        let rows = await self.repo.verifyIdentity(id, tokenSha);
+        let m = Map<string, json.JsonValue>(6, string.hash);
+        m.set("ok", json.bool(true));
+        if (rows.items.size() > 0) {
+            let r = rows.items.getOr(0, AgentVerifyRow{ an: "", aid: "", apn: "" });
+            m.set("verified", json.bool(true));
+            m.set("agent", json.str(r.an));
+            m.set("app_id", json.str(r.aid));
+            m.set("app", json.str(r.apn));
+        } else {
+            m.set("verified", json.bool(false));
+        }
+        return Http.okObj(m);
+    }
+}

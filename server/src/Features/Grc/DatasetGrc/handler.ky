@@ -1,0 +1,73 @@
+// POST /grc/dataset {subject,title?,source?,licence?,consent_basis?,collection_date?,
+//   retention?,records?,pii?,status?,notes?} -> {"ok":true,"id","status","governance_complete"}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+import Features.Grc.AssessGrc.handler;
+
+fn grcDsStatus(s: string): bool {
+    return string.eql(s, "active") || string.eql(s, "retention") || string.eql(s, "deletion-requested") || string.eql(s, "deleted") || string.eql(s, "unlearned");
+}
+
+pub struct DatasetGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DatasetGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let subject = string.trim(grcsign.grcStr(body, "subject"));
+        if (subject.length == 0) { return grcErr("subject is required"); }
+        let title = string.trim(grcsign.grcStr(body, "title"));
+        if (title.length == 0) { title = subject; }
+        let source = string.trim(grcsign.grcStr(body, "source"));
+        let licence = string.trim(grcsign.grcStr(body, "licence"));
+        let consent = string.trim(grcsign.grcStr(body, "consent_basis"));
+        let collectionDate = string.trim(grcsign.grcStr(body, "collection_date"));
+        let retention = string.trim(grcsign.grcStr(body, "retention"));
+        let notes = string.trim(grcsign.grcStr(body, "notes"));
+        let records = grcsign.grcLong(body, "records", 0);
+        let pii = if (body.kind == 5 && json.has(body, "pii")) (json.asBool(json.get(body, "pii")) ?? false) else (false);
+        let status = string.trim(grcsign.grcStr(body, "status"));
+        if (status.length == 0) { status = "active"; }
+        if (!grcDsStatus(status)) { return grcErr("status must be one of active, retention, deletion-requested, deleted, unlearned"); }
+        let governanceComplete = source.length > 0 && licence.length > 0 && consent.length > 0;
+
+        let db = Map<string, json.JsonValue>(12, string.hash);
+        db.set("kind", json.str("dataset"));
+        db.set("source", json.str(source));
+        db.set("licence", json.str(licence));
+        db.set("consent_basis", json.str(consent));
+        db.set("collection_date", json.str(collectionDate));
+        db.set("retention", json.str(retention));
+        db.set("records", json.number(records));
+        db.set("pii", json.bool(pii));
+        db.set("governance_complete", json.bool(governanceComplete));
+        db.set("notes", json.str(notes));
+        let docBody = json.stringify(json.object(db));
+
+        let id = string.concat("grc-", random.randomHex(6));
+        let now = Http.nowMs();
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let doc = grcsign.grcDoc(id, "dataset", subject, title, status, docBody);
+        let sig = grcsign.grcSignHex(self.app.trust.keypair.privHex, doc);
+        await self.repo.add(id, "dataset", subject, title, status, docBody, "console", now, self.app.trust.keypair.pubHex, sig, "[]", "{}", "", 0, status, tenant);
+
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("status", json.str(status));
+        m.set("governance_complete", json.bool(governanceComplete));
+        return Http.okObj(m);
+    }
+}

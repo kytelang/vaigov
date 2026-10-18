@@ -1,0 +1,184 @@
+//! Shared content-firewall matchers (content-firewall-design §4, §7.2).
+//!
+//! The deterministic rule matchers live HERE, in varman-core, so the edge
+//! sidecar engine and the control-plane "test rule" box use the SAME code and
+//! cannot drift. The sidecar keeps its own compiled-regex cache for the hot
+//! path and delegates the secret/pii/substr/size checks to this module; the
+//! server's TestRule calls `matchesOneShot` (which compiles any regex inline).
+
+import text.regex;
+import string;
+
+fn isDigit(ch: int): bool { return ch >= 48 && ch <= 57; }
+fn isLower(ch: int): bool { return ch >= 97 && ch <= 122; }
+fn isUpper(ch: int): bool { return ch >= 65 && ch <= 90; }
+fn isAlpha(ch: int): bool { return isLower(ch) || isUpper(ch); }
+pub fn isAlnum(ch: int): bool { return isAlpha(ch) || isDigit(ch); }
+
+/// Case-insensitive substring match.
+pub fn substrMatch(pattern: string, text: string): bool {
+    if (string.eql(pattern, "")) { return false; }
+    return string.contains(string.toLowerCase(text), string.toLowerCase(pattern));
+}
+
+/// PII detectors. `selector`: email | ssn | card | any.
+pub fn detectPii(selector: string, text: string): bool {
+    let s = selector;
+    if (string.eql(s, "email") || string.eql(s, "any")) { if (hasEmail(text)) { return true; } }
+    if (string.eql(s, "ssn") || string.eql(s, "any")) { if (hasSsn(text)) { return true; } }
+    if (string.eql(s, "card") || string.eql(s, "any")) { if (hasCard(text)) { return true; } }
+    return false;
+}
+
+fn hasEmail(t: string): bool {
+    let n = t.length;
+    let i = 0;
+    while (i < n) {
+        if (t[i] == 64) {
+            let left = i > 0 && isAlnum(t[i - 1]);
+            let j = i + 1;
+            let dom = 0;
+            let dot = false;
+            while (j < n && (isAlnum(t[j]) || t[j] == 46 || t[j] == 45)) {
+                if (t[j] == 46 && dom > 0) { dot = true; }
+                else if (isAlnum(t[j])) { dom = dom + 1; }
+                j = j + 1;
+            }
+            if (left && dot && dom >= 2) { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hasSsn(t: string): bool {
+    let n = t.length;
+    let i = 0;
+    while (i + 11 <= n) {
+        if (isDigit(t[i]) && isDigit(t[i+1]) && isDigit(t[i+2]) && t[i+3] == 45
+            && isDigit(t[i+4]) && isDigit(t[i+5]) && t[i+6] == 45
+            && isDigit(t[i+7]) && isDigit(t[i+8]) && isDigit(t[i+9]) && isDigit(t[i+10])) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hasCard(t: string): bool {
+    let n = t.length;
+    let i = 0;
+    while (i < n) {
+        if (isDigit(t[i])) {
+            let digits = List<int>();
+            let j = i;
+            // Collect a digit run allowing common card separators: space, dash,
+            // dot, and plus (so 4111 1111..., 4111-1111..., 4111.1111..., and the
+            // URL-/form-encoded 4111+1111... all read as one number). The Luhn
+            // check below guards against false positives.
+            while (j < n && (isDigit(t[j]) || t[j] == 32 || t[j] == 45 || t[j] == 46 || t[j] == 43)) {
+                if (isDigit(t[j])) { digits.push(t[j] - 48); }
+                j = j + 1;
+            }
+            if (digits.size() >= 13 && digits.size() <= 19 && luhnOk(digits)) { return true; }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn luhnOk(digits: List<int>): bool {
+    let sum = 0;
+    let dbl = false;
+    let k = digits.size() - 1;
+    while (k >= 0) {
+        let d = digits.get(k) ?? 0;
+        if (dbl) { d = d * 2; if (d > 9) { d = d - 9; } }
+        sum = sum + d;
+        dbl = !dbl;
+        k = k - 1;
+    }
+    return (sum % 10) == 0;
+}
+
+/// Secret detectors. `selector`: prefix | entropy | any | "".
+pub fn detectSecret(selector: string, text: string): bool {
+    let s = selector;
+    if (string.eql(s, "prefix") || string.eql(s, "any") || string.eql(s, "")) {
+        if (hasKnownKeyPrefix(text)) { return true; }
+    }
+    if (string.eql(s, "entropy") || string.eql(s, "any")) {
+        if (hasHighEntropyToken(text)) { return true; }
+    }
+    return false;
+}
+
+fn hasKnownKeyPrefix(t: string): bool {
+    if (string.contains(t, "sk-")) { return true; }
+    if (string.contains(t, "AKIA")) { return true; }
+    if (string.contains(t, "ghp_")) { return true; }
+    if (string.contains(t, "xoxb-")) { return true; }
+    if (string.contains(t, "AIza")) { return true; }
+    return false;
+}
+
+fn hasHighEntropyToken(t: string): bool {
+    let n = t.length;
+    let i = 0;
+    while (i < n) {
+        if (isAlnum(t[i]) || t[i] == 95 || t[i] == 45) {
+            let j = i;
+            while (j < n && (isAlnum(t[j]) || t[j] == 95 || t[j] == 45)) { j = j + 1; }
+            let len = j - i;
+            // Raised from 24 to 40: short random-looking tokens (UUIDs, trace
+            // ids, JWT segments) that normal app/CLI telemetry emits are
+            // indistinguishable from secrets by entropy alone, so the old
+            // threshold false-positived on benign traffic. A real long-form
+            // credential (API session token, base64 key material) is 40+ chars;
+            // anything shorter must be caught by the key-PREFIX detector, not
+            // entropy. Tenants wanting the aggressive net use selector "any".
+            if (len >= 40 && distinctHeavy(t, i, j)) { return true; }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+/// Distinct-symbol-ratio proxy for entropy (no float/log on the hot path): a
+/// random 24+ char credential uses many distinct symbols, prose repeats few.
+fn distinctHeavy(s: string, from: int, to: int): bool {
+    let seen = List<bool>();
+    let b = 0;
+    while (b < 128) { seen.push(false); b = b + 1; }
+    let distinct = 0;
+    let i = from;
+    while (i < to) {
+        let ch = s[i];
+        if (ch < 128) {
+            let was = seen.get(ch) ?? false;
+            if (!was) { seen.set(ch, true); distinct = distinct + 1; }
+        }
+        i = i + 1;
+    }
+    let len = to - from;
+    return distinct >= 20 && (distinct * 100) > (len * 60);
+}
+
+/// One-shot match used by the control-plane TestRule (compiles any regex inline).
+/// `kind`: regex | substr | secret | pii | size.
+pub fn matchesOneShot(kind: string, pattern: string, threshold: int, text: string): bool {
+    if (string.eql(kind, "regex")) {
+        if (string.eql(pattern, "")) { return false; }
+        let rx = regex.compile(pattern);
+        return rx.test(text);
+    }
+    if (string.eql(kind, "substr")) { return substrMatch(pattern, text); }
+    if (string.eql(kind, "size")) { return text.length > threshold; }
+    if (string.eql(kind, "pii")) { return detectPii(pattern, text); }
+    if (string.eql(kind, "secret")) { return detectSecret(pattern, text); }
+    return false;
+}

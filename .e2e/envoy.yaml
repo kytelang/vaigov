@@ -1,0 +1,287 @@
+## Varman content-firewall demo data plane (multi-host).
+## TLS-bumps httpbin.org + the three governed AI providers (Claude/ChatGPT/Gemini);
+## each chain runs the Lua content check against the Kyte sidecar before egress.
+static_resources:
+  listeners:
+  - name: ingress
+    address: { socket_address: { address: 127.0.0.1, port_value: 10000 } }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector }
+    filter_chains:
+    - filter_chain_match: { server_names: ["httpbin.org"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/httpbin.org.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/httpbin.org.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bump_httpbin_org
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: httpbin.org
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: httpbin_upstream, host_rewrite_literal: httpbin.org, timeout: 30s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - filter_chain_match: { server_names: ["api.anthropic.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.anthropic.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.anthropic.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bump_api_anthropic_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: api.anthropic.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: anthropic, host_rewrite_literal: api.anthropic.com, timeout: 30s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - filter_chain_match: { server_names: ["api.openai.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.openai.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/api.openai.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bump_api_openai_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: api.openai.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: openai, host_rewrite_literal: api.openai.com, timeout: 30s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - filter_chain_match: { server_names: ["generativelanguage.googleapis.com"] }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/generativelanguage.googleapis.com.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/generativelanguage.googleapis.com.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bump_generativelanguage_googleapis_com
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: generativelanguage.googleapis.com
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: gemini, host_rewrite_literal: generativelanguage.googleapis.com, timeout: 30s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: { filename: "/Users/kamlesh/kytelang/varman/.e2e/localhost.crt" }
+              private_key: { filename: "/Users/kamlesh/kytelang/varman/.e2e/localhost.key" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bump_localhost
+          codec_type: AUTO
+          route_config:
+            name: r
+            virtual_hosts:
+            - name: localhost
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: anthropic, host_rewrite_literal: api.anthropic.com, timeout: 120s }
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  function envoy_on_request(handle)
+                    local body = handle:body(true)
+                    local b = ""
+                    if body ~= nil and body:length() > 0 then b = body:getBytes(0, body:length()) end
+                    local h, _ = handle:httpCall("content", { [":method"]="POST", [":path"]="/cf/check", [":authority"]="sidecar", ["content-type"]="text/plain" }, b, 5000)
+                    if h == nil or h[":status"] ~= "200" then
+                      handle:respond({ [":status"]="403", ["content-type"]="text/plain", ["x-acp-content-verdict"]="deny" }, "blocked by content policy\n")
+                    end
+                  end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: content
+    connect_timeout: 2s
+    type: STRICT_DNS
+    load_assignment:
+      cluster_name: content
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8899 } } }
+  - name: httpbin_upstream
+    connect_timeout: 10s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: httpbin_upstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: httpbin.org, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: httpbin.org
+  - name: anthropic
+    connect_timeout: 10s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: anthropic
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: api.anthropic.com, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: api.anthropic.com
+  - name: openai
+    connect_timeout: 10s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: openai
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: api.openai.com, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: api.openai.com
+  - name: gemini
+    connect_timeout: 10s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: gemini
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: generativelanguage.googleapis.com, port_value: 443 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: generativelanguage.googleapis.com
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }

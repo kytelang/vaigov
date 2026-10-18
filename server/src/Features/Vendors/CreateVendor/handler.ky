@@ -1,0 +1,77 @@
+// POST /vendors (vendor_register) {name, questionnaire?|risk?, review_interval_ms?}
+//   -> {"ok":true,"id":"vnd-...","name","score","band","review_due_ms"}.
+// Reproduces acp-server vendor_register risk scoring (G6).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Vendors.Shared.VendorRepository;
+import Features.Apps.CreateApp.handler;
+
+fn qStr(q: json.JsonValue, key: string): string {
+    if (!json.has(q, key)) { return ""; }
+    return json.asString(json.get(q, key)) ?? "";
+}
+fn qNum(q: json.JsonValue, key: string): long {
+    if (!json.has(q, key)) { return 0; }
+    return json.asNumber(json.get(q, key)) ?? 0;
+}
+
+pub struct CreateVendorHandler impl RouteHandler {
+    repo: VendorRepository,
+    app: AppContext,
+    init(repo: VendorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateVendorHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterApp)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(bodyStr(body, "name"));
+        if (name.length == 0) { return okFalse("name is required"); }
+
+        let score: long = 0;
+        let band = "n/a";
+        let riskJson = "{}";
+        if (json.has(body, "questionnaire")) {
+            let q = json.get(body, "questionnaire");
+            let dr = qStr(q, "data_residency");
+            let sub = qNum(q, "sub_processors");
+            let certs = json.asArray(json.get(q, "certifications"));
+            let nCerts = if (certs != undefined) ((certs ?? list.List<json.JsonValue>()).size()) else (0);
+            let inc = qNum(q, "incidents");
+            if (!(string.eql(dr, "eu") || string.eql(dr, "us") || string.eql(dr, "uk"))) { score = score + 2; }
+            if (sub > 3) { score = score + (sub - 3); }
+            if (nCerts == 0) { score = score + 2; }
+            score = score + inc * 2;
+            band = if (score <= 1) ("low") else (if (score <= 3) ("medium") else (if (score <= 6) ("high") else ("critical")));
+            let rm = Map<string, json.JsonValue>(4, string.hash);
+            rm.set("questionnaire", q);
+            rm.set("score", json.number(score));
+            rm.set("band", json.str(band));
+            riskJson = json.stringify(json.object(rm));
+        } else {
+            if (json.has(body, "risk")) { riskJson = json.stringify(json.get(body, "risk")); }
+        }
+
+        let defaultInterval: long = 7776000000;
+        let interval = json.asNumber(json.get(body, "review_interval_ms")) ?? defaultInterval;
+        let reviewDue = Http.nowMs() + interval;
+        let id = string.concat("vnd-", random.randomHex(6));
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.add(id, name, riskJson, tenant, reviewDue, Http.nowMs());
+
+        let m = Map<string, json.JsonValue>(6, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("name", json.str(name));
+        m.set("score", json.number(score));
+        m.set("band", json.str(band));
+        m.set("review_due_ms", json.number(reviewDue));
+        return Http.okObj(m);
+    }
+}

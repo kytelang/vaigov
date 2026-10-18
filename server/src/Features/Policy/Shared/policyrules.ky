@@ -1,0 +1,54 @@
+// Shared: load the tenant's ENABLED policy_rules from the acp db and shape each
+// into the UI-authored rule JSON that varman-core `rego` compiles/evaluates
+// (match tree + verdict + control tags). Replaces the old in-memory rule list.
+import list;
+import string;
+import map;
+import serde.json;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.Shared.rulebody;
+import Domain.Dtos.RuleListRow;
+
+/// The active (enabled) rules for `tenant`, as the rule-model JSON objects
+/// `rego.compileRules`/`rego.evaluate`/`rego.lint` expect.
+pub async fn activeRuleJson(repo: RuleRepository, tenant: string): list.List<json.JsonValue> {
+    let rows = await repo.list(tenant);
+    let out = list.List<json.JsonValue>();
+    let i = 0;
+    while (i < rows.items.size()) {
+        let r = rows.items.getOr(i, RuleListRow{ rule_id: "", name: "", description: "", subject_json: "{}", resource: "", operation: "", condition_json: "[]", match_json: "{}", approver_group: "", verdict: "deny", obligations_json: "[]", enabled: 1, priority: 100, updated_ms: 0 });
+        if (r.enabled != 0) {
+            let cRows = await repo.controlsFor(r.rule_id);
+            let controls = list.List<json.JsonValue>();
+            let k = 0;
+            while (k < cRows.items.size()) {
+                let c = cRows.items.getOr(k, RuleControlRow{ item_id: "", control_id: "", slug: "" });
+                // Carry each control as {act, control_id} so `decisionJson` can
+                // emit "act:control_id"; a bare string leaves "act" undefined and
+                // every control is silently dropped from the compiled decision.
+                let cm = Map<string, json.JsonValue>(2, string.hash);
+                cm.set("act", json.str(c.slug));
+                cm.set("control_id", json.str(c.control_id));
+                controls.push(json.object(cm));
+                k = k + 1;
+            }
+            let m = Map<string, json.JsonValue>(12, string.hash);
+            m.set("rule_id", json.str(r.rule_id));
+            m.set("id", json.str(r.rule_id));
+            m.set("name", json.str(r.name));
+            m.set("subject", rulebody.ruleParse(r.subject_json, 5));
+            m.set("resource", json.str(r.resource));
+            m.set("operation", json.str(r.operation));
+            m.set("condition", rulebody.ruleParse(r.condition_json, 4));
+            m.set("match", rulebody.ruleParse(r.match_json, 5));
+            m.set("verdict", json.str(r.verdict));
+            m.set("obligations", rulebody.ruleParse(r.obligations_json, 4));
+            m.set("controls", json.array(controls));
+            m.set("priority", json.number(r.priority as long));
+            m.set("approver_group", json.str(r.approver_group));
+            out.push(json.object(m));
+        }
+        i = i + 1;
+    }
+    return out;
+}

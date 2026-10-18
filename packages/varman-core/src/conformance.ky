@@ -1,0 +1,294 @@
+//! Exhaustive conformance engine.
+//!
+//! A port of Rust `acp-core`'s `conformance.rs`. Given a subject profile (the
+//! role played, risk tier, sector, jurisdiction, asset type) this computes which
+//! controls in a framework APPLY and assigns each a conformity state.
+//! "Exhaustive" means every applicable control is assessed and every
+//! non-applicable control is recorded as not-applicable WITH the predicate that
+//! excluded it: that pairing is the definition.
+//!
+//! The applicability predicate is a tiny DSL: conjuncts split on " and ", each
+//! one of "always", "risk_tier in [a, b]", "role=X", "asset_type=X", "sector=X",
+//! "jurisdiction=X". An unrecognised conjunct is permissive (treated as
+//! satisfied), so an unknown predicate never silently excludes a control.
+
+import string;
+import list;
+import controls;
+
+/// What a subject IS, for deciding which controls bind it. Empty or undefined
+/// fields do not gate. A reference type: it owns the `roles` list.
+pub class SubjectProfile {
+    /// provider, deployer, developer, importer, distributor, controller, processor.
+    pub roles: List<string>,
+    /// EU-style risk tier: unacceptable, high, limited, minimal. undefined when
+    /// the framework has no tier.
+    pub riskTier: string | undefined,
+    pub sector: string | undefined,
+    pub jurisdiction: string | undefined,
+    /// gpai, gpai_systemic, and similar asset qualifiers.
+    pub assetType: string | undefined,
+
+    init(roles: List<string>, riskTier: string | undefined, sector: string | undefined, jurisdiction: string | undefined, assetType: string | undefined) {
+        self.roles = roles;
+        self.riskTier = riskTier;
+        self.sector = sector;
+        self.jurisdiction = jurisdiction;
+        self.assetType = assetType;
+    }
+}
+
+/// The conformity state of a single control for a subject. Serde in Rust renders
+/// these kebab-case; `toSnake` reproduces those wire strings.
+pub enum Conformity {
+    Conformant,
+    Partial,
+    NonConformant,
+    NotApplicable,
+    NotAssessed,
+
+    pub fn toSnake(self: Conformity): string {
+        switch (self) {
+            case Conformity.Conformant: { return "conformant"; }
+            case Conformity.Partial: { return "partial"; }
+            case Conformity.NonConformant: { return "non-conformant"; }
+            case Conformity.NotApplicable: { return "not-applicable"; }
+            case Conformity.NotAssessed: { return "not-assessed"; }
+            default: { return "not-assessed"; }
+        }
+    }
+}
+
+/// Whether a control applies to a subject, and if not, the reason it was excluded.
+pub struct ApplyResult {
+    pub ok: bool,
+    pub reason: string,
+
+    init(ok: bool, reason: string) {
+        self.ok = ok;
+        self.reason = reason;
+    }
+}
+
+/// One control's assessment for a subject: whether it applies, its conformity
+/// state, and (for a non-applicable control) the predicate that excluded it.
+pub struct ControlAssessment {
+    pub framework: string,
+    pub controlId: string,
+    pub title: string,
+    pub reference: string,
+    pub obligationType: string,
+    pub applicable: bool,
+    pub conformity: Conformity,
+    pub exclusionReason: string,
+
+    init(framework: string, controlId: string, title: string, reference: string, obligationType: string, applicable: bool, conformity: Conformity, exclusionReason: string) {
+        self.framework = framework;
+        self.controlId = controlId;
+        self.title = title;
+        self.reference = reference;
+        self.obligationType = obligationType;
+        self.applicable = applicable;
+        self.conformity = conformity;
+        self.exclusionReason = exclusionReason;
+    }
+}
+
+/// A roll-up of an assessment: counts by conformity state and an applicable
+/// total, so a report can prove exhaustiveness (applicable + not_applicable ==
+/// total, zero not-assessed once complete).
+pub struct ConformitySummary {
+    pub total: int,
+    pub applicable: int,
+    pub notApplicable: int,
+    pub conformant: int,
+    pub partial: int,
+    pub nonConformant: int,
+    pub notAssessed: int,
+
+    init(total: int, applicable: int, notApplicable: int, conformant: int, partial: int, nonConformant: int, notAssessed: int) {
+        self.total = total;
+        self.applicable = applicable;
+        self.notApplicable = notApplicable;
+        self.conformant = conformant;
+        self.partial = partial;
+        self.nonConformant = nonConformant;
+        self.notAssessed = notAssessed;
+    }
+}
+
+// --- predicate DSL ----------------------------------------------------------
+
+// Split a predicate on " and " into its trimmed, non-empty conjuncts.
+fn conjuncts(pred: string): List<string> {
+    let out = List<string>();
+    let parts = string.split(pred, " and ");
+    let i = 0;
+    while (i < parts.size()) {
+        let p = string.trim(parts.at(i));
+        if (string.len(p) > 0) { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// The remainder of `s` after `prefix` (caller has already checked startsWith).
+fn after(s: string, prefix: string): string {
+    return string.slice(s, string.len(prefix), string.len(s));
+}
+
+// Parse the members of a "[a, b, c]" list.
+fn inList(rest: string): List<string> {
+    let out = List<string>();
+    let t = string.trim(rest);
+    let n = string.len(t);
+    let start = 0;
+    let end = n;
+    if (n > 0 && string.eql(string.charAt(t, 0), "[")) { start = 1; }
+    if (end > start && string.eql(string.charAt(t, end - 1), "]")) { end = end - 1; }
+    let inner = string.slice(t, start, end);
+    let parts = string.split(inner, ",");
+    let i = 0;
+    while (i < parts.size()) {
+        let p = string.trim(parts.at(i));
+        if (string.len(p) > 0) { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Membership test over a List<string> using value (string) equality.
+fn memberOf(xs: List<string>, v: string): bool {
+    let i = 0;
+    while (i < xs.size()) {
+        if (string.eql(xs.at(i), v)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Evaluate one conjunct against the profile. An unrecognised conjunct is
+// permissive (satisfied): an unknown predicate never silently excludes.
+fn evalConjunct(c: string, p: SubjectProfile): bool {
+    if (string.eql(c, "always")) { return true; }
+    if (string.startsWith(c, "risk_tier in ")) {
+        let set = inList(after(c, "risk_tier in "));
+        let t = p.riskTier ?? "";
+        if (string.len(t) == 0) { return false; }
+        return memberOf(set, t);
+    }
+    if (string.startsWith(c, "role=")) {
+        return memberOf(p.roles, string.trim(after(c, "role=")));
+    }
+    if (string.startsWith(c, "asset_type=")) {
+        return string.eql(p.assetType ?? "", string.trim(after(c, "asset_type=")));
+    }
+    if (string.startsWith(c, "sector=")) {
+        return string.eql(p.sector ?? "", string.trim(after(c, "sector=")));
+    }
+    if (string.startsWith(c, "jurisdiction=")) {
+        return string.eql(p.jurisdiction ?? "", string.trim(after(c, "jurisdiction=")));
+    }
+    return true;
+}
+
+// Does a control's role binding overlap the subject's roles? A control with no
+// declared roles binds any subject, and a subject with no roles is bound by any.
+fn roleMatch(controlRoles: List<string>, subjectRoles: List<string>): bool {
+    if (controlRoles.size() == 0) { return true; }
+    if (subjectRoles.size() == 0) { return true; }
+    let i = 0;
+    while (i < controlRoles.size()) {
+        if (memberOf(subjectRoles, controlRoles.at(i))) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether a control applies to a subject, and if not, the reason. Applies when
+/// its applicability predicate holds AND its role binding overlaps the subject's.
+pub fn applies(c: controls.Control, p: SubjectProfile): ApplyResult {
+    let conj = conjuncts(c.applicability);
+    let i = 0;
+    while (i < conj.size()) {
+        let one = conj.at(i);
+        if (!evalConjunct(one, p)) {
+            return ApplyResult(false, string.concat("predicate not met: ", one));
+        }
+        i = i + 1;
+    }
+    if (!roleMatch(c.roles, p.roles)) {
+        let msg = string.concat("binds roles [", string.join(c.roles, ", "));
+        msg = string.concat(msg, "], subject is [");
+        msg = string.concat(msg, string.join(p.roles, ", "));
+        msg = string.concat(msg, "]");
+        return ApplyResult(false, msg);
+    }
+    return ApplyResult(true, "");
+}
+
+/// The applicable controls of a framework for a subject.
+pub fn applicable(framework: string, p: SubjectProfile): List<controls.Control> {
+    let out = List<controls.Control>();
+    let cs = controls.forFramework(framework);
+    let i = 0;
+    while (i < cs.size()) {
+        let c = cs.at(i);
+        if (applies(c, p).ok) { out.push(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Assess every control of a framework for a subject. `satisfied` holds the
+/// control ids carrying sufficient evidence; `partial` holds those with some but
+/// not sufficient evidence. Applicable controls in neither set are NotAssessed;
+/// non-applicable controls are NotApplicable with the exclusion reason. This is
+/// the exhaustive per-control result the reports render.
+pub fn assessFramework(framework: string, p: SubjectProfile, satisfied: List<string>, partial: List<string>): List<ControlAssessment> {
+    let out = List<ControlAssessment>();
+    let cs = controls.forFramework(framework);
+    let i = 0;
+    while (i < cs.size()) {
+        let c = cs.at(i);
+        let r = applies(c, p);
+        let state = Conformity.NotApplicable;
+        if (r.ok) {
+            if (memberOf(satisfied, c.id)) {
+                state = Conformity.Conformant;
+            } else if (memberOf(partial, c.id)) {
+                state = Conformity.Partial;
+            } else {
+                state = Conformity.NotAssessed;
+            }
+        }
+        out.push(ControlAssessment(c.framework, c.id, c.title, c.reference, c.obligationType, r.ok, state, r.reason));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Roll up an assessment into counts. `applicable + not_applicable == total`.
+pub fn summarise(rows: List<ControlAssessment>): ConformitySummary {
+    let total = rows.size();
+    let applicable = 0;
+    let notApplicable = 0;
+    let conformant = 0;
+    let partial = 0;
+    let nonConformant = 0;
+    let notAssessed = 0;
+    let i = 0;
+    while (i < rows.size()) {
+        let r = rows.at(i);
+        switch (r.conformity) {
+            case Conformity.NotApplicable: { notApplicable = notApplicable + 1; }
+            case Conformity.Conformant: { applicable = applicable + 1; conformant = conformant + 1; }
+            case Conformity.Partial: { applicable = applicable + 1; partial = partial + 1; }
+            case Conformity.NonConformant: { applicable = applicable + 1; nonConformant = nonConformant + 1; }
+            case Conformity.NotAssessed: { applicable = applicable + 1; notAssessed = notAssessed + 1; }
+            default: { }
+        }
+        i = i + 1;
+    }
+    return ConformitySummary(total, applicable, notApplicable, conformant, partial, nonConformant, notAssessed);
+}

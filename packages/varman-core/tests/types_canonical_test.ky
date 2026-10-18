@@ -1,0 +1,292 @@
+//! Known-answer gate for the Varman trust core, slice 2:
+//! types + canonical JSON + STH signing + in-memory ledger.
+//!
+//! The canonical cross-check is a REAL known answer: EXPECTED_CANON is the exact
+//! compact sorted image of a known nested object, and EXPECTED_CANON_SHA is its
+//! SHA-256 computed independently in the shell:
+//!   printf '%s' '{"a":[3,2,1],"b":{"c":1,"d":2},"z":"hi"}' | shasum -a 256
+//! The Ed25519 keypair is RFC 8032 test 2's seed (reused from slice 1).
+
+import bytes;
+import list;
+import string;
+import assert;
+import serde.json;
+import hashing;
+import merkle;
+import sign;
+import types;
+import canonical;
+import ledger;
+
+// Exact canonical image of {"a":[3,2,1],"b":{"c":1,"d":2},"z":"hi"} and its
+// shell-computed SHA-256.
+const EXPECTED_CANON: string = `{"a":[3,2,1],"b":{"c":1,"d":2},"z":"hi"}`;
+const EXPECTED_CANON_SHA: string = "5f29b5270278e204d9b88bc3546e715fdf0c8b01ac5291483efcfe286f2c16db";
+
+const ED_SEED: string = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+
+// --- helpers ----------------------------------------------------------------
+
+fn sampleImpact(): types.Impact {
+    return types.Impact(types.BlastRadius.High, "impact@1.3");
+}
+
+fn sampleProvenance(): types.Provenance {
+    return types.Provenance("sha256", "ed25519", "cedar@0.1", "varman@0.1", "ctx@2");
+}
+
+// A fully-populated record, built the same way every time so its canonical
+// bytes are deterministic.
+fn sampleRecord(): types.Record {
+    return types.Record(
+        1,                                  // schema
+        7,                                  // seq
+        1700000000000,                      // tsMs
+        "hlc-001",                          // hlc
+        "fp:abcd",                          // toolServerFingerprint
+        "agent-9",                          // agentId
+        types.Principal("alice", true),     // principal
+        "sess-42",                          // sessionId
+        "fs.write",                         // tool
+        "deadbeef",                         // argsHash
+        sampleImpact(),                     // impact
+        types.Verdict.StepUp,               // verdict
+        "rule-7",                           // ruleId
+        "path startsWith /etc",             // matched
+        "policyhashxyz",                    // policyHash
+        "needs approval",                   // reason
+        sampleProvenance()                  // provenance
+    );
+}
+
+// --- enums ------------------------------------------------------------------
+
+@test
+fn verdict_snake_round_trips(): void {
+    assert.equalStr(types.Verdict.Allow.toSnake(), "allow");
+    assert.equalStr(types.Verdict.Deny.toSnake(), "deny");
+    assert.equalStr(types.Verdict.StepUp.toSnake(), "step_up");
+    assert.equalStr(types.Verdict.Shadow.toSnake(), "shadow");
+
+    // string -> enum -> string must round-trip.
+    assert.equalStr(types.Verdict.fromSnake("allow").toSnake(), "allow");
+    assert.equalStr(types.Verdict.fromSnake("deny").toSnake(), "deny");
+    assert.equalStr(types.Verdict.fromSnake("step_up").toSnake(), "step_up");
+    assert.equalStr(types.Verdict.fromSnake("shadow").toSnake(), "shadow");
+}
+
+@test
+fn blast_radius_and_outcome_snake_round_trips(): void {
+    assert.equalStr(types.BlastRadius.Low.toSnake(), "low");
+    assert.equalStr(types.BlastRadius.Medium.toSnake(), "medium");
+    assert.equalStr(types.BlastRadius.High.toSnake(), "high");
+    assert.equalStr(types.BlastRadius.fromSnake("medium").toSnake(), "medium");
+    assert.equalStr(types.BlastRadius.fromSnake("high").toSnake(), "high");
+
+    assert.equalStr(types.OutcomeKind.Forwarded.toSnake(), "forwarded");
+    assert.equalStr(types.OutcomeKind.NotExecuted.toSnake(), "not_executed");
+    assert.equalStr(types.OutcomeKind.EvalError.toSnake(), "eval_error");
+    assert.equalStr(types.OutcomeKind.fromSnake("not_executed").toSnake(), "not_executed");
+    assert.equalStr(types.OutcomeKind.fromSnake("eval_error").toSnake(), "eval_error");
+}
+
+@test
+fn verdict_rank_precedence(): void {
+    // deny > step_up > shadow > allow
+    assert.gt(types.rank(types.Verdict.Deny), types.rank(types.Verdict.StepUp));
+    assert.gt(types.rank(types.Verdict.StepUp), types.rank(types.Verdict.Shadow));
+    assert.gt(types.rank(types.Verdict.Shadow), types.rank(types.Verdict.Allow));
+
+    assert.equalStr(types.maxVerdict(types.Verdict.Allow, types.Verdict.Deny).toSnake(), "deny");
+    assert.equalStr(types.maxVerdict(types.Verdict.Shadow, types.Verdict.StepUp).toSnake(), "step_up");
+    assert.equalStr(types.maxVerdict(types.Verdict.Allow, types.Verdict.Shadow).toSnake(), "shadow");
+    assert.equalStr(types.maxVerdict(types.Verdict.Allow, types.Verdict.Allow).toSnake(), "allow");
+}
+
+// --- canonical bytes --------------------------------------------------------
+
+@test
+fn canonical_is_byte_exact_and_order_independent(): void {
+    // Same object, keys inserted in two different orders (outer and inner).
+    let a = json.parse(`{"z":"hi","b":{"d":2,"c":1},"a":[3,2,1]}`);
+    let b = json.parse(`{"a":[3,2,1],"b":{"c":1,"d":2},"z":"hi"}`);
+    let ca = canonical.canonicalBytesOfJson(a);
+    let cb = canonical.canonicalBytesOfJson(b);
+
+    // Order-independent: identical canonical bytes regardless of insertion order.
+    assert.isTrue(string.eql(ca, cb));
+    // Byte-exact against the hand-written expected compact sorted string.
+    assert.equalStr(ca, EXPECTED_CANON);
+}
+
+@test
+fn canonical_sha_matches_shell(): void {
+    // Cross-check: SHA-256 of the expected canonical string equals the value
+    // computed independently with `shasum -a 256`.
+    assert.equalStr(canonical.sha256HexOfString(EXPECTED_CANON), EXPECTED_CANON_SHA);
+    // And hashing the canonical bytes we actually produce agrees.
+    let v = json.parse(`{"z":"hi","b":{"d":2,"c":1},"a":[3,2,1]}`);
+    assert.equalStr(canonical.sha256HexOfJson(v), EXPECTED_CANON_SHA);
+}
+
+@test
+fn jcs_integer_valued_float_normalises(): void {
+    // JCS rule: 1.0 canonicalises to 1.
+    let v = json.parse(`{"x":1.0}`);
+    assert.equalStr(canonical.canonicalBytesOfJson(v), `{"x":1}`);
+    // A genuine fraction is preserved.
+    let w = json.parse(`{"x":0.5}`);
+    assert.equalStr(canonical.canonicalBytesOfJson(w), `{"x":0.5}`);
+}
+
+// --- record canonicalisation ------------------------------------------------
+
+@test
+fn record_canonicalises_deterministically(): void {
+    let r1 = sampleRecord();
+    let r2 = sampleRecord();
+    // Same record value -> identical canonical bytes and identical hash.
+    assert.isTrue(string.eql(canonical.recordCanonicalBytes(r1), canonical.recordCanonicalBytes(r2)));
+    assert.equalStr(canonical.recordSha256Hex(r1), canonical.recordSha256Hex(r2));
+
+    // Hash is a stable 64-char hex string.
+    let h = canonical.recordSha256Hex(r1);
+    assert.equalInt(h.length, 64);
+
+    // A changed field changes the canonical bytes (and therefore the hash).
+    let r3 = types.Record(
+        1, 7, 1700000000000, "hlc-001", "fp:abcd", "agent-9",
+        types.Principal("alice", true), "sess-42", "fs.write", "deadbeef",
+        sampleImpact(), types.Verdict.Deny,  // verdict changed StepUp -> Deny
+        "rule-7", "path startsWith /etc", "policyhashxyz", "needs approval",
+        sampleProvenance());
+    assert.isFalse(string.eql(canonical.recordCanonicalBytes(r1), canonical.recordCanonicalBytes(r3)));
+}
+
+@test
+fn args_hash_is_stable_and_order_independent(): void {
+    // argsHash = sha256 over canonical args JSON; stable and key-order-free.
+    let a1 = json.parse(`{"path":"/etc/passwd","mode":"r"}`);
+    let a2 = json.parse(`{"mode":"r","path":"/etc/passwd"}`);
+    let h1 = canonical.sha256HexOfJson(a1);
+    let h2 = canonical.sha256HexOfJson(a2);
+    assert.equalStr(h1, h2);
+    assert.equalInt(h1.length, 64);
+}
+
+// --- STH signing ------------------------------------------------------------
+
+@test
+fn sth_sign_then_verify_accepts(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let sth = types.SignedTreeHead(4, "11170c8d45f48eb6ec89abd8dd8b6e07d153db5e70f8083841d6bb5e00f3f9f0", 1700000000000);
+    let sig = sign.signSth(kp.privHex, sth);
+    assert.isTrue(sign.verifySth(kp.pubHex, sth, sig));
+}
+
+@test
+fn sth_mutated_size_or_root_rejected(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let root = "11170c8d45f48eb6ec89abd8dd8b6e07d153db5e70f8083841d6bb5e00f3f9f0";
+    let sth = types.SignedTreeHead(4, root, 1700000000000);
+    let sig = sign.signSth(kp.privHex, sth);
+
+    // Mutated tree size must not verify under the original signature.
+    let badSize = types.SignedTreeHead(5, root, 1700000000000);
+    assert.isFalse(sign.verifySth(kp.pubHex, badSize, sig));
+
+    // Mutated root must not verify either.
+    let badRoot = types.SignedTreeHead(4, "00170c8d45f48eb6ec89abd8dd8b6e07d153db5e70f8083841d6bb5e00f3f9f0", 1700000000000);
+    assert.isFalse(sign.verifySth(kp.pubHex, badRoot, sig));
+}
+
+@test
+fn detached_pack_round_trips_and_is_tamper_evident(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let body = json.parse(`{"@type":"acp:ComplianceReport","conformsTo":"EU AI Act","coverage":40}`);
+    let canon = canonical.canonicalBytesOfJson(body);
+    let sig = sign.signHex(kp.privHex, canon as ptr, canon.length);
+
+    let pack = json.parse(`{}`);
+    let pm = json.asObject(pack) ?? Map<string, json.JsonValue>(8, string.hash);
+    pm.set("body", body);
+    pm.set("pubkey_hex", json.str(kp.pubHex));
+    pm.set("sig_hex", json.str(sig));
+    assert.isTrue(sign.verifyDetachedPack(pack));
+
+    // Tamper the body: verification must fail.
+    let bodyBad = json.parse(`{"@type":"acp:ComplianceReport","conformsTo":"EU AI Act","coverage":99}`);
+    let packBad = json.parse(`{}`);
+    let pmb = json.asObject(packBad) ?? Map<string, json.JsonValue>(8, string.hash);
+    pmb.set("body", bodyBad);
+    pmb.set("pubkey_hex", json.str(kp.pubHex));
+    pmb.set("sig_hex", json.str(sig));
+    assert.isFalse(sign.verifyDetachedPack(packBad));
+
+    // Missing fields are rejected, not crashed.
+    assert.isFalse(sign.verifyDetachedPack(json.parse(`{"body":{}}`)));
+}
+
+// --- ledger -----------------------------------------------------------------
+
+@test
+fn ledger_appends_signs_and_verifies(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let led = ledger.Ledger(kp.privHex, kp.pubHex);
+
+    // Append several records.
+    let i = 0;
+    while (i < 4) {
+        let r = types.Record(
+            1, i as long, 1700000000000, "hlc", undefined, "agent",
+            types.Principal("p", false), "sess", "tool", "argh",
+            sampleImpact(), types.Verdict.Allow,
+            undefined, undefined, "ph", undefined, sampleProvenance());
+        led.appendRecord(r);
+        i = i + 1;
+    }
+    assert.equalInt(led.size(), 4);
+
+    // The signed head verifies under the public key.
+    let sh = led.signedHead(kp.privHex);
+    assert.equalInt(sh.sth.treeSize as int, 4);
+    assert.isTrue(sign.verifySth(kp.pubHex, sh.sth, sh.sigHex));
+
+    // Whole-ledger verify (every stored head signature + consistency).
+    assert.isTrue(led.verify(kp.pubHex));
+
+    // A wrong public key must fail verification.
+    let other = sign.keypairFromSeedHex("00000000000000000000000000000000000000000000000000000000000000ff");
+    assert.isFalse(led.verify(other.pubHex));
+}
+
+@test
+fn ledger_consistency_between_sizes_via_slice1(): void {
+    let kp = sign.keypairFromSeedHex(ED_SEED);
+    let led = ledger.Ledger(kp.privHex, kp.pubHex);
+    let i = 0;
+    while (i < 4) {
+        let r = types.Record(
+            1, i as long, 1700000000000, "hlc", undefined, "agent",
+            types.Principal("p", false), "sess", "tool", "argh",
+            sampleImpact(), types.Verdict.Allow,
+            undefined, undefined, "ph", undefined, sampleProvenance());
+        led.appendRecord(r);
+        i = i + 1;
+    }
+
+    // Slice-1 verifyConsistency between size 2 and size 4.
+    let root2 = led.rootAtSize(2);
+    let root4 = led.rootAtSize(4);
+    let proof = led.log.consistencyProof(2) ?? List<string>();
+    assert.isTrue(merkle.verifyConsistency(2, root2, 4, root4, proof));
+
+    // And between size 1 and size 4.
+    let root1 = led.rootAtSize(1);
+    let proof1 = led.log.consistencyProof(1) ?? List<string>();
+    assert.isTrue(merkle.verifyConsistency(1, root1, 4, root4, proof1));
+
+    // A tampered first root must be rejected.
+    assert.isFalse(merkle.verifyConsistency(2, root1, 4, root4, proof));
+}

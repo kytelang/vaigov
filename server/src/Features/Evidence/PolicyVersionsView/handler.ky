@@ -1,0 +1,76 @@
+// GET /policy-versions/view -> the Policy versions hypermedia view (Datastar
+// fragment), matching acp/console PolicyVersionsView.vue. Lists the policy_bundle
+// artifact(s) and their version history, marking the active and baseline versions.
+import ds_response;
+import list;
+import string;
+import serde.json;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Evidence.Shared.EvidenceRepository;
+import Features.Evidence.views.versions;
+import Domain.Dtos.IngestedRow;
+
+// Rebuild the version-history groups for the tenant's policy bundle(s).
+async fn pvGroups(repo: EvidenceRepository, tenant: string): list.List<versions.VersionGroup> {
+    let arts = await repo.listArtifacts(tenant, "policy_bundle");
+    let groups = list.List<versions.VersionGroup>();
+    let i = 0;
+    while (i < arts.items.size()) {
+        let a = arts.items.getOr(i, ArtifactRow{ artifact_id: "", kind: "", name: "", scope: "", active_version: "", baseline_version: "", versions: 0, updated_ms: 0 });
+        let vs = await repo.listVersions(a.artifact_id);
+        let label = if (a.name.length > 0) (a.name) else ("Compiled policy");
+        groups.push(versions.VersionGroup(a.artifact_id, label, a.active_version, a.baseline_version, vs.items));
+        i = i + 1;
+    }
+    return groups;
+}
+
+fn pvSig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+
+pub struct PolicyVersionsViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: EvidenceRepository,
+    init(app: AppContext) { self.app = app; self.repo = EvidenceRepository(app.db); }
+
+    async fn serve(self: PolicyVersionsViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let groups = await pvGroups(self.repo, tenant);
+        return await ds_response.patch(versions.versionsPanel(groups));
+    }
+}
+
+// POST /console/policy-versions/activate -> roll the active pointer to a version.
+pub struct PvActivateHandler impl RouteHandler {
+    app: AppContext,
+    repo: EvidenceRepository,
+    init(app: AppContext) { self.app = app; self.repo = EvidenceRepository(app.db); }
+    async fn serve(self: PvActivateHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let aid = pvSig(body, "pvArtifact");
+        let vid = pvSig(body, "pvVersion");
+        if (aid.length > 0 && vid.length > 0) { let _ok = await self.repo.setPointer(aid, "active", vid, Http.nowMs()); }
+        let groups = await pvGroups(self.repo, tenant);
+        return await ConsoleDs.patchAndSignals(versions.versionsPanel(groups), "{\"pvArtifact\":\"\",\"pvVersion\":\"\"}");
+    }
+}
+
+// POST /console/policy-versions/baseline -> mark a version as the audit baseline.
+pub struct PvBaselineHandler impl RouteHandler {
+    app: AppContext,
+    repo: EvidenceRepository,
+    init(app: AppContext) { self.app = app; self.repo = EvidenceRepository(app.db); }
+    async fn serve(self: PvBaselineHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let aid = pvSig(body, "pvArtifact");
+        let vid = pvSig(body, "pvVersion");
+        if (aid.length > 0 && vid.length > 0) { let _ok = await self.repo.setPointer(aid, "baseline", vid, Http.nowMs()); }
+        let groups = await pvGroups(self.repo, tenant);
+        return await ConsoleDs.patchAndSignals(versions.versionsPanel(groups), "{\"pvArtifact\":\"\",\"pvVersion\":\"\"}");
+    }
+}

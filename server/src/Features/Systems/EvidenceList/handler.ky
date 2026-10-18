@@ -1,0 +1,45 @@
+// GET /systems/{id}/evidence -> {"evidence":[{id,framework,control_id,title,source,owner,produced_ms,valid_until_ms,fresh}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Systems.Shared.SystemRepository;
+import Domain.Dtos.SystemDtos;
+
+pub struct EvidenceListHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EvidenceListHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listEvidence(id, tenant);
+        let now = Http.nowMs();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let e = rows.items.getOr(i, SystemEvidenceRow{ id:"", framework:"", control_id:"", title:"", source:"", owner:"", produced_ms:0, valid_until_ms:0 });
+            let fresh = e.valid_until_ms == 0 || e.valid_until_ms > now;
+            let m = Map<string, json.JsonValue>(10, string.hash);
+            m.set("id", json.str(e.id));
+            m.set("framework", json.str(e.framework));
+            m.set("control_id", json.str(e.control_id));
+            m.set("title", json.str(e.title));
+            m.set("source", json.str(e.source));
+            m.set("owner", json.str(e.owner));
+            m.set("produced_ms", json.number(e.produced_ms));
+            m.set("valid_until_ms", json.number(e.valid_until_ms));
+            m.set("fresh", json.bool(fresh));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("evidence", json.array(arr));
+        return Http.okObj(out);
+    }
+}

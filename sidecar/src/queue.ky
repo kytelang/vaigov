@@ -1,0 +1,100 @@
+//! A local, file-backed, durable violation queue (store-and-forward).
+//!
+//! This replaces the Rust sidecar's SQLite queue with a plain append file, as
+//! the Varman sidecar design mandates. The contract is the one that matters for
+//! "never lose a violation": a record is durably on disk BEFORE the ingest
+//! endpoint acknowledges it, and the background flusher only removes records the
+//! control plane has confirmed.
+//!
+//! On-disk framing is length-prefixed so a record body may contain ANY bytes
+//! (newlines, NULs, gzip) without ambiguity. Each record is:
+//!
+//!     <ascii-decimal-length>\n<body-bytes>
+//!
+//! records laid end to end. Appends use `File.appendText` (one `open`/`write`/
+//! `close`), so a crash can at worst leave a half-written trailing frame, which
+//! the parser discards; every fully-written earlier record survives and is
+//! re-read on the next open (durability across restart).
+
+import io.file;
+import string;
+import list;
+import bytes;
+
+/// A durable queue backed by the file at `path`.
+pub class Queue {
+    pub path: string,
+
+    init(path: string) {
+        self.path = path;
+    }
+
+    /// Appends one record, framed with its byte length. Durable once this
+    /// returns: the bytes are flushed to the file before the caller acks.
+    pub fn append(self: Queue, body: string): void {
+        File.appendText(self.path, `${body.length}\n` + body);
+    }
+
+    /// Reads and returns every intact record, in insertion order. A trailing
+    /// partial frame (torn write) is ignored.
+    pub fn readAll(self: Queue): list.List<string> {
+        let out = list.List<string>();
+        if (!File.exists(self.path)) { return out; }
+        let data = File.readText(self.path);
+        let n = data.length;
+        let pos = 0;
+        while (pos < n) {
+            // Parse the length prefix up to the newline.
+            let nl = pos;
+            while (nl < n && data[nl] != 10) { nl = nl + 1; }
+            if (nl >= n) { break; } // no newline: torn frame, stop.
+            let len = string.parseInt(string.slice(data, pos, nl)) ?? -1;
+            if (len < 0) { break; }
+            let bodyStart = nl + 1;
+            let bodyEnd = bodyStart + len;
+            if (bodyEnd > n) { break; } // body not fully written: torn frame.
+            out.push(string.slice(data, bodyStart, bodyEnd));
+            pos = bodyEnd;
+        }
+        return out;
+    }
+
+    /// The number of intact queued records.
+    pub fn count(self: Queue): int {
+        return self.readAll().size();
+    }
+
+    /// Returns up to `limit` records from the front of the queue, in order.
+    pub fn batch(self: Queue, limit: int): list.List<string> {
+        let all = self.readAll();
+        if (all.size() <= limit) { return all; }
+        let out = list.List<string>();
+        let i = 0;
+        while (i < limit) { out.push(all.get(i) ?? ""); i = i + 1; }
+        return out;
+    }
+
+    /// Removes the first `n` records (the ones a flush confirmed), rewriting the
+    /// file with the remainder. This is the "delete confirmed rows" step.
+    pub fn removeConfirmed(self: Queue, n: int): void {
+        let all = self.readAll();
+        self.rewriteFrom(all, n);
+    }
+
+    /// Replaces the whole queue file with records `all[from..]`, re-framed.
+    fn rewriteFrom(self: Queue, all: list.List<string>, from: int): void {
+        let sb = "";
+        let i = from;
+        while (i < all.size()) {
+            let body = all.get(i) ?? "";
+            sb = sb + `${body.length}\n` + body;
+            i = i + 1;
+        }
+        File.writeText(self.path, sb);
+    }
+
+    /// Drops every record (used after a full drain, or to reset in tests).
+    pub fn truncate(self: Queue): void {
+        File.writeText(self.path, "");
+    }
+}

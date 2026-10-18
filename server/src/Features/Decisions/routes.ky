@@ -1,0 +1,21 @@
+// Decisions feature route table (acp-compatible JSON over the shared `acp` db):
+// the OPA decision-log sink + the compliance read-side. Only registration here;
+// shared parse/SQL helpers in Shared/decisionlog.ky + Shared/DecisionRepository.ky,
+// each handler in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Decisions.IngestLogs.handler;
+import Features.Decisions.ListDecisions.handler;
+import Features.Decisions.DecisionSummary.handler;
+import Features.Decisions.Coverage.handler;
+import Features.Decisions.CoverageView.handler;
+import Features.Decisions.DecisionsView.handler;
+
+pub fn registerDecisions(ctx: AppContext): void {
+    ctx.app.post("/logs", LogsHandler(ctx));
+    ctx.app.get("/decisions/view", DecisionsViewHandler(ctx));
+    ctx.app.get("/decisions", DecisionsHandler(ctx));
+    ctx.app.get("/compliance/decision-summary", DecisionSummaryHandler(ctx));
+    ctx.app.get("/compliance/coverage", CoverageHandler(ctx));
+    ctx.app.get("/coverage/view", CoverageViewHandler(ctx));
+}

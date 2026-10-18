@@ -1,0 +1,9 @@
+import assert;
+import entra;
+
+@test
+fn test_construct(): void {
+    let e = entra.Entra("tenant-1", "client-1", "secret-1");
+    assert.equalStr(e.tenantId, "tenant-1");
+    assert.equalStr(e.clientId, "client-1");
+}

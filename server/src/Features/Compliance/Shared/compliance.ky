@@ -1,0 +1,56 @@
+//! Shared compliance helpers: entity -> JSON projections and the subject profile.
+import string;
+import list;
+import map;
+import serde.json;
+import controls;
+import conformance;
+import Shared.Http;
+import web.routing;
+
+pub fn controlToJson(c: controls.Control): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("framework", json.str(c.framework));
+    m.set("id", json.str(c.id));
+    m.set("title", json.str(c.title));
+    m.set("reference", json.str(c.reference));
+    m.set("obligation_type", json.str(c.obligationType));
+    m.set("applicability", json.str(c.applicability));
+    m.set("roles", Http.strList(c.roles));
+    m.set("crosswalk", Http.strList(c.crosswalk));
+    return json.object(m);
+}
+
+// The subject profile from the query string. `role` may be comma-separated;
+// defaults to [provider] with risk tier high (the common EU AI Act subject).
+pub fn profileFromQuery(ctx: routing.Context): conformance.SubjectProfile {
+    let roles = List<string>();
+    let roleStr = ctx.query("role");
+    if (roleStr.length > 0) {
+        let parts = string.split(roleStr, ",");
+        let i = 0;
+        while (i < parts.size()) {
+            let p = string.trim(parts.at(i));
+            if (p.length > 0) { roles.push(p); }
+            i = i + 1;
+        }
+    } else {
+        roles.push("provider");
+    }
+    let riskTier = Http.optQuery(ctx, "risk_tier");
+    if (riskTier == undefined) { riskTier = "high"; }
+    return conformance.SubjectProfile(roles, riskTier, Http.optQuery(ctx, "sector"), Http.optQuery(ctx, "jurisdiction"), Http.optQuery(ctx, "asset_type"));
+}
+
+pub fn assessmentToJson(a: conformance.ControlAssessment): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("framework", json.str(a.framework));
+    m.set("control_id", json.str(a.controlId));
+    m.set("title", json.str(a.title));
+    m.set("reference", json.str(a.reference));
+    m.set("obligation_type", json.str(a.obligationType));
+    m.set("applicable", json.bool(a.applicable));
+    m.set("conformity", json.str(a.conformity.toSnake()));
+    m.set("exclusion_reason", json.str(a.exclusionReason));
+    return json.object(m);
+}

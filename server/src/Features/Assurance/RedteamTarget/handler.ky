@@ -1,0 +1,28 @@
+// POST /redteam/target -> runs the corpus against a named target without persisting
+// an attestation; returns {"ok":true,"id","attacks","caught","catch_rate","passed"}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.asr;
+
+pub struct RedteamTargetHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: RedteamTargetHandler, ctx: routing.Context): response.Response {
+        let minCatch = 0.75;
+        let evalj = asr.asrEvalRedteam();
+        let cr = json.asFloat(json.get(evalj, "catch_rate")) ?? 0.0;
+        let passed = cr >= minCatch;
+        let id = string.concat("rtt-", random.randomHex(6));
+        let m = Map<string, json.JsonValue>(6, string.hash);
+        m.set("ok", json.bool(true)); m.set("id", json.str(id));
+        m.set("attacks", json.get(evalj, "attacks")); m.set("caught", json.get(evalj, "caught"));
+        m.set("catch_rate", json.get(evalj, "catch_rate")); m.set("passed", json.bool(passed));
+        return Http.okObj(m);
+    }
+}

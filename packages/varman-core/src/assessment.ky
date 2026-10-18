@@ -1,0 +1,161 @@
+//! AI system assessment: EU AI Act risk tiering and obligations.
+//!
+//! A port of Rust `acp-core`'s `assessment.rs` (the `RiskTier` / `Screening` /
+//! `classify_tier` / `obligations_for` core; the signing wrapper and the
+//! signal-derivation helper are out of scope for this compliance layer). The
+//! rules are deterministic over a small questionnaire, not a legal opinion:
+//! they produce the tier and the obligations (controls) to satisfy, which an
+//! assessor then works. The obligation ids are pulled from the `controls`
+//! catalogue, so they stay in lock-step with the control library.
+
+import string;
+import list;
+import controls;
+
+/// EU AI Act risk tiers. Serde in Rust renders these kebab-case; `toSnake`
+/// reproduces those wire strings.
+pub enum RiskTier {
+    Unacceptable,
+    High,
+    Limited,
+    Minimal,
+
+    pub fn toSnake(self: RiskTier): string {
+        switch (self) {
+            case RiskTier.Unacceptable: { return "unacceptable"; }
+            case RiskTier.High: { return "high"; }
+            case RiskTier.Limited: { return "limited"; }
+            case RiskTier.Minimal: { return "minimal"; }
+            default: { return "minimal"; }
+        }
+    }
+}
+
+/// The screening questionnaire. Each flag maps to an EU AI Act trigger.
+pub struct Screening {
+    /// Prohibited practice (social scoring, manipulative or exploitative AI...).
+    pub prohibitedPractice: bool,
+    /// Safety component of a product, or Annex III high-risk use.
+    pub safetyComponent: bool,
+    pub biometricIdentification: bool,
+    pub criticalInfrastructure: bool,
+    pub employmentOrEducation: bool,
+    pub essentialServices: bool,
+    pub lawEnforcement: bool,
+    /// Interacts directly with people (chatbot) -> transparency duty.
+    pub interactsWithHumans: bool,
+    /// Generates or manipulates content (gen-AI, deepfakes) -> transparency duty.
+    pub generatesContent: bool,
+
+    init(prohibitedPractice: bool, safetyComponent: bool, biometricIdentification: bool, criticalInfrastructure: bool, employmentOrEducation: bool, essentialServices: bool, lawEnforcement: bool, interactsWithHumans: bool, generatesContent: bool) {
+        self.prohibitedPractice = prohibitedPractice;
+        self.safetyComponent = safetyComponent;
+        self.biometricIdentification = biometricIdentification;
+        self.criticalInfrastructure = criticalInfrastructure;
+        self.employmentOrEducation = employmentOrEducation;
+        self.essentialServices = essentialServices;
+        self.lawEnforcement = lawEnforcement;
+        self.interactsWithHumans = interactsWithHumans;
+        self.generatesContent = generatesContent;
+    }
+}
+
+/// An all-false screening (the Rust `Screening::default()`).
+pub fn emptyScreening(): Screening {
+    return Screening(false, false, false, false, false, false, false, false, false);
+}
+
+/// The tier plus the human-readable reasons that produced it.
+pub class Classification {
+    pub tier: RiskTier,
+    pub reasons: List<string>,
+
+    init(tier: RiskTier, reasons: List<string>) {
+        self.tier = tier;
+        self.reasons = reasons;
+    }
+}
+
+/// One obligation to satisfy, keyed to a control in the library.
+pub struct Obligation {
+    pub framework: string,
+    pub controlId: string,
+    pub title: string,
+
+    init(framework: string, controlId: string, title: string) {
+        self.framework = framework;
+        self.controlId = controlId;
+        self.title = title;
+    }
+}
+
+/// Classify the risk tier from the screening (EU AI Act structure). A prohibited
+/// practice is Unacceptable and short-circuits; any Annex III / high-risk flag is
+/// High; a transparency trigger is Limited; otherwise Minimal. The reasons list
+/// records every flag that fired.
+pub fn classifyTier(s: Screening): Classification {
+    let reasons = List<string>();
+    if (s.prohibitedPractice) {
+        reasons.push("prohibited practice under Article 5");
+        return Classification(RiskTier.Unacceptable, reasons);
+    }
+    let isHigh = false;
+    if (s.safetyComponent) { reasons.push("safety component / Annex III use"); isHigh = true; }
+    if (s.biometricIdentification) { reasons.push("biometric identification"); isHigh = true; }
+    if (s.criticalInfrastructure) { reasons.push("critical infrastructure"); isHigh = true; }
+    if (s.employmentOrEducation) { reasons.push("employment or education decisions"); isHigh = true; }
+    if (s.essentialServices) { reasons.push("access to essential services (credit, benefits)"); isHigh = true; }
+    if (s.lawEnforcement) { reasons.push("law enforcement"); isHigh = true; }
+    if (isHigh) {
+        return Classification(RiskTier.High, reasons);
+    }
+    if (s.interactsWithHumans) {
+        reasons.push("interacts directly with people (transparency duty)");
+    }
+    if (s.generatesContent) {
+        reasons.push("generates or manipulates content (transparency duty)");
+    }
+    if (s.interactsWithHumans || s.generatesContent) {
+        return Classification(RiskTier.Limited, reasons);
+    }
+    reasons.push("no high-risk or transparency trigger");
+    return Classification(RiskTier.Minimal, reasons);
+}
+
+// Pull the eu-ai-act controls named by `ids` into obligations, skipping any id
+// absent from the catalogue (mirrors the Rust `filter_map`).
+fn pull(ids: List<string>): List<Obligation> {
+    let out = List<Obligation>();
+    let i = 0;
+    while (i < ids.size()) {
+        let c = controls.get("eu-ai-act", ids.at(i));
+        if (c != undefined) {
+            let ctl = c ?? controls.makeControl("eu-ai-act", "", "", "", "", "always", "", "");
+            out.push(Obligation(ctl.framework, ctl.id, ctl.title));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The obligations (controls) a tier must satisfy. High pulls the full EU AI Act
+/// high-risk set; Limited pulls the transparency obligation; Unacceptable and
+/// Minimal mandate none.
+pub fn obligationsFor(tier: RiskTier): List<Obligation> {
+    switch (tier) {
+        case RiskTier.High: {
+            let ids = List<string>();
+            ids.push("art-9"); ids.push("art-10"); ids.push("art-11"); ids.push("art-12");
+            ids.push("art-13"); ids.push("art-14"); ids.push("art-15");
+            return pull(ids);
+        }
+        case RiskTier.Limited: {
+            let ids = List<string>();
+            ids.push("art-13");
+            return pull(ids);
+        }
+        default: {
+            return List<Obligation>();
+        }
+    }
+}

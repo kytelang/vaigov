@@ -1,0 +1,20 @@
+// Persistence entity: one row of the `grc` table (a governance/risk/compliance
+// record: assessments, risks, model cards, dataset governance, use-case stages).
+// Persistence-agnostic; the GrcDto view projection is derived from it.
+@serializable
+pub struct GrcRecord {
+    pub id: string,
+    pub kind: string,
+    pub subject: string,
+    pub title: string,
+    pub status: string,
+    pub body: string,
+    pub operator: string,
+    pub assignee: string,
+    pub stage: string,
+    pub linked_refs: string,
+    pub answers_json: string,
+    pub due_ms: long,
+    pub created_ms: long,
+    pub tenant: string,
+}

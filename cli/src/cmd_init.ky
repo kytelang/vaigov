@@ -1,0 +1,64 @@
+//! varman-cli: `init`. A port of Rust `acp-cli`'s `commands/init.rs`, adapted to
+//! the CLI's policy-file model (the rego rule-model that `policy-compile`
+//! consumes, see `cmd_policy.ky`). It writes a starter `policy.json`:
+//! default-allow, a step-up gate on large charges, and a deny on destructive
+//! operations in prod, then prints how to compile and test it.
+
+import string;
+import io.file;
+import io.dir;
+
+/// The starter policy as a JSON string. Default-allow for shadow-first
+/// observation; a step-up gate on large charges; a deny on destructive prod
+/// operations. It parses and compiles through `policy-compile`.
+pub fn starterPolicyJson(): string {
+    return "{\n"
+        + "  \"default\": \"allow\",\n"
+        + "  \"rules\": [\n"
+        + "    {\n"
+        + "      \"rule_id\": \"cap-spend\",\n"
+        + "      \"name\": \"step up large charges\",\n"
+        + "      \"verdict\": \"step_up\",\n"
+        + "      \"enabled\": true,\n"
+        + "      \"approver_group\": \"finance\",\n"
+        + "      \"match\": { \"combinator\": \"all\", \"groups\": [\n"
+        + "        { \"combinator\": \"all\", \"conditions\": [\n"
+        + "          { \"target\": \"args.amount_cents\", \"op\": \"gt\", \"value\": 50000 } ] } ] }\n"
+        + "    },\n"
+        + "    {\n"
+        + "      \"rule_id\": \"no-prod-delete\",\n"
+        + "      \"name\": \"deny destructive operations in prod\",\n"
+        + "      \"verdict\": \"deny\",\n"
+        + "      \"enabled\": true,\n"
+        + "      \"match\": { \"combinator\": \"all\", \"groups\": [\n"
+        + "        { \"combinator\": \"all\", \"conditions\": [\n"
+        + "          { \"target\": \"operation\", \"op\": \"in\", \"value\": [\"delete\", \"drop\", \"truncate\"] } ] },\n"
+        + "        { \"combinator\": \"all\", \"conditions\": [\n"
+        + "          { \"target\": \"context.env\", \"op\": \"eq\", \"value\": \"prod\" } ] } ] }\n"
+        + "    }\n"
+        + "  ]\n"
+        + "}\n";
+}
+
+/// Write the starter workspace into `dir`. Returns the path of the policy file
+/// written, or undefined on a write failure.
+pub fn writeWorkspace(dir: string): string | undefined {
+    Dir.create(dir, 493); // 0755
+    let policy = `${dir}/policy.json`;
+    if (!File.writeTextOk(policy, starterPolicyJson())) { return undefined; }
+    return policy;
+}
+
+/// CLI: `init [dir]`. Scaffolds the workspace and prints next steps.
+pub fn cmdInit(dir: string): int {
+    let policy = writeWorkspace(dir);
+    if (policy == undefined) { console.log(`varman: cannot write workspace in ${dir}`); return 1; }
+    console.log(`Initialised a varman workspace in ${dir}/`);
+    console.log(`  policy:   ${policy}`);
+    console.log("");
+    console.log("Author and check the policy offline:");
+    console.log(`  varman policy-compile ${policy}      # compile to Rego`);
+    console.log(`  varman policy-lint    ${policy}      # heuristic findings`);
+    console.log(`  varman policy-test    ${policy} calls.jsonl`);
+    return 0;
+}

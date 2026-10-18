@@ -1,0 +1,41 @@
+//! AppContext: the composition context, built once at startup and handed to every
+//! feature's `register<Feature>(ctx)`. It bundles the `App` being configured with
+//! the app-wide shared services: the Postgres pool (`db`), the loaded config
+//! (`cfg`, bound per-feature), and the trust-core runtime (`trust`: the evidence
+//! ledger, signing key, active rules, decision read-side, Entra bindings).
+//!
+//! This is the Go "server struct" shape: one value holding the router and the
+//! deps, so a feature's register takes a single argument. It is a concrete class
+//! (a single shared instance, passed by reference), distinct from
+//! `web.routing.Context`, which is the PER-REQUEST context a handler receives.
+
+import web.app;
+import web.config;
+import Shared.Db;
+import Shared.AppConfig;
+import Shared.TrustState;
+
+pub class AppContext {
+    /// The web application being configured; features register routes on it.
+    pub app: App,
+    /// The Postgres connection pool (the single control-plane store).
+    pub db: Db,
+    /// The loaded app config (framework `web.config`, read from app.yaml). A
+    /// feature binds its own typed section, e.g. `ctx.cfg.bind<DbConfig>("db")`.
+    pub cfg: config.AppConfig,
+    /// Trust settings (signing seed, session key, tenant, default verdict).
+    pub trustCfg: TrustConfig,
+    /// Microsoft Entra app registration for interactive sign-in (from app.yaml).
+    pub entra: EntraSignInConfig,
+    /// The trust-core runtime (ledger, signing key, rules, decisions, bindings).
+    pub trust: TrustState,
+
+    init(app: App, db: Db, cfg: config.AppConfig, trustCfg: TrustConfig, entra: EntraSignInConfig, trust: TrustState) {
+        self.app = app;
+        self.db = db;
+        self.cfg = cfg;
+        self.trustCfg = trustCfg;
+        self.entra = entra;
+        self.trust = trust;
+    }
+}

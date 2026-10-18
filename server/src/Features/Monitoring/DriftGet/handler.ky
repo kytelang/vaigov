@@ -1,0 +1,43 @@
+// GET /monitor/drift -> {"classes":[{class,hits,total,rate,baseline,drifted}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Monitoring.Shared.MonitorRepository;
+import Features.Monitoring.Shared.monitorjson;
+import Domain.Dtos.MonitorRows;
+
+pub struct DriftGetHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DriftGetHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.listDrift();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, DriftRow{ cls: "", hits: 0, total: 0, baseline: 0.0 });
+            let rate = if (r.total > 0) ((r.hits as double) / (r.total as double)) else (0.0);
+            let diff = rate - r.baseline;
+            let ad = if (diff < 0.0) (0.0 - diff) else (diff);
+            let drifted = r.total >= 5 && ad > 0.15;
+            let m = Map<string, json.JsonValue>(8, string.hash);
+            m.set("class", json.str(r.cls));
+            m.set("hits", json.number(r.hits));
+            m.set("total", json.number(r.total));
+            m.set("rate", monitorjson.jfloat(rate));
+            m.set("baseline", monitorjson.jfloat(r.baseline));
+            m.set("drifted", json.bool(drifted));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("classes", json.array(arr));
+        return Http.okObj(out);
+    }
+}

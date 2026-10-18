@@ -1,0 +1,35 @@
+// GET /policy/templates -> {templates:[...]}. A representative built-in set of
+// rule starting points (acp ships a richer catalogue; FLAG: representative).
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+fn tpl(id: string, name: string, desc: string, verdict: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("id", json.str(id));
+    m.set("name", json.str(name));
+    m.set("description", json.str(desc));
+    m.set("verdict", json.str(verdict));
+    return json.object(m);
+}
+
+pub struct PolicyTemplatesHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: PolicyTemplatesHandler, ctx: routing.Context): response.Response {
+        let arr = list.List<json.JsonValue>();
+        arr.push(tpl("cap-spend", "Spend cap step-up", "Require approval for payments over a threshold.", "step_up"));
+        arr.push(tpl("no-prod-delete", "No prod destructive DB ops", "Deny delete/drop/truncate against prod databases.", "deny"));
+        arr.push(tpl("pii-egress", "PII egress guard", "Step up when a tool would send PII to an external endpoint.", "step_up"));
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("templates", json.array(arr));
+        return Http.okObj(m);
+    }
+}

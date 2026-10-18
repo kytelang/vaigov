@@ -1,0 +1,19 @@
+// GET /auth/entra/consented -> whether admin consent has been granted (dev: no).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct EntraConsentedHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: EntraConsentedHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("consented", json.bool(false));
+        return Http.okObj(m);
+    }
+}

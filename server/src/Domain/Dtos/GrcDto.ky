@@ -1,0 +1,15 @@
+// Read DTO: the shape the GRC views render, derived from GrcRecord by the mapper.
+// Fields camelCase; @from bridges the snake_case entity columns.
+@serializable
+pub struct GrcDto {
+    pub id: string,
+    pub kind: string,
+    pub subject: string,
+    pub title: string,
+    pub status: string,
+    pub assignee: string,
+    pub stage: string,
+    @from("due_ms") pub dueMs: long,
+    @from("created_ms") pub createdMs: long,
+    pub tenant: string,
+}

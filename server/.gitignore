@@ -1,0 +1,6 @@
+build/
+*.o
+# Secrets: the Entra client secret lives in .entra.env (loaded by serve.sh). Keep
+# it, and any other local *.env, out of git so a `git add -A` never stages a secret.
+.entra.env
+*.env

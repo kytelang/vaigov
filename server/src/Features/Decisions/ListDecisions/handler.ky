@@ -1,0 +1,56 @@
+// GET /decisions -> {"decisions":[{decision_id,ts_ms,ts,verdict,rule_id,controls[],obligations[],resource,operation,subject,bundle_revision}]}
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Decisions.Shared.DecisionRepository;
+import Domain.Dtos.DecisionDtos;
+
+pub fn decisionJsonArr(s: string): json.JsonValue {
+    let v = json.tryParse(s);
+    if (v == undefined) { return json.array(list.List<json.JsonValue>()); }
+    let doc = v ?? json.null();
+    if (doc.kind != 4) { return json.array(list.List<json.JsonValue>()); }
+    return doc;
+}
+
+pub fn decisionRowJson(r: DecisionRaw): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("decision_id", json.str(r.decision_id));
+    m.set("ts_ms", json.number(r.ts_ms));
+    m.set("ts", json.str(r.ts_text));
+    m.set("verdict", json.str(r.verdict));
+    m.set("rule_id", json.str(r.rule_id));
+    m.set("controls", decisionJsonArr(r.controls_json));
+    m.set("obligations", decisionJsonArr(r.obligations_json));
+    m.set("resource", json.str(r.resource));
+    m.set("operation", json.str(r.operation));
+    m.set("subject", json.str(r.subject));
+    m.set("bundle_revision", json.str(r.bundle_revision));
+    return json.object(m);
+}
+
+pub struct DecisionsHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); }
+
+    async fn serve(self: DecisionsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant, 500);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let row = rows.items.getOr(i, DecisionRaw{ decision_id: "", ts_ms: 0, ts_text: "", verdict: "", rule_id: "", controls_json: "[]", obligations_json: "[]", resource: "", operation: "", subject: "", bundle_revision: "" });
+            arr.push(decisionRowJson(row));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("decisions", json.array(arr));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,29 @@
+// Models registry routes (acp-compatible JSON over the shared `acp` db). Mirrors
+// acp-server's /models surface exactly. Only registration lives here.
+import web.app;
+import Shared.AppContext;
+import Features.Models.Shared.ModelRepository;
+import Features.Models.ListModels.handler;
+import Features.Models.GetModel.handler;
+import Features.Models.RegisterModel.handler;
+import Features.Models.UpdateModel.handler;
+import Features.Models.DeleteModel.handler;
+import Features.Models.Fairness.handler;
+import Features.Models.FairnessHistory.handler;
+import Features.Models.ModelsConsole.handler;
+
+pub fn registerModels(ctx: AppContext): void {
+    let repo = ModelRepository(ctx.db);
+    // Console view + mutations, registered BEFORE "/models/{id}" (router matches
+    // in registration order) so "view" is not captured as an {id}.
+    ctx.app.get("/models/view", ModelsViewHandler(repo, ctx));
+    ctx.app.post("/console/models/save", ModelsSaveHandler(repo, ctx));
+    ctx.app.post("/console/models/delete", ModelsDeleteHandler(repo, ctx));
+    ctx.app.get("/models", ModelsListHandler(repo, ctx));
+    ctx.app.post("/models", ModelRegisterHandler(repo, ctx));
+    ctx.app.get("/models/{id}", ModelGetHandler(repo, ctx));
+    ctx.app.post("/models/{id}/update", ModelUpdateHandler(repo, ctx));
+    ctx.app.post("/models/{id}/delete", ModelDeleteHandler(repo, ctx));
+    ctx.app.post("/models/{id}/fairness", ModelFairnessHandler(repo, ctx));
+    ctx.app.get("/models/{id}/fairness/history", ModelFairnessHistoryHandler(repo, ctx));
+}

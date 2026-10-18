@@ -1,0 +1,77 @@
+// GET /auth/callback -> complete the Entra interactive sign-in. Verifies the
+// state cookie, exchanges the code for tokens (confidential client, over TLS),
+// decodes the id_token claims, and admits ONLY the organisation's primary
+// contact or DPO (the two emails captured at org creation). On success it mints
+// the same signed session cookie the dev-login path uses, so every downstream
+// capability check works identically; any other identity is refused (403).
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import list;
+import entra;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Admin.Shared.AdminRepository;
+import Features.Auth.Shared.authhelp;
+import Domain.Dtos.AdminRows;
+
+pub struct CallbackHandler impl RouteHandler {
+    app: AppContext,
+    repo: AdminRepository,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+
+    async fn serve(self: CallbackHandler, ctx: routing.Context): response.Response {
+        let cfg = self.app.entra;
+        if (!authhelp.entraConfigured(cfg)) {
+            return response.Response(Status.ServiceUnavailable, "Entra sign-in is not configured.");
+        }
+        let code = ctx.query("code");
+        let state = ctx.query("state");
+        let stateCookie = ctx.request.getCookie("acp_oauth_state") ?? "";
+        if (string.eql(code, "")) {
+            return response.Response(Status.Forbidden, "Missing authorization code.");
+        }
+        if (string.eql(state, "") || !string.eql(state, stateCookie)) {
+            return response.Response(Status.Forbidden, "State mismatch; possible CSRF. Please sign in again.");
+        }
+
+        let e = entra.Entra(cfg.tenantId, cfg.clientId, authhelp.entraSecret(cfg));
+        let cr = e.exchangeCode(code, authhelp.entraRedirectUri(cfg));
+        if (!cr.ok) {
+            return response.Response(Status.Forbidden, "Token exchange with Entra failed.");
+        }
+        // Verify the id_token's RS256 signature against the tenant JWKS, and its
+        // iss/aud/exp, BEFORE trusting any claim. Fail closed: an id_token we cannot
+        // cryptographically verify is refused rather than decoded-and-trusted.
+        if (!authhelp.verifyIdToken(cfg, cr.idToken, Http.nowMs())) {
+            return response.Response(Status.Forbidden, "id_token signature verification failed.");
+        }
+        let claims = entra.decodeIdClaims(cr.idToken);
+        let email = claims.email;
+        if (string.eql(string.trim(email), "")) { email = claims.preferredUsername; }
+
+        // Authorisation gate: only the org's primary contact or DPO may sign in.
+        let tenant = self.app.trustCfg.tenant;
+        let contactEmail = "";
+        let dpoEmail = "";
+        let sr = await self.repo.tenantSettings(tenant);
+        if (sr.items.size() > 0) {
+            let s = sr.items.getOr(0, TenantSettingsRow{ onboarded: 0, jurisdiction: "", enabled_acts: "[]", org_name: "", address_line1: "", address_line2: "", city: "", postcode: "", country: "", contact_name: "", contact_email: "", contact_phone: "", profile_json: "{}" });
+            contactEmail = s.contact_email;
+            dpoEmail = authhelp.dpoEmailOf(s.profile_json);
+        }
+        let roles = authhelp.loginRolesFor(email, contactEmail, dpoEmail);
+        if (roles.size() == 0) {
+            return response.Response(Status.Forbidden, "This account (" + email + ") is not authorised to sign in to this organisation. Only the primary contact and the DPO may log in. Ask an administrator to set this address as the primary contact or DPO.");
+        }
+
+        // Mint the signed session (same shape as dev-login) and land on the console.
+        let now = Http.nowMs();
+        let oid = if (string.eql(string.trim(claims.oid), "")) email else claims.oid;
+        let sess = Auth.Session(oid, email, claims.tid, tenant, roles, now, now + 28800000);
+        let cookieVal = Auth.signSession(self.app.trustCfg.sessionKeyHex, sess);
+        return Http.redirectWithCookie("/", Auth.sessionCookieHeader(Http.sessionCookieName(), cookieVal));
+    }
+}

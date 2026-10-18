@@ -1,0 +1,22 @@
+// GET /policy-packs/view -> the Policy packs hypermedia view (Datastar fragment),
+// matching acp/console PacksView.vue. Delegates to the shared card builder
+// (packcards.ky), which the console install/uninstall handlers also use.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packcards;
+import Features.PolicyPacks.views.packview;
+
+pub struct PacksViewHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: PacksViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let cards = await packcards.packCards(self.repo, tenant);
+        return await ds_response.patch(packview.packsPanel(cards));
+    }
+}

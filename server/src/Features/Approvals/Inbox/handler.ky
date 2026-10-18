@@ -1,0 +1,44 @@
+// GET /inbox -> the pending-approvals HTML page (acp's maud inbox), with an
+// Approve/Deny form per hold. Text is escaped so a presented/tool value cannot
+// inject markup.
+import web.routing;
+import web.response;
+import string;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Approvals.Shared.ApprovalStore;
+
+fn approvalEsc(s: string): string {
+    let a = string.replace(s, "&", "&amp;");
+    let b = string.replace(a, "<", "&lt;");
+    return string.replace(b, ">", "&gt;");
+}
+
+pub struct InboxHandler impl RouteHandler {
+    store: ApprovalStore,
+    app: AppContext,
+    init(store: ApprovalStore, app: AppContext) { self.store = store; self.app = app; }
+
+    async fn serve(self: InboxHandler, ctx: routing.Context): response.Response {
+        let items = await self.store.listPending();
+        let body = "<!doctype html><html><head><title>ACP approvals</title><style>body{font:15px system-ui;margin:2rem;max-width:760px} .card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:10px 0} button{margin-right:8px;padding:6px 12px} .meta{color:#666;font-size:.85em}</style></head><body><h1>Pending approvals</h1>";
+        if (items.size() == 0) {
+            body = string.concat(body, "<p>No pending approvals.</p>");
+        } else {
+            let i = 0;
+            while (i < items.size()) {
+                let r = items.at(i);
+                body = string.concat(body, string.concat("<div class=\"card\"><div><b>", approvalEsc(r.tool)));
+                body = string.concat(body, string.concat("</b></div><div class=\"meta\">presented: ", approvalEsc(r.presented)));
+                body = string.concat(body, string.concat("</div><div class=\"meta\">id: ", approvalEsc(r.id)));
+                body = string.concat(body, string.concat("</div><form method=\"post\" action=\"/approvals/", approvalEsc(r.id)));
+                body = string.concat(body, "/approve\" style=\"display:inline\"><button>Approve</button></form>");
+                body = string.concat(body, string.concat("<form method=\"post\" action=\"/approvals/", approvalEsc(r.id)));
+                body = string.concat(body, "/deny\" style=\"display:inline\"><button>Deny</button></form></div>");
+                i = i + 1;
+            }
+        }
+        body = string.concat(body, "</body></html>");
+        return Http.html(body);
+    }
+}

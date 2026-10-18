@@ -1,0 +1,66 @@
+//! Stripe client: customers, Checkout sessions and subscriptions over the Stripe
+//! REST API. Auth is HTTP basic with the secret key as the username (Stripe's
+//! scheme); request bodies are application/x-www-form-urlencoded. Works with test
+//! keys (sk_test_...) unchanged. Uses the Kyte web HTTP client.
+import web.client;
+import web.response;
+import serde.json;
+import string;
+import map;
+
+pub class StripeResult {
+    pub ok: bool,
+    pub status: int,
+    pub id: string,
+    pub body: string,
+    init(ok: bool, status: int, id: string, body: string) { self.ok = ok; self.status = status; self.id = id; self.body = body; }
+}
+
+pub class Stripe {
+    pub secretKey: string,
+    init(secretKey: string) { self.secretKey = secretKey; }
+
+    fn form(self: Stripe, method: string, path: string, body: string): StripeResult {
+        let url = "https://api.stripe.com" + path;
+        let h = Map<string, string>(2, string.hash);
+        h.set("authorization", client.basicAuth(self.secretKey, ""));
+        h.set("content-type", "application/x-www-form-urlencoded");
+        let resp = client.Http.request(method, url, h, body);
+        let code = resp.status.toCode();
+        let id = "";
+        let v = json.tryParse(resp.body);
+        if (v != undefined) {
+            let o = v ?? json.null();
+            if (o.kind == 5) { id = json.asString(json.get(o, "id")) ?? ""; }
+        }
+        return StripeResult(code >= 200 && code < 300, code, id, resp.body);
+    }
+
+    /// POST /v1/customers {email}.
+    pub fn createCustomer(self: Stripe, email: string): StripeResult {
+        return self.form("POST", "/v1/customers", "email=" + email);
+    }
+
+    /// POST /v1/checkout/sessions for a subscription to `priceId`, returning the
+    /// session (its `url` is the hosted checkout to redirect the user to).
+    /// `clientRef` is echoed back on the webhook event so the server can map the
+    /// completed checkout to its tenant.
+    pub fn createCheckoutSession(self: Stripe, customerId: string, priceId: string, successUrl: string, cancelUrl: string, clientRef: string): StripeResult {
+        let cust = if (customerId.length > 0) ("&customer=" + customerId) else ("");
+        let body = "mode=subscription" + cust +
+            "&line_items[0][price]=" + priceId + "&line_items[0][quantity]=1" +
+            "&client_reference_id=" + clientRef +
+            "&success_url=" + successUrl + "&cancel_url=" + cancelUrl;
+        return self.form("POST", "/v1/checkout/sessions", body);
+    }
+
+    /// GET /v1/subscriptions/{id}.
+    pub fn retrieveSubscription(self: Stripe, id: string): StripeResult {
+        return self.form("GET", "/v1/subscriptions/" + id, "");
+    }
+
+    /// DELETE /v1/subscriptions/{id} (cancel).
+    pub fn cancelSubscription(self: Stripe, id: string): StripeResult {
+        return self.form("DELETE", "/v1/subscriptions/" + id, "");
+    }
+}

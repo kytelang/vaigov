@@ -1,0 +1,109 @@
+// Governance (GRC) console: the hypermedia view (GET /grc/view) + first-party
+// mutation handlers (POST /console/grc/{save,delete}) backing views/grc.kyx.
+// Records are created unsigned here (the Ed25519 record signing is a later
+// enhancement); subject/title/status/assignee/description persist. Trusted
+// /console/*; the machine /grc JSON API keeps its checks.
+import ds_response;
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.views.grc;
+import Domain.Dtos.GrcDto;
+
+fn grTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+fn sig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+fn levelOf(s: string): int {
+    if (string.eql(s, "low")) { return 1; }
+    if (string.eql(s, "medium")) { return 2; }
+    if (string.eql(s, "high")) { return 3; }
+    return 2;
+}
+fn band(score: int): string {
+    if (score <= 2) { return "low"; }
+    if (score <= 4) { return "medium"; }
+    if (score <= 6) { return "high"; }
+    return "critical";
+}
+// Build the typed `body` JSON for a GRC record from the create-modal signals,
+// matching the shape the machine /grc/{risk,dataset,model-card,assess} endpoints
+// store so records render consistently.
+fn buildBody(body: json.JsonValue, kind: string): string {
+    let bm = Map<string, json.JsonValue>(8, string.hash);
+    bm.set("description", json.str(sig(body, "grDesc")));
+    if (string.eql(kind, "risk")) {
+        let lk = sig(body, "grLikelihood"); if (lk.length == 0) { lk = "medium"; }
+        let im = sig(body, "grImpact"); if (im.length == 0) { im = "medium"; }
+        let tr = sig(body, "grTreatment"); if (tr.length == 0) { tr = "mitigate"; }
+        let score = levelOf(lk) * levelOf(im);
+        bm.set("likelihood", json.str(lk));
+        bm.set("impact", json.str(im));
+        bm.set("treatment", json.str(tr));
+        bm.set("score", json.number(score as long));
+        bm.set("band", json.str(band(score)));
+    } else if (string.eql(kind, "assessment")) {
+        bm.set("framework", json.str(sig(body, "grFramework")));
+    } else if (string.eql(kind, "model-card")) {
+        bm.set("model_id", json.str(sig(body, "grModelId")));
+    } else if (string.eql(kind, "dataset")) {
+        bm.set("source", json.str(sig(body, "grSource")));
+    }
+    return json.stringify(json.object(bm));
+}
+
+pub struct GrcViewHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: GrcViewHandler, ctx: routing.Context): Response {
+        let rows = await self.repo.list(grTenant(self.app, ctx));
+        return await ds_response.patch(grc.grcPanel(rows.items));
+    }
+}
+
+pub struct GrcSaveHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: GrcSaveHandler, ctx: routing.Context): Response {
+        let tenant = grTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let ttl = sig(body, "grTitle");
+        if (ttl.length == 0) {
+            let rows = await self.repo.list(tenant);
+            return await ConsoleDs.patchAndSignals(grc.grcPanel(rows.items), "{\"grErr\":\"Title is required.\"}");
+        }
+        let kind = sig(body, "grKind"); if (kind.length == 0) { kind = "risk"; }
+        let subject = sig(body, "grSubject");
+        let status = sig(body, "grStatus"); if (status.length == 0) { status = "open"; }
+        let assignee = sig(body, "grAssignee");
+        let bodyJson = buildBody(body, kind);
+        let id = string.concat("grc-", random.randomHex(6));
+        await self.repo.add(id, kind, subject, ttl, status, bodyJson, "operator", Http.nowMs(), "", "", "[]", "{}", assignee, 0, "", tenant);
+        let rows = await self.repo.list(tenant);
+        return await ConsoleDs.patchAndSignals(grc.grcPanel(rows.items),
+            "{\"grModal\":\"\",\"grErr\":\"\",\"grId\":\"\",\"grKind\":\"risk\",\"grSubject\":\"\",\"grTitle\":\"\",\"grStatus\":\"open\",\"grAssignee\":\"\",\"grDesc\":\"\"}");
+    }
+}
+
+pub struct GrcDeleteHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: GrcDeleteHandler, ctx: routing.Context): Response {
+        let tenant = grTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "grId");
+        if (id.length > 0) { await self.repo.remove(id, tenant); }
+        let rows = await self.repo.list(tenant);
+        return await ConsoleDs.patchAndSignals(grc.grcPanel(rows.items), "{\"grModal\":\"\",\"grErr\":\"\"}");
+    }
+}

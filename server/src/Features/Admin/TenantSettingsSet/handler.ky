@@ -1,0 +1,40 @@
+// POST /tenant/settings {org_name,jurisdiction,acts:[...]} -> {"ok":true,"enabled_acts":acts}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Shared.adminjson;
+
+pub struct TenantSettingsSetHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: TenantSettingsSetHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let actsVal = if (body.kind == 5 && json.has(body, "acts")) (json.get(body, "acts")) else (json.array(list.List<json.JsonValue>()));
+        let actsArr = json.asArray(actsVal) ?? list.List<json.JsonValue>();
+        if (actsArr.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false));
+            e.set("error", json.str("select at least one act"));
+            return Http.okObj(e);
+        }
+        let orgName = adminBodyStr(body, "org_name");
+        let jurisdiction = adminBodyStr(body, "jurisdiction");
+        let actsJson = json.stringify(json.array(actsArr));
+        await self.repo.setTenantSettings(tenant, orgName, jurisdiction, actsJson, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("enabled_acts", json.array(actsArr));
+        return Http.okObj(m);
+    }
+}

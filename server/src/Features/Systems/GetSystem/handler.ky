@@ -1,0 +1,63 @@
+// GET /systems/{id} -> {"system":..,"roles":[..],"records_by_kind":{..},"records":[..]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+
+pub struct GetSystemHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: GetSystemHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(1, string.hash);
+            e.set("error", json.str("not found"));
+            return Http.okObj(e);
+        }
+        let sys = srows.items.getOr(0, SystemRow{ id:"", name:"", purpose:"", owner:"", lifecycle_state:"", risk_tier:"", sector:"", asset_type:"", jurisdictions:"[]", tenant:"", created_ms:0, updated_ms:0 });
+        let roleRows = await self.repo.listRoles(id, tenant);
+        let roles = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < roleRows.items.size()) {
+            roles.push(systemhelp.systemRoleJson(roleRows.items.getOr(i, SystemRoleRow{ id:"", system_id:"", role:"", jurisdiction:"", market_date:"", created_ms:0 })));
+            i = i + 1;
+        }
+        let grcRows = await self.repo.grcForSubject(sys.name, tenant);
+        let byKind = Map<string, json.JsonValue>(8, string.hash);
+        let recs = list.List<json.JsonValue>();
+        let counts = Map<string, int>(8, string.hash);
+        let k = 0;
+        while (k < grcRows.items.size()) {
+            let g = grcRows.items.getOr(k, SystemGrcRow{ id:"", kind:"", title:"", status:"", subject:"" });
+            let rm = Map<string, json.JsonValue>(4, string.hash);
+            rm.set("id", json.str(g.id)); rm.set("kind", json.str(g.kind)); rm.set("title", json.str(g.title)); rm.set("status", json.str(g.status));
+            recs.push(json.object(rm));
+            let prev = counts.get(g.kind) ?? 0;
+            counts.set(g.kind, prev + 1);
+            k = k + 1;
+        }
+        let keys = counts.keys();
+        let ki = 0;
+        while (ki < keys.size()) {
+            let kk = keys.at(ki);
+            byKind.set(kk, json.number((counts.get(kk) ?? 0) as long));
+            ki = ki + 1;
+        }
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("system", systemhelp.systemRowJson(sys));
+        m.set("roles", json.array(roles));
+        m.set("records_by_kind", json.object(byKind));
+        m.set("records", json.array(recs));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,30 @@
+// GET /approvals/{id}/status -> {"state","approver"} (or {"state":"unknown"}).
+// Lets a PEP poll for the console operator's decision.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Approvals.Shared.ApprovalStore;
+
+pub struct ApprovalStatusHandler impl RouteHandler {
+    store: ApprovalStore,
+    app: AppContext,
+    init(store: ApprovalStore, app: AppContext) { self.store = store; self.app = app; }
+
+    async fn serve(self: ApprovalStatusHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let r = await self.store.get(id);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        if (r == undefined) {
+            m.set("state", json.str("unknown"));
+            return Http.okObj(m);
+        }
+        let rec = r ?? ApprovalRecord("", "", "", "", "", "{}", "unknown", "", 0, 0);
+        m.set("state", json.str(rec.state));
+        m.set("approver", json.str(rec.approver));
+        return Http.okObj(m);
+    }
+}

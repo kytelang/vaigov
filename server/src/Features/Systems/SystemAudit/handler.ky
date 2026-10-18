@@ -1,0 +1,39 @@
+// GET /systems/{id}/audit -> {"audit":[{id,action,actor,detail,ts_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Systems.Shared.SystemRepository;
+import Domain.Dtos.SystemDtos;
+
+pub struct SystemAuditHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SystemAuditHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listAudit(id, tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let a = rows.items.getOr(i, SystemAuditRow{ id:"", action:"", actor:"", detail:"", ts_ms:0 });
+            let m = Map<string, json.JsonValue>(6, string.hash);
+            m.set("id", json.str(a.id));
+            m.set("action", json.str(a.action));
+            m.set("actor", json.str(a.actor));
+            m.set("detail", json.str(a.detail));
+            m.set("ts_ms", json.number(a.ts_ms));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("audit", json.array(arr));
+        return Http.okObj(out);
+    }
+}

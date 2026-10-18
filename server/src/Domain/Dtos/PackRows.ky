@@ -1,0 +1,31 @@
+// Row DTOs for the PolicyPacks feature (tenant_policy_packs, policy_rules
+// provenance, pack artifacts). Field names match the acp SELECTs.
+@serializable pub struct InstalledPackRow {
+    @from("pack_slug") pub slug: string,
+    pub version: int,
+    pub params_json: string,
+    pub status: string,
+    pub installed_ms: long,
+}
+
+@serializable pub struct PackRuleRow {
+    pub rule_id: string,
+    pub name: string,
+    pub pack_customised: int,
+    pub enabled: int,
+}
+
+@serializable pub struct PackArtifactRow {
+    @from("artifact_id") pub id: string,
+    pub name: string,
+    pub tenant_id: string,
+    pub body: string,
+}
+
+@serializable pub struct PackItemRow {
+    pub item_id: string,
+}
+
+@serializable pub struct PackCountRow {
+    pub n: long,
+}

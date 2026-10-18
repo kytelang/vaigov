@@ -1,0 +1,31 @@
+// Row DTOs for the decisions / compliance-coverage read side, bound by the ORM
+// from the acp `decisions` / `policy_rules` / `rule_controls` / `conformance_checklist`
+// / `tenant_settings` tables. Field names match the SELECT column aliases.
+
+@serializable pub struct DecisionRaw {
+    pub decision_id: string,
+    pub ts_ms: long,
+    pub ts_text: string,
+    pub verdict: string,
+    pub rule_id: string,
+    pub controls_json: string,
+    pub obligations_json: string,
+    pub resource: string,
+    pub operation: string,
+    pub subject: string,
+    pub bundle_revision: string,
+}
+
+@serializable pub struct VerdictCountRow { pub verdict: string, pub n: long, }
+
+@serializable pub struct CtrlVerdictRow { pub controls_json: string, pub verdict: string, }
+
+@serializable pub struct RuleCtrlRow { pub rule_id: string, pub control_id: string, pub slug: string, }
+
+@serializable pub struct CoverageCtrlRow {
+    pub control_id: string,
+    pub title: string,
+    pub obligation_type: string,
+}
+
+@serializable pub struct SettingsRow { pub onboarded: int, pub enabled_acts: string, }

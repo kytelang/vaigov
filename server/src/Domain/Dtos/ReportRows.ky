@@ -1,0 +1,16 @@
+// Row DTOs for the Reports feature (reads over the shared `acp` tables).
+@serializable pub struct GrcBodyRow { pub body: string, pub linked_refs: string, }
+@serializable pub struct RuleCtrlRow { pub act: string, pub control_id: string, }
+@serializable pub struct DecisionCtrlRow { pub controls_json: string, pub verdict: string, }
+@serializable pub struct SnapshotRow { pub id: string, pub created_ms: long, pub body_json: string, }
+@serializable pub struct ViolationRow {
+    pub ts_ms: long, pub kind: string, pub pep: string, pub agent: string, pub tool: string,
+    pub verdict: string, pub rule_id: string, pub impact: string, pub outcome: string,
+}
+@serializable pub struct DriftRow { pub class: string, pub hits: long, pub total: long, }
+@serializable pub struct SysRow { pub id: string, pub name: string, }
+@serializable pub struct EvRow { pub framework: string, pub control_id: string, pub title: string, pub valid_until_ms: long, }
+@serializable pub struct SoaRow { pub framework: string, pub control_id: string, pub applicable: int, pub status: string, }
+@serializable pub struct RProbe { pub one: int, }
+@serializable pub struct RedteamRow { pub status: string, pub passed: int, pub failed: int, pub total: int, }
+@serializable pub struct DecVerdictRow { pub verdict: string, pub rule_id: string, }

@@ -1,0 +1,273 @@
+//! varman-cli: the policy toolchain (`policy-compile`, `policy-lint`,
+//! `policy-test`). A port of Rust `acp-cli`'s `commands/policy.rs`.
+//!
+//! Design note (deviation from the Rust CLI, consistent with the Kyte port of
+//! varman-core): the Rust `policy-compile` parsed the YAML manifest DSL and
+//! compiled it to Cedar. Cedar was deliberately NOT ported (see
+//! `policy.ky`'s header); the model with a compiler, an in-process evaluator and
+//! a linter is the rego rule-model in `rego.ky`. So the whole CLI policy
+//! toolchain is built on that one model, which keeps a single policy-file shape
+//! across compile / lint / test / init:
+//!
+//!   { "default": "allow", "rules": [ { "rule_id", "verdict", "enabled",
+//!       "match": { "combinator", "groups":[ { "combinator", "conditions":[
+//!         { "target", "op", "value", "negate?" } ] } ] } } ] }
+//!
+//! `policy-compile` emits exactly `rego.compileRules(rules, default)` (the gate
+//! round-trips through this parse path). The manifest DSL (`policy.ky`,
+//! `build_context`) remains available in varman-core as the alternative engine.
+
+import string;
+import list;
+import serde.json;
+import serde.yaml;
+import io.file;
+import rego;
+
+// ---- loading a policy document (JSON, or best-effort YAML by extension) ----
+
+fn endsWith(s: string, suffix: string): bool {
+    if (suffix.length > s.length) { return false; }
+    return string.eql(string.slice(s, s.length - suffix.length, s.length), suffix);
+}
+
+// Convert a parsed YamlValue into the JsonValue the rego engine consumes. A
+// small recursive walk over the scalar/array/object shapes; numbers fold to
+// integers (policy manifests do not use fractional literals).
+fn yamlToJson(y: yaml.YamlValue): json.JsonValue {
+    if (yaml.isNull(y)) { return json.null(); }
+    let o = yaml.asObject(y);
+    if (o != undefined) {
+        let out = Map<string, json.JsonValue>(8, string.hash);
+        let keys = o.keys();
+        let i = 0;
+        while (i < keys.size()) {
+            let k = keys.at(i);
+            out.set(k, yamlToJson(o.get(k) ?? yaml.null()));
+            i = i + 1;
+        }
+        return json.object(out);
+    }
+    let a = yaml.asArray(y);
+    if (a != undefined) {
+        let arr = List<json.JsonValue>();
+        let i = 0;
+        while (i < a.size()) { arr.push(yamlToJson(a.at(i))); i = i + 1; }
+        return json.array(arr);
+    }
+    let b = yaml.asBool(y);
+    if (b != undefined) { return json.bool(b); }
+    let n = yaml.asNumber(y);
+    if (n != undefined) { return json.number(n); }
+    let s = yaml.asString(y);
+    if (s != undefined) { return json.str(s); }
+    return json.null();
+}
+
+/// Parse a policy document from its text, treating `.yaml`/`.yml` as YAML and
+/// everything else as JSON. Returns undefined when the text does not parse.
+pub fn parseDocText(text: string, path: string): json.JsonValue | undefined {
+    if (endsWith(path, ".yaml") || endsWith(path, ".yml")) {
+        return yamlToJson(yaml.parse(text));
+    }
+    return json.tryParse(text);
+}
+
+/// Read and parse a policy file. Returns undefined if the file is missing or
+/// does not parse.
+pub fn loadDoc(path: string): json.JsonValue | undefined {
+    if (!File.exists(path)) { return undefined; }
+    let text = File.readText(path);
+    return parseDocText(text, path);
+}
+
+// ---- document accessors ----
+
+pub fn docDefault(doc: json.JsonValue): string {
+    return json.asString(json.get(doc, "default")) ?? "allow";
+}
+
+pub fn docRules(doc: json.JsonValue): List<json.JsonValue> {
+    return json.asArray(json.get(doc, "rules")) ?? List<json.JsonValue>();
+}
+
+// ---- compile ----
+
+/// Validate every rule's match tree (bounded, well-formed regex patterns).
+/// Returns undefined on success, else a human-readable error.
+pub fn validateDoc(doc: json.JsonValue): string | undefined {
+    let rules = docRules(doc);
+    let i = 0;
+    while (i < rules.size()) {
+        let r = rules.at(i);
+        if (json.has(r, "match")) {
+            let e = rego.validateMatch(json.get(r, "match"));
+            if (e != undefined) {
+                let rid = json.asString(json.get(r, "rule_id")) ?? "?";
+                return `rule '${rid}': ${e}`;
+            }
+        }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+/// Compile a parsed policy document to its Rego module, or undefined when the
+/// document fails validation. This is exactly `rego.compileRules(rules, default)`
+/// over the document's rules, so the CLI parse path round-trips against a direct
+/// `rego.compileRules` call on the same rules.
+pub fn compileDoc(doc: json.JsonValue): string | undefined {
+    if (validateDoc(doc) != undefined) { return undefined; }
+    return rego.compileRules(docRules(doc), docDefault(doc));
+}
+
+// ---- evaluate / test ----
+
+/// The verdict and attributed rule for one call input.
+pub struct CallVerdict {
+    pub verdict: string,
+    pub rule: string,
+
+    init(verdict: string, rule: string) {
+        self.verdict = verdict;
+        self.rule = rule;
+    }
+}
+
+pub fn evalCall(rules: List<json.JsonValue>, dflt: string, input: json.JsonValue): CallVerdict {
+    let dec = rego.evaluate(rules, input, dflt);
+    let v = json.asString(json.get(dec, "verdict")) ?? dflt;
+    let r = json.asString(json.get(dec, "rule")) ?? "default";
+    return CallVerdict(v, r);
+}
+
+/// Evaluate a whole call list against a policy document, returning one verdict
+/// per call in order.
+pub fn testVerdicts(doc: json.JsonValue, calls: List<json.JsonValue>): List<string> {
+    let rules = docRules(doc);
+    let dflt = docDefault(doc);
+    let out = List<string>();
+    let i = 0;
+    while (i < calls.size()) {
+        out.push(evalCall(rules, dflt, calls.at(i)).verdict);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Count the calls whose verdict flips between two policy documents (the
+/// `--diff` form). Both documents are evaluated over the same call list.
+pub fn diffFlips(oldDoc: json.JsonValue, newDoc: json.JsonValue, calls: List<json.JsonValue>): int {
+    let a = testVerdicts(oldDoc, calls);
+    let b = testVerdicts(newDoc, calls);
+    let flips = 0;
+    let i = 0;
+    while (i < calls.size()) {
+        if (!string.eql(a.at(i), b.at(i))) { flips = flips + 1; }
+        i = i + 1;
+    }
+    return flips;
+}
+
+// A short label for a call, for human-readable output: its tool, else its
+// operation, else "call".
+fn callLabel(input: json.JsonValue): string {
+    let t = json.asString(json.get(input, "tool"));
+    if (t != undefined && t.length > 0) { return t; }
+    let o = json.asString(json.get(input, "operation"));
+    if (o != undefined && o.length > 0) { return o; }
+    return "call";
+}
+
+// Each non-empty line of a calls file is one JSON input object. Returns
+// undefined if any line fails to parse.
+pub fn parseCalls(text: string): List<json.JsonValue> | undefined {
+    let out = List<json.JsonValue>();
+    let lines = string.split(text, "\n");
+    let i = 0;
+    while (i < lines.size()) {
+        let line = string.trim(lines.at(i));
+        if (line.length > 0) {
+            let v = json.tryParse(line);
+            if (v == undefined) { return undefined; }
+            out.push(v);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn loadCalls(path: string): List<json.JsonValue> | undefined {
+    if (!File.exists(path)) { return undefined; }
+    return parseCalls(File.readText(path));
+}
+
+// ---- CLI command wrappers (print + exit code) ----
+
+pub fn cmdPolicyCompile(path: string): int {
+    let doc = loadDoc(path);
+    if (doc == undefined) { console.log(`varman: cannot read or parse policy ${path}`); return 1; }
+    let err = validateDoc(doc);
+    if (err != undefined) { console.log(`varman: invalid policy ${path}: ${err}`); return 1; }
+    let rego_ = rego.compileRules(docRules(doc), docDefault(doc));
+    console.log(rego_);
+    return 0;
+}
+
+pub fn cmdPolicyLint(path: string): int {
+    let doc = loadDoc(path);
+    if (doc == undefined) { console.log(`varman: cannot read or parse policy ${path}`); return 1; }
+    let findings = rego.lint(docRules(doc));
+    if (findings.size() == 0) { console.log("lint: no findings"); return 0; }
+    let i = 0;
+    while (i < findings.size()) {
+        let f = findings.at(i);
+        let sev = json.asString(json.get(f, "severity")) ?? "info";
+        let rid = json.asString(json.get(f, "rule_id")) ?? "";
+        let kind = json.asString(json.get(f, "kind")) ?? "";
+        let msg = json.asString(json.get(f, "message")) ?? "";
+        console.log(`[${sev}] ${kind} (${rid}): ${msg}`);
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn cmdPolicyTest(args: List<string>): int {
+    // --diff <old> <new> <calls> | <policy> <calls>
+    if (args.size() >= 1 && string.eql(args.at(0), "--diff")) {
+        if (args.size() < 4) { console.log("usage: varman policy-test --diff <old> <new> <calls.jsonl>"); return 2; }
+        let oldDoc = loadDoc(args.at(1));
+        let newDoc = loadDoc(args.at(2));
+        let calls = loadCalls(args.at(3));
+        if (oldDoc == undefined) { console.log("varman: cannot read policies"); return 1; }
+        if (newDoc == undefined) { console.log("varman: cannot read policies"); return 1; }
+        if (calls == undefined) { console.log("varman: cannot read or parse calls"); return 1; }
+        let oldV = testVerdicts(oldDoc, calls);
+        let newV = testVerdicts(newDoc, calls);
+        let flips = 0;
+        let i = 0;
+        while (i < calls.size()) {
+            if (!string.eql(oldV.at(i), newV.at(i))) {
+                flips = flips + 1;
+                console.log(`flip call#${i} ${callLabel(calls.at(i))}: ${oldV.at(i)} -> ${newV.at(i)}`);
+            }
+            i = i + 1;
+        }
+        console.log(`${flips} of ${calls.size()} calls change verdict`);
+        return 0;
+    }
+    if (args.size() < 2) { console.log("usage: varman policy-test <policy> <calls.jsonl>"); return 2; }
+    let doc = loadDoc(args.at(0));
+    let calls = loadCalls(args.at(1));
+    if (doc == undefined) { console.log("varman: cannot read or parse policy"); return 1; }
+    if (calls == undefined) { console.log("varman: cannot read or parse calls"); return 1; }
+    let rules = docRules(doc);
+    let dflt = docDefault(doc);
+    let i = 0;
+    while (i < calls.size()) {
+        let cv = evalCall(rules, dflt, calls.at(i));
+        console.log(`call#${i} ${callLabel(calls.at(i))}: ${cv.verdict} (rule ${cv.rule})`);
+        i = i + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// Row of GET /agents. `active` is held as the integer column; the handler emits it
+// as a JSON bool (active != 0) to match acp's serialized Agent struct.
+@serializable pub struct AgentListRow {
+    pub id: string,
+    pub app_id: string,
+    pub name: string,
+    pub owner: string,
+    pub metadata_json: string,
+    pub active: int,
+    pub tenant: string,
+    pub created_ms: long,
+}

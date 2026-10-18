@@ -1,0 +1,6 @@
+// A single-column count projection (SELECT count(*) AS n ...), used by the
+// Overview dashboard to tally rows without materialising them.
+@serializable
+pub struct OverviewCountRow {
+    pub n: long,
+}

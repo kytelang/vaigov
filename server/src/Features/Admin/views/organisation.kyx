@@ -1,0 +1,168 @@
+// Organisation view as KYX (full parity with acp/console OrganisationView.vue):
+// the org profile form (name + jurisdiction, Save) and the acts catalogue grouped
+// by jurisdiction, each act a click-to-toggle enable/disable. Datastar forms post
+// to /console/organisation/*. Form signals are prefilled on the fragment root from
+// the server values (re-applied on each re-render, which is the desired reset).
+import list;
+import string;
+
+pub class OrgActItem {
+    pub slug: string,
+    pub label: string,
+    pub controls: int,
+    pub enabled: bool,
+    init(slug: string, label: string, controls: int, enabled: bool) {
+        self.slug = slug; self.label = label; self.controls = controls; self.enabled = enabled;
+    }
+}
+pub class OrgGroup {
+    pub jurisdiction: string,
+    pub acts: list.List<OrgActItem>,
+    init(jurisdiction: string, acts: list.List<OrgActItem>) { self.jurisdiction = jurisdiction; self.acts = acts; }
+}
+pub class OrgProfile {
+    pub orgName: string,
+    pub jurisdiction: string,
+    pub addressLine1: string,
+    pub addressLine2: string,
+    pub city: string,
+    pub postcode: string,
+    pub country: string,
+    pub contactName: string,
+    pub contactEmail: string,
+    pub contactPhone: string,
+    init(orgName: string, jurisdiction: string, addressLine1: string, addressLine2: string, city: string, postcode: string, country: string, contactName: string, contactEmail: string, contactPhone: string) {
+        self.orgName = orgName; self.jurisdiction = jurisdiction;
+        self.addressLine1 = addressLine1; self.addressLine2 = addressLine2;
+        self.city = city; self.postcode = postcode; self.country = country;
+        self.contactName = contactName; self.contactEmail = contactEmail; self.contactPhone = contactPhone;
+    }
+}
+
+fn jsq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "'", "\\'"); }
+fn jq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "\"", "\\\""); }
+
+fn orgActRow(a: OrgActItem): Html {
+    let toggle = "$orgSlug='" + jsq(a.slug) + "'; @post('/console/organisation/toggle-act')";
+    let box = if (a.enabled)
+        (<span class="mt-0.5 w-4 h-4 shrink-0 rounded flex items-center justify-center text-[10px] font-bold bg-panel2 text-ok border border-line">✓</span>)
+        else (<span class="mt-0.5 w-4 h-4 shrink-0 rounded bg-panel2 border border-line"></span>);
+    let rowCls = if (a.enabled)
+        ("flex items-start gap-2 text-[13px] border border-line rounded-md px-3 py-2 cursor-pointer hover:bg-panel2 w-full text-left bg-panel2")
+        else ("flex items-start gap-2 text-[13px] border border-line rounded-md px-3 py-2 cursor-pointer hover:bg-panel2 w-full text-left");
+    return <button class={rowCls} data-on:click={toggle}>
+        {box}
+        <span><span class="font-medium text-txt">{a.label}</span><span class="text-dim">{` · ${a.controls} controls`}</span></span>
+    </button>;
+}
+
+fn showAllToggle(showAll: bool, allGet: string): Html {
+    if (showAll) {
+        return <label class="flex items-center gap-1.5 text-xs text-dim cursor-pointer"><input type="checkbox" checked="checked" data-on:change={allGet} /> show all</label>;
+    }
+    return <label class="flex items-center gap-1.5 text-xs text-dim cursor-pointer"><input type="checkbox" data-on:change={allGet} /> show all</label>;
+}
+
+fn orgGroupBlock(g: OrgGroup): Html {
+    return <div>
+        <div class="text-xs uppercase tracking-wide text-dim mb-1">{g.jurisdiction}</div>
+        <div class="grid sm:grid-cols-2 gap-1.5">
+            {for (i in 0..g.acts.size()) { orgActRow(g.acts.at(i)); }}
+        </div>
+    </div>;
+}
+
+fn orgDash(s: string): string { if (s.length == 0) { return "-"; } return s; }
+
+fn profileField(label: string, value: string): Html {
+    return <div>
+        <div class="text-[10px] uppercase tracking-wide text-muted">{label}</div>
+        <div class="text-sm text-txt mt-0.5">{orgDash(value)}</div>
+    </div>;
+}
+
+fn addressText(p: OrgProfile): string {
+    let parts = "";
+    if (p.addressLine1.length > 0) { parts = p.addressLine1; }
+    if (p.addressLine2.length > 0) { parts = if (parts.length > 0) (parts + ", " + p.addressLine2) else p.addressLine2; }
+    if (p.city.length > 0) { parts = if (parts.length > 0) (parts + ", " + p.city) else p.city; }
+    if (p.postcode.length > 0) { parts = if (parts.length > 0) (parts + " " + p.postcode) else p.postcode; }
+    if (p.country.length > 0) { parts = if (parts.length > 0) (parts + ", " + p.country) else p.country; }
+    return parts;
+}
+
+fn profileCard(p: OrgProfile): Html {
+    return <div class="bg-panel border border-line rounded-xl">
+        <div class="px-5 py-3 border-b border-line">
+            <h2 class="font-semibold text-txt">Organisation profile</h2>
+            <p class="text-xs text-dim">The registered details for this tenant, as captured during onboarding.</p>
+        </div>
+        <div class="px-5 py-4 grid sm:grid-cols-2 md:grid-cols-3 gap-4">
+            {profileField("Name", p.orgName)}
+            {profileField("Primary jurisdiction", p.jurisdiction)}
+            {profileField("Address", addressText(p))}
+            {profileField("Primary contact", p.contactName)}
+            {profileField("Contact email", p.contactEmail)}
+            {profileField("Contact phone", p.contactPhone)}
+        </div>
+    </div>;
+}
+
+fn entraCard(): Html {
+    return <div class="bg-panel border border-line rounded-xl">
+        <div class="px-5 py-3 border-b border-line">
+            <h2 class="font-semibold text-txt">Microsoft Entra</h2>
+            <p class="text-xs text-dim">Connect your Microsoft Entra directory so operators sign in with their work identity and roles map to console permissions.</p>
+        </div>
+        <div class="px-5 py-4 flex items-center gap-3">
+            <a href="/auth/entra/consent-url" class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90">Connect Microsoft Entra</a>
+            <span class="text-xs text-dim">Uses OIDC single sign-on; no passwords are stored by Varman.</span>
+        </div>
+    </div>;
+}
+
+pub fn organisationPanel(profile: OrgProfile, onboarded: bool, selectedCount: int, groups: list.List<OrgGroup>, country: string, showAll: bool): Html {
+    let orgName = profile.orgName;
+    let jurisdiction = profile.jurisdiction;
+    let allOn = if (showAll) "1" else "0";
+    let allGet = "@get('/organisation/view?all=' + (evt.target.checked ? '1' : '0'))";
+    let scope = if (showAll) "Showing the full catalogue." else (if (string.eql(country, "")) "Showing the full catalogue (no country set)." else ("Showing regulations relevant to " + country + "."));
+    let sigs = "{orgName: '" + jq(orgName) + "', orgJur: '" + jq(jurisdiction) + "', orgSlug: '', orgErr: ''}";
+    let onboardBadge = if (onboarded)
+        (<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">onboarded</span>)
+        else (<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">not onboarded yet</span>);
+    return <div id="organisation" data-signals={sigs} class="grid gap-4">
+        {profileCard(profile)}
+        {entraCard()}
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Organisation setup</h2>
+                <p class="text-xs text-dim">Name your organisation and choose the regulations that apply; the console then shows only those.</p>
+            </div>
+            <div class="px-5 py-4 grid gap-4">
+                <div class="flex items-center gap-2">
+                    {onboardBadge}
+                    <span class="text-xs text-dim">{`${selectedCount} act(s) selected`}</span>
+                </div>
+                <div class="grid md:grid-cols-2 gap-3">
+                    <label class="text-xs text-dim">Organisation name
+                        <input type="text" data-bind="orgName" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="Acme Ltd" />
+                    </label>
+                    <label class="text-xs text-dim">Primary jurisdiction
+                        <input type="text" data-bind="orgJur" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="e.g. UK, EU, US" />
+                    </label>
+                </div>
+                <div><button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90" data-on:click="@post('/console/organisation/save-profile')">Save profile</button>
+                    <span data-show="$orgErr != ''" class="text-bad text-sm ml-3" data-text="$orgErr"></span></div>
+                <div class="flex items-center gap-2">
+                    <p class="text-xs text-dim flex-1">{scope} Statutory acts for your jurisdiction and the relevant international standards are shown.</p>
+                    {showAllToggle(showAll, allGet)}
+                </div>
+                <div class="grid gap-4">
+                    {for (i in 0..groups.size()) { orgGroupBlock(groups.at(i)); }}
+                </div>
+                <p class="text-xs text-dim">Click an act to enable or disable it for this organisation.</p>
+            </div>
+        </div>
+    </div>;
+}

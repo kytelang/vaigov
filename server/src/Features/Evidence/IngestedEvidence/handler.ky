@@ -1,0 +1,49 @@
+// GET /evidence/ingested -> {"records":[{decision_id,pep,kind,verdict,record,created_ms,verified}],"count"}.
+// Each record is re-verified against its embedded public key (checked, not asserted).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import sign;
+import canonical;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Evidence.Shared.EvidenceRepository;
+import Domain.Dtos.IngestedRow;
+
+pub struct IngestedEvidenceHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: IngestedEvidenceHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.listIngested(200);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, IngestedRow{ decision_id: "", pep: "", kind: "", verdict: "", record: "", operator: "", created_ms: 0, pubkey_hex: "", sig_hex: "" });
+            i = i + 1;
+            let verified = false;
+            let doc = json.tryParse(r.record);
+            if (doc != undefined) {
+                let cb = canonical.canonicalBytesOfJson(doc ?? json.null());
+                verified = sign.verifyHex(r.pubkey_hex, cb as ptr, cb.length, r.sig_hex);
+            }
+            let m = Map<string, json.JsonValue>(8, string.hash);
+            m.set("decision_id", json.str(r.decision_id));
+            m.set("pep", json.str(r.pep));
+            m.set("kind", json.str(r.kind));
+            m.set("verdict", json.str(r.verdict));
+            m.set("record", json.str(r.record));
+            m.set("created_ms", json.number(r.created_ms));
+            m.set("verified", json.bool(verified));
+            arr.push(json.object(m));
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("records", json.array(arr));
+        out.set("count", json.number(arr.size() as long));
+        return Http.okObj(out);
+    }
+}

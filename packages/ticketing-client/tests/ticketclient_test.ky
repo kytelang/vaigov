@@ -1,0 +1,9 @@
+import assert;
+import ticketclient;
+
+@test
+fn test_construct(): void {
+    let t = ticketclient.Ticketing("jira", "https://acme.atlassian.net", "me@acme.com", "tok", "GOV", 0);
+    assert.equalStr(t.system, "jira");
+    assert.equalInt(t.timeoutMs, 10000);
+}

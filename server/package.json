@@ -1,0 +1,12 @@
+{
+  "name": "kyte-web-app",
+  "private": true,
+  "scripts": {
+    "css": "npx @tailwindcss/cli -i ./styles/app.css -o ./wwwroot/index.css --minify",
+    "css:watch": "npx @tailwindcss/cli -i ./styles/app.css -o ./wwwroot/index.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "tailwindcss": "^4.1.0"
+  }
+}

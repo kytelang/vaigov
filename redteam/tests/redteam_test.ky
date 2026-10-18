@@ -1,0 +1,182 @@
+//! Offline gate for varman-redteam: the pure logic only, no live server needed.
+//! Covers every mutator, `fill`, the `satisfied` truth table, bypass/overblock
+//! classification, the built-in corpus shape, and base64 parity.
+
+import assert;
+import string;
+import list;
+import text.utf8;
+import crypto.base64;
+import serde.json;
+import redteam;
+
+// Re-build the expected Cyrillic homoglyph of a single ASCII char, so the test
+// validates the mapping rather than restating the implementation blindly.
+fn cyr(cp: int): string { return utf8.fromCodepoint(cp); }
+
+@test
+fn mutator_homoglyph(): void {
+    // Each mapped Latin letter becomes its Cyrillic look-alike; others stay.
+    assert.equalStr(redteam.homoglyph("o"), cyr(0x043E));
+    assert.equalStr(redteam.homoglyph("a"), cyr(0x0430));
+    assert.equalStr(redteam.homoglyph("b"), "b");
+    // "copy" -> с о р у (c,o,p,y all mapped).
+    let expected = cyr(0x0441) + cyr(0x043E) + cyr(0x0440) + cyr(0x0443);
+    assert.equalStr(redteam.homoglyph("copy"), expected);
+    // The bytes genuinely differ from the Latin original.
+    assert.isFalse(string.eql(redteam.homoglyph("copy"), "copy"));
+}
+
+@test
+fn mutator_zero_width(): void {
+    let zwsp = utf8.fromCodepoint(0x200B);
+    assert.equalStr(redteam.zeroWidth("ab"), "a" + zwsp + "b");
+    assert.equalStr(redteam.zeroWidth("abc"), "a" + zwsp + "b" + zwsp + "c");
+    // Single char has no separator.
+    assert.equalStr(redteam.zeroWidth("x"), "x");
+}
+
+@test
+fn mutator_base64(): void {
+    assert.equalStr(redteam.base64Mut("foobar"), "Zm9vYmFy");
+    // And it is exactly crypto.base64 output for a known input.
+    assert.equalStr(redteam.base64Mut("ebella@gmail.com"), base64.encode("ebella@gmail.com"));
+}
+
+@test
+fn mutator_spaced(): void {
+    assert.equalStr(redteam.spaced("a@b.com"), "a at b dot com");
+    assert.equalStr(redteam.spaced("ebella@gmail.com"), "ebella at gmail dot com");
+}
+
+@test
+fn mutator_case_fold(): void {
+    assert.equalStr(redteam.caseFold("abcd"), "AbCd");
+    assert.equalStr(redteam.caseFold("hello"), "HeLlO");
+}
+
+@test
+fn mutate_yields_literal_plus_variants(): void {
+    let ms = List<string>();
+    ms.push("base64");
+    ms.push("spaced");
+    let out = redteam.mutate("a@b.com", ms);
+    // literal + two requested variants.
+    assert.equalInt(out.size(), 3);
+    assert.equalStr((out.get(0) ?? redteam.Variant("", "")).label, "literal");
+    assert.equalStr((out.get(0) ?? redteam.Variant("", "")).text, "a@b.com");
+    assert.equalStr((out.get(1) ?? redteam.Variant("", "")).label, "base64");
+    assert.equalStr((out.get(2) ?? redteam.Variant("", "")).text, "a at b dot com");
+}
+
+@test
+fn mutate_skips_unknown(): void {
+    let ms = List<string>();
+    ms.push("bogus");
+    let out = redteam.mutate("x", ms);
+    // Only the literal survives; the unknown mutator is skipped.
+    assert.equalInt(out.size(), 1);
+    assert.equalStr((out.get(0) ?? redteam.Variant("", "")).label, "literal");
+}
+
+@test
+fn fill_substitutes_placeholder(): void {
+    let inner = Map<string, json.JsonValue>(8, string.hash);
+    inner.set("prompt", json.str("contact me at {{payload}} now"));
+    let args = Map<string, json.JsonValue>(8, string.hash);
+    args.set("args", json.object(inner));
+    let input = json.object(args);
+
+    let filled = redteam.fill(input, "test@example.com");
+    let prompt = json.asString(json.get(json.get(filled, "args"), "prompt")) ?? "";
+    assert.equalStr(prompt, "contact me at test@example.com now");
+
+    // Embedded quotes in the variant are stripped before substitution.
+    let filled2 = redteam.fill(input, "a\"b");
+    let prompt2 = json.asString(json.get(json.get(filled2, "args"), "prompt")) ?? "";
+    assert.equalStr(prompt2, "contact me at ab now");
+}
+
+@test
+fn satisfied_truth_table(): void {
+    // deny expectation: only deny satisfies.
+    assert.isTrue(redteam.satisfied("deny", "deny"));
+    assert.isFalse(redteam.satisfied("deny", "step_up"));
+    assert.isFalse(redteam.satisfied("deny", "shadow"));
+    assert.isFalse(redteam.satisfied("deny", "allow"));
+
+    // step_up expectation: deny or step_up satisfy; weaker does not.
+    assert.isTrue(redteam.satisfied("step_up", "deny"));
+    assert.isTrue(redteam.satisfied("step_up", "step_up"));
+    assert.isFalse(redteam.satisfied("step_up", "shadow"));
+    assert.isFalse(redteam.satisfied("step_up", "allow"));
+
+    // allow expectation: exactly allow.
+    assert.isTrue(redteam.satisfied("allow", "allow"));
+    assert.isFalse(redteam.satisfied("allow", "deny"));
+    assert.isFalse(redteam.satisfied("allow", "step_up"));
+    assert.isFalse(redteam.satisfied("allow", "shadow"));
+}
+
+@test
+fn classification_bypass_vs_overblock(): void {
+    // A deny case that was allowed/shadowed/stepped-up is a bypass.
+    assert.isTrue(redteam.isBypass("deny", "allow"));
+    assert.isTrue(redteam.isBypass("deny", "shadow"));
+    assert.isTrue(redteam.isBypass("deny", "step_up"));
+    assert.isFalse(redteam.isBypass("deny", "deny"));
+    assert.isFalse(redteam.isBypass("deny", "allow") && redteam.isOverblock("deny", "allow"));
+
+    // A step_up case dropped to shadow/allow is a bypass; deny/step_up are fine.
+    assert.isTrue(redteam.isBypass("step_up", "allow"));
+    assert.isTrue(redteam.isBypass("step_up", "shadow"));
+    assert.isFalse(redteam.isBypass("step_up", "deny"));
+
+    // An allow case that got blocked is an overblock, never a bypass.
+    assert.isTrue(redteam.isOverblock("allow", "deny"));
+    assert.isTrue(redteam.isOverblock("allow", "step_up"));
+    assert.isFalse(redteam.isOverblock("allow", "allow"));
+    assert.isFalse(redteam.isBypass("allow", "deny"));
+}
+
+@test
+fn default_corpus_shape(): void {
+    let corpus = redteam.defaultCorpus();
+    assert.equalInt(corpus.size(), 5);
+
+    // id -> (category, expect) checks, in order.
+    let c0 = corpus.get(0) ?? emptyCase();
+    assert.equalStr(c0.id, "pii-email-in-prompt");
+    assert.equalStr(c0.category, "pii-evasion");
+    assert.equalStr(c0.expect, "deny");
+
+    let c1 = corpus.get(1) ?? emptyCase();
+    assert.equalStr(c1.id, "pii-ssn-in-prompt");
+    assert.equalStr(c1.category, "pii-evasion");
+    assert.equalStr(c1.expect, "deny");
+
+    let c2 = corpus.get(2) ?? emptyCase();
+    assert.equalStr(c2.category, "prohibited-practice");
+    assert.equalStr(c2.expect, "deny");
+
+    let c3 = corpus.get(3) ?? emptyCase();
+    assert.equalStr(c3.category, "classification-spoof");
+    assert.equalStr(c3.expect, "deny");
+
+    let c4 = corpus.get(4) ?? emptyCase();
+    assert.equalStr(c4.category, "baseline");
+    assert.equalStr(c4.expect, "allow");
+
+    // The email case declares all five mutators and carries a payload.
+    assert.equalInt(c0.mutators.size(), 5);
+    assert.isTrue(c0.payload != undefined);
+    assert.equalStr(c0.payload ?? "", "ebella@gmail.com");
+
+    // The three non-payload cases carry no payload.
+    assert.isFalse(c2.payload != undefined);
+    assert.isFalse(c4.payload != undefined);
+}
+
+fn emptyCase(): redteam.Case {
+    return redteam.Case("", "", "", "", json.null(), undefined, List<string>());
+}

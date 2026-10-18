@@ -1,0 +1,14 @@
+// Persistence entity: one row of the `agents` table (the AI agents registered
+// under an app). Persistence-agnostic; the AgentDto view projection is derived
+// from it by the feature mapper. Snake_case fields match the Postgres columns.
+@serializable
+pub struct Agent {
+    pub id: string,
+    pub app_id: string,
+    pub name: string,
+    pub owner: string,
+    pub metadata_json: string,
+    pub active: bool,
+    pub tenant: string,
+    pub created_ms: long,
+}

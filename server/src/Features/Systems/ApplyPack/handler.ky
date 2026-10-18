@@ -1,0 +1,98 @@
+// POST /systems/{id}/apply-pack {framework|pack_id} -> {"ok":true,"seeded":n,"skipped":n}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import crypto.random;
+import controls;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+import Domain.Dtos.SystemDtos;
+
+pub struct ApplyPackHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ApplyPackHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str(string.concat(string.concat("unknown system '", id), "'")));
+            return Http.okObj(e);
+        }
+        let body = Http.bodyJson(ctx);
+        // Resolve the (framework, control_id) set.
+        let fws = list.List<string>();
+        let cids = list.List<string>();
+        let fwArg = systemhelp.sysStr(body, "framework");
+        if (fwArg.length > 0) {
+            let lib = controls.forFramework(fwArg);
+            let i = 0;
+            while (i < lib.size()) { fws.push(lib.at(i).framework); cids.push(lib.at(i).id); i = i + 1; }
+        } else {
+            let pid = systemhelp.sysStr(body, "pack_id");
+            if (pid.length > 0) {
+                let pr = await self.repo.packBody(pid);
+                if (pr.items.size() > 0) {
+                    let doc = json.tryParse((pr.items.getOr(0, SystemPackRow{ doc_json: "{}" })).doc_json);
+                    if (doc != undefined) {
+                        let arr = json.asArray(json.get(doc ?? json.null(), "controls"));
+                        if (arr != undefined) {
+                            let a = arr ?? List<json.JsonValue>();
+                            let j = 0;
+                            while (j < a.size()) {
+                                let c = a.at(j);
+                                let fw = json.asString(json.get(c, "framework")) ?? "";
+                                let cid = json.asString(json.get(c, "id")) ?? "";
+                                if (fw.length > 0 && cid.length > 0) { fws.push(fw); cids.push(cid); }
+                                j = j + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (cids.size() == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str("provide a known 'framework' or 'pack_id' with controls"));
+            return Http.okObj(e);
+        }
+        let existing = await self.repo.listAllSoa(id, tenant);
+        let seeded = 0;
+        let skipped = 0;
+        let now = Http.nowMs();
+        let k = 0;
+        while (k < cids.size()) {
+            let fw = fws.at(k);
+            let cid = cids.at(k);
+            if (hasSoa(existing, fw, cid)) { skipped = skipped + 1; } else {
+                await self.repo.setSoa(string.concat("soa-", random.randomHex(6)), id, fw, cid, 1, "", "planned", "[]", tenant, now);
+                seeded = seeded + 1;
+            }
+            k = k + 1;
+        }
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "pack-applied", "system", string.concat(string.concat("seeded ", `${seeded}`), string.concat(" skipped ", `${skipped}`)), tenant, now);
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true)); m.set("seeded", json.number(seeded as long)); m.set("skipped", json.number(skipped as long));
+        return Http.okObj(m);
+    }
+}
+
+fn hasSoa(rows: Rows<SoaStoredRow>, fw: string, cid: string): bool {
+    let i = 0;
+    while (i < rows.items.size()) {
+        let e = rows.items.getOr(i, SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 });
+        if (string.eql(e.framework, fw) && string.eql(e.control_id, cid)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}

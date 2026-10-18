@@ -1,0 +1,429 @@
+//! The persistence seam for the evidence ledger: a `Store` interface with a
+//! PostgreSQL backend and an in-memory backend behind the same contract.
+//!
+//! A port of the storage half of Rust `acp-core`'s `ledger/mod.rs`. The signed,
+//! append-only verifiable log is split into two layers in this Kyte port: the
+//! pure Merkle/record/STH algorithms live in `merkle.ky`, `canonical.ky`,
+//! `sign.ky`, and the in-memory `ledger.ky`; THIS module is the durable seam on
+//! top of them. Both backends preserve the canonical record bytes and the signed
+//! tree-head format exactly, so a head produced here verifies with the same
+//! `sign.verifySth` the rest of the trust core uses.
+//!
+//! [`Store`] is an async trait because the real backend ([`PgStore`]) does
+//! socket I/O through Kyte's `data.db` connection seam; [`MemStore`] implements
+//! the identical async surface without ever suspending, which is what lets the
+//! gate drive it on a plain `@test async fn` with no live database.
+//!
+//! What matches the Rust ledger:
+//!   - `appendRecord` is idempotent by `decision_id` (a repeat returns the
+//!     existing seq and does NOT extend the log, so retried batches never create
+//!     duplicate leaves);
+//!   - a new Ed25519-signed `SignedTreeHead` is produced on every real append
+//!     (never per record beyond that), over the canonical STH bytes;
+//!   - `verify` recomputes each stored head's root from the leaves and checks
+//!     its signature, catching both an edited leaf and a re-signed-impossible
+//!     history rewrite;
+//!   - `args_blob` is written idempotently and is independent of the leaf (the
+//!     leaf commits to the record, which holds only the args hash).
+//!
+//! Simplifications vs Rust: the at-rest AES-GCM envelope for argument blobs is
+//! represented by the schema's `encrypted` flag and left as plaintext here (the
+//! KEK plumbing is a later slice); the single-writer `EXCLUSIVE` lock Rust gets
+//! from SQLite is, on Postgres, the append-only triggers plus the NOSUPERUSER
+//! role (see `schema.ky`). The live Postgres round-trip is deferred behind a
+//! configured database (see the gate note); the `PgStore` path is COMPILE-
+//! CHECKED here, exercised against `MemStore`.
+
+import string;
+import list;
+import map;
+import types;
+import ledger;
+import canonical;
+import merkle;
+import hashing;
+import sign;
+import data.db;
+
+/// The durable persistence contract for the evidence ledger.
+///
+/// Both [`PgStore`] and [`MemStore`] implement this. Methods are async so the
+/// Postgres backend can await its connection; the in-memory backend satisfies
+/// the same signatures without suspending.
+pub trait Store {
+    /// Appends `rec` as a new leaf, idempotent by `decisionId`: a repeat of a
+    /// decision id already stored returns its existing seq and does not extend
+    /// the log. Returns the 0-based sequence (the leaf index).
+    async fn appendRecord(self, decisionId: string, rec: types.Record): long;
+    /// Stores the full argument payload under its hash, idempotently. The leaf
+    /// does not depend on it, so it can be purged later without breaking verify.
+    async fn putArgsBlob(self, argsHash: string, blob: string): void;
+    /// The signed head whose `tree_size` equals `size`, or `undefined` if none.
+    async fn headAt(self, size: long): ledger.HeadEntry | undefined;
+    /// The record at `seq`, or `undefined` if out of range.
+    async fn recordAt(self, seq: long): types.Record | undefined;
+    /// Every stored signed head, in ascending `tree_size` order.
+    async fn allHeads(self): list.List<ledger.HeadEntry>;
+    /// Verifies the whole log: each stored head's root matches the recomputed
+    /// root at its size and carries a valid signature. An empty store verifies.
+    async fn verify(self): bool;
+}
+
+// --- in-memory backend ------------------------------------------------------
+
+/// An in-memory [`Store`] for tests and for any caller that wants the verifiable
+/// log without a database. It wraps the existing `ledger.Ledger` (so the
+/// canonical record bytes, the RFC 6962 tree, and the Ed25519-signed heads are
+/// produced by exactly the same code the Postgres backend's format must match),
+/// and adds the decision-id idempotency index, the record list, and the args
+/// blobs that the durable seam owns.
+pub class MemStore impl Store {
+    /// The underlying signing ledger (Merkle log + per-append signed heads).
+    /// Public so a test can reach in to tamper a stored head and prove `verify`
+    /// rejects it.
+    pub led: ledger.Ledger,
+    /// Records in append order; the index is the seq.
+    pub records: list.List<types.Record>,
+    /// decision_id -> seq, the idempotency index.
+    pub seqByDecision: Map<string, long>,
+    /// args_hash -> stored payload.
+    pub argsBlobs: Map<string, string>,
+    /// The public key every stored head is verified under.
+    pub pubHex: string,
+
+    /// Creates an empty store that signs heads with the given keypair (hex).
+    init(privHex: string, pubHex: string) {
+        self.led = ledger.Ledger(privHex, pubHex);
+        self.records = list.List<types.Record>();
+        self.seqByDecision = Map<string, long>(16, string.hash);
+        self.argsBlobs = Map<string, string>(16, string.hash);
+        self.pubHex = pubHex;
+    }
+
+    pub async fn appendRecord(self, decisionId: string, rec: types.Record): long {
+        let existing = self.seqByDecision.get(decisionId);
+        if (existing != undefined) { return existing; }
+        let idx = self.led.appendRecord(rec);
+        let seq = idx as long;
+        self.records.push(rec);
+        self.seqByDecision.set(decisionId, seq);
+        return seq;
+    }
+
+    pub async fn putArgsBlob(self, argsHash: string, blob: string): void {
+        if (!self.argsBlobs.has(argsHash)) {
+            self.argsBlobs.set(argsHash, blob);
+        }
+    }
+
+    pub async fn headAt(self, size: long): ledger.HeadEntry | undefined {
+        let i = 0;
+        while (i < self.led.heads.size()) {
+            let e = self.led.heads.at(i);
+            if (e.sth.treeSize == size) { return e; }
+            i = i + 1;
+        }
+        return undefined;
+    }
+
+    pub async fn recordAt(self, seq: long): types.Record | undefined {
+        if (seq < 0 || seq >= (self.records.size() as long)) { return undefined; }
+        return self.records.get(seq as int);
+    }
+
+    pub async fn allHeads(self): list.List<ledger.HeadEntry> {
+        return self.led.heads;
+    }
+
+    pub async fn verify(self): bool {
+        return self.led.verify(self.pubHex);
+    }
+}
+
+// --- PostgreSQL backend (compile-checked; live round-trip deferred) ---------
+
+// Builds a bind value for an optional string column: a NULL cell when absent.
+fn optParam(s: string | undefined): db.DbValue {
+    if (s == undefined) { return db.dbNull(); }
+    return db.dbText(s);
+}
+
+// Reads an optional string column: `undefined` when the cell is NULL.
+fn optFromRow(row: db.Row, i: int): string | undefined {
+    if (row.isNull(i)) { return undefined; }
+    return row.getText(i);
+}
+
+/// A PostgreSQL-backed [`Store`] over the `data.db` connection seam.
+///
+/// It mirrors the Rust `Ledger`: a live `data.db.Connection`, an in-memory
+/// `merkle.MerkleLog` kept in step with the persisted leaves so a fresh head can
+/// be signed on each append, and the signing keypair (hex). On a real open the
+/// Merkle log is rebuilt from the stored `canonical` column via [`PgStore.load`];
+/// each `appendRecord` wraps the `records` + `tree_heads` inserts (and any
+/// `args_blob`) in one transaction so a record never lands without its signed
+/// head.
+///
+/// The SQL path is compile-checked in this slice and exercised end-to-end via
+/// [`MemStore`]; the live Postgres round-trip is deferred behind a configured
+/// database (needs `ACP_PG_TEST_URL`).
+pub class PgStore impl Store {
+    /// The live connection the statements run against.
+    pub conn: db.Connection,
+    /// In-memory Merkle log mirroring the persisted leaves, for root + sign.
+    pub merkle: merkle.MerkleLog,
+    /// Signing keypair (hex): 128-hex private, 64-hex public.
+    pub privHex: string,
+    pub pubHex: string,
+    /// Monotone head timestamp (ms), advanced once per append.
+    pub tsMs: long,
+
+    init(conn: db.Connection, privHex: string, pubHex: string) {
+        self.conn = conn;
+        self.merkle = merkle.MerkleLog();
+        self.privHex = privHex;
+        self.pubHex = pubHex;
+        self.tsMs = 0;
+    }
+
+    /// Rebuilds the in-memory Merkle log from the persisted `canonical` bytes in
+    /// seq order (the Rust `rebuild_merkle` / open path). Call once after
+    /// connecting, before the first append, so new heads extend the real tree.
+    pub async fn load(self): void {
+        self.merkle = merkle.MerkleLog();
+        let rs = await self.conn.query(
+            "SELECT canonical FROM records ORDER BY seq", list.List<db.DbValue>());
+        let i = 0;
+        while (i < rs.rowCount()) {
+            let canon = rs.row(i).getText(0);
+            let idx = self.merkle.append(canon as ptr, canon.length);
+            i = i + 1;
+        }
+    }
+
+    // Looks up the seq already stored for a decision id, or -1 if none.
+    pub async fn existingSeq(self, decisionId: string): long {
+        let p = list.List<db.DbValue>();
+        p.push(db.dbText(decisionId));
+        let rs = await self.conn.query(
+            "SELECT seq FROM records WHERE decision_id = $1", p);
+        if (rs.rowCount() == 0) { return 0 - 1; }
+        return rs.row(0).getLong(0);
+    }
+
+    pub async fn appendRecord(self, decisionId: string, rec: types.Record): long {
+        let prior = await self.existingSeq(decisionId);
+        if (prior >= 0) { return prior; }
+
+        let canon = canonical.recordCanonicalBytes(rec);
+        let leafHex = hashing.leafHashHex(canon as ptr, canon.length);
+
+        // Extend the in-memory tree; the returned index is the new leaf's seq.
+        let idx = self.merkle.append(canon as ptr, canon.length);
+        let seq = idx as long;
+        self.tsMs = self.tsMs + 1;
+        let ts = self.tsMs;
+
+        let bt = await self.conn.begin();
+
+        let rp = list.List<db.DbValue>();
+        rp.push(db.dbLong(seq));                                // seq
+        rp.push(db.dbText(decisionId));                         // decision_id
+        rp.push(db.dbInt(rec.schema));                          // schema
+        rp.push(db.dbLong(rec.tsMs));                           // ts_ms
+        rp.push(db.dbText(rec.hlc));                            // hlc
+        rp.push(optParam(rec.toolServerFingerprint));           // tool_server_fingerprint
+        rp.push(db.dbText(rec.agentId));                        // agent_id
+        rp.push(db.dbText(rec.principal.id));                   // principal_id
+        rp.push(db.dbBool(rec.principal.verified));             // principal_verified
+        rp.push(db.dbText(rec.sessionId));                      // session_id
+        rp.push(db.dbText(rec.tool));                           // tool
+        rp.push(db.dbText(rec.argsHash));                       // args_hash
+        rp.push(db.dbText(rec.impact.level.toSnake()));         // impact_level
+        rp.push(db.dbText(rec.impact.taxonomy));                // impact_taxonomy
+        rp.push(db.dbText(rec.verdict.toSnake()));              // verdict
+        rp.push(optParam(rec.ruleId));                          // rule_id
+        rp.push(optParam(rec.matched));                         // matched
+        rp.push(db.dbText(rec.policyHash));                     // policy_hash
+        rp.push(optParam(rec.reason));                          // reason
+        rp.push(db.dbText(rec.provenance.algoHash));            // prov_algo_hash
+        rp.push(db.dbText(rec.provenance.algoSig));             // prov_algo_sig
+        rp.push(db.dbText(rec.provenance.evaluator));           // prov_evaluator
+        rp.push(db.dbText(rec.provenance.compiler));            // prov_compiler
+        rp.push(db.dbText(rec.provenance.contextDerivation));   // prov_context_derivation
+        rp.push(db.dbText(canon));                              // canonical
+        rp.push(db.dbText(leafHex));                            // leaf_hash
+        rp.push(db.dbLong(ts));                                 // created_ms
+
+        let insRec = await self.conn.exec(
+            "INSERT INTO records (seq, decision_id, schema, ts_ms, hlc, "
+            + "tool_server_fingerprint, agent_id, principal_id, principal_verified, "
+            + "session_id, tool, args_hash, impact_level, impact_taxonomy, verdict, "
+            + "rule_id, matched, policy_hash, reason, prov_algo_hash, prov_algo_sig, "
+            + "prov_evaluator, prov_compiler, prov_context_derivation, canonical, "
+            + "leaf_hash, created_ms) VALUES "
+            + "($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,"
+            + "$20,$21,$22,$23,$24,$25,$26,$27)", rp);
+        if (insRec.hasError()) {
+            let rb = await self.conn.rollback();
+            await self.load();
+            return 0 - 1;
+        }
+
+        // Sign a fresh head over the extended tree.
+        let sth = types.SignedTreeHead(self.merkle.size() as long, self.merkle.root(), ts);
+        let sig = sign.signSth(self.privHex, sth);
+
+        let hp = list.List<db.DbValue>();
+        hp.push(db.dbLong(sth.treeSize));
+        hp.push(db.dbText(sth.rootHashHex));
+        hp.push(db.dbLong(sth.timestampMs));
+        hp.push(db.dbText(sig));
+        hp.push(db.dbText(self.pubHex));
+        let insHead = await self.conn.exec(
+            "INSERT INTO tree_heads (tree_size, root_hash, timestamp_ms, sig_hex, pubkey_hex) "
+            + "VALUES ($1,$2,$3,$4,$5)", hp);
+        if (insHead.hasError()) {
+            let rb = await self.conn.rollback();
+            await self.load();
+            return 0 - 1;
+        }
+
+        let cm = await self.conn.commit();
+        if (cm.hasError()) {
+            await self.load();
+            return 0 - 1;
+        }
+        return seq;
+    }
+
+    pub async fn putArgsBlob(self, argsHash: string, blob: string): void {
+        let p = list.List<db.DbValue>();
+        p.push(db.dbText(argsHash));
+        p.push(db.dbText(blob));
+        p.push(db.dbBool(false));
+        let r = await self.conn.exec(
+            "INSERT INTO args_blob (args_hash, blob, encrypted) VALUES ($1,$2,$3) "
+            + "ON CONFLICT (args_hash) DO NOTHING", p);
+    }
+
+    pub async fn headAt(self, size: long): ledger.HeadEntry | undefined {
+        let p = list.List<db.DbValue>();
+        p.push(db.dbLong(size));
+        let rs = await self.conn.query(
+            "SELECT tree_size, root_hash, timestamp_ms, sig_hex FROM tree_heads "
+            + "WHERE tree_size = $1", p);
+        if (rs.rowCount() == 0) { return undefined; }
+        let row = rs.row(0);
+        let sth = types.SignedTreeHead(row.getLong(0), row.getText(1), row.getLong(2));
+        return ledger.HeadEntry(sth, row.getText(3));
+    }
+
+    pub async fn recordAt(self, seq: long): types.Record | undefined {
+        let p = list.List<db.DbValue>();
+        p.push(db.dbLong(seq));
+        let rs = await self.conn.query(
+            "SELECT schema, ts_ms, hlc, tool_server_fingerprint, agent_id, principal_id, "
+            + "principal_verified, session_id, tool, args_hash, impact_level, impact_taxonomy, "
+            + "verdict, rule_id, matched, policy_hash, reason, prov_algo_hash, prov_algo_sig, "
+            + "prov_evaluator, prov_compiler, prov_context_derivation FROM records WHERE seq = $1", p);
+        if (rs.rowCount() == 0) { return undefined; }
+        let row = rs.row(0);
+        let principal = types.Principal(row.getText(5), row.getBool(6));
+        let impact = types.Impact(types.BlastRadius.fromSnake(row.getText(10)), row.getText(11));
+        let provenance = types.Provenance(
+            row.getText(17), row.getText(18), row.getText(19), row.getText(20), row.getText(21));
+        return types.Record(
+            row.getInt(0),                                  // schema
+            seq,
+            row.getLong(1),                                 // ts_ms
+            row.getText(2),                                 // hlc
+            optFromRow(row, 3),                             // tool_server_fingerprint
+            row.getText(4),                                 // agent_id
+            principal,
+            row.getText(7),                                 // session_id
+            row.getText(8),                                 // tool
+            row.getText(9),                                 // args_hash
+            impact,
+            types.Verdict.fromSnake(row.getText(12)),       // verdict
+            optFromRow(row, 13),                            // rule_id
+            optFromRow(row, 14),                            // matched
+            row.getText(15),                                // policy_hash
+            optFromRow(row, 16),                            // reason
+            provenance);
+    }
+
+    pub async fn allHeads(self): list.List<ledger.HeadEntry> {
+        let out = list.List<ledger.HeadEntry>();
+        let rs = await self.conn.query(
+            "SELECT tree_size, root_hash, timestamp_ms, sig_hex FROM tree_heads ORDER BY tree_size",
+            list.List<db.DbValue>());
+        let i = 0;
+        while (i < rs.rowCount()) {
+            let row = rs.row(i);
+            let sth = types.SignedTreeHead(row.getLong(0), row.getText(1), row.getLong(2));
+            out.push(ledger.HeadEntry(sth, row.getText(3)));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    pub async fn verify(self): bool {
+        // Rebuild the leaves from the stored canonical bytes, checking each
+        // stored leaf_hash, then check every stored head's recomputed root and
+        // signature. This mirrors the Rust `Ledger::verify` exactly.
+        let recs = await self.conn.query(
+            "SELECT canonical, leaf_hash FROM records ORDER BY seq", list.List<db.DbValue>());
+        let log = merkle.MerkleLog();
+        let i = 0;
+        while (i < recs.rowCount()) {
+            let canon = recs.row(i).getText(0);
+            let storedLeaf = recs.row(i).getText(1);
+            let leaf = hashing.leafHashHex(canon as ptr, canon.length);
+            if (!string.eql(leaf, storedLeaf)) { return false; }
+            let idx = log.appendHashHex(leaf);
+            i = i + 1;
+        }
+
+        let heads = await self.conn.query(
+            "SELECT tree_size, root_hash, timestamp_ms, sig_hex, pubkey_hex FROM tree_heads "
+            + "ORDER BY tree_size", list.List<db.DbValue>());
+        let any = false;
+        let j = 0;
+        while (j < heads.rowCount()) {
+            any = true;
+            let row = heads.row(j);
+            let size = row.getLong(0) as int;
+            if (size > log.size()) { return false; }
+            let recomputed = merkle.rootOf(log.leaves.slice(0, size));
+            if (!string.eql(recomputed, row.getText(1))) { return false; }
+            let sth = types.SignedTreeHead(row.getLong(0), row.getText(1), row.getLong(2));
+            if (!sign.verifySth(row.getText(4), sth, row.getText(3))) { return false; }
+            j = j + 1;
+        }
+        if (!any && log.size() > 0) { return false; }
+        return true;
+    }
+}
+
+// --- constructors -----------------------------------------------------------
+//
+// NOTE on the module name: this file is `store.ky` as the slice requires, but
+// the current Kyte compiler reserves the bare module token `store`, so a class
+// declared here is not reachable as `store.MemStore` from another module
+// (`store.<freeFunction>` resolves fine). These factory functions are the
+// supported way to construct the backends across the module boundary; callers
+// write `store.newMemStore(...)` / `store.newPgStore(...)` and get a fully typed
+// value with all of the `Store` methods.
+
+/// Creates an in-memory [`MemStore`] that signs heads with the given keypair.
+pub fn newMemStore(privHex: string, pubHex: string): MemStore {
+    return MemStore(privHex, pubHex);
+}
+
+/// Creates a PostgreSQL-backed [`PgStore`] over an open `data.db` connection.
+/// Call [`PgStore.load`] once before the first append to rebuild the in-memory
+/// Merkle log from any already-persisted records.
+pub fn newPgStore(conn: db.Connection, privHex: string, pubHex: string): PgStore {
+    return PgStore(conn, privHex, pubHex);
+}

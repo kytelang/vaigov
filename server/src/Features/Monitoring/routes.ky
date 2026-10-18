@@ -1,0 +1,31 @@
+// Monitoring feature route table (acp-compatible JSON over the shared `acp` db):
+// drift + lineage counts, spike alerts, proxy heartbeat, and human-oversight
+// thresholds. /leader, /liveness, /metrics are owned by the Health feature and
+// NOT registered here. /events/recent, /event/:kind, /timeline, /inbox,
+// /meta-audit live in other acp handler files (assurance/evidence) and are a
+// later wave, so they are not registered here.
+import web.app;
+import Shared.AppContext;
+import Features.Monitoring.Shared.MonitorRepository;
+import Features.Monitoring.DriftGet.handler;
+import Features.Monitoring.DriftPost.handler;
+import Features.Monitoring.LineageGet.handler;
+import Features.Monitoring.LineagePost.handler;
+import Features.Monitoring.Alerts.handler;
+import Features.Monitoring.Heartbeat.handler;
+import Features.Monitoring.OversightGet.handler;
+import Features.Monitoring.OversightConfig.handler;
+import Features.Monitoring.OversightScan.handler;
+
+pub fn registerMonitoring(ctx: AppContext): void {
+    let repo = MonitorRepository(ctx.db);
+    ctx.app.get("/monitor/drift", DriftGetHandler(repo, ctx));
+    ctx.app.post("/monitor/drift", DriftPostHandler(repo, ctx));
+    ctx.app.get("/monitor/lineage", LineageGetHandler(repo, ctx));
+    ctx.app.post("/monitor/lineage", LineagePostHandler(repo, ctx));
+    ctx.app.get("/alerts", AlertsHandler(ctx));
+    ctx.app.post("/heartbeat/{proxy}", HeartbeatHandler(repo, ctx));
+    ctx.app.get("/oversight", OversightGetHandler(repo, ctx));
+    ctx.app.post("/oversight/config", OversightConfigHandler(repo, ctx));
+    ctx.app.post("/oversight/scan", OversightScanHandler(repo, ctx));
+}

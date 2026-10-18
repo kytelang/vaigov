@@ -1,0 +1,155 @@
+//! Control-plane sync: the outbound policy pull, the endpoint-registry pull
+//! (which drives Envoy regeneration), and the store-and-forward flush of queued
+//! violations.
+//!
+//! These use the synchronous `web.client.Http`. They are invoked from the
+//! background loops in `main`. Each is tolerant of a down control plane: a
+//! failed poll keeps serving the last-good bundle, and a failed flush leaves the
+//! queue intact for the next tick. They are NOT exercised by the offline gate
+//! (they need a live control plane); the cache/queue/emit functions they call
+//! are what the tests drive directly.
+
+import state;
+import envoy;
+import sign;
+import web.client;
+import web.response;
+import web.status;
+import serde.source;
+import string;
+import list;
+
+/// Adds the tenant and optional bearer headers every CP call carries.
+fn authHeaders(st: state.SidecarState): Map<string, string> {
+    let h = client.Http.emptyHeaders();
+    h.set("x-acp-tenant", st.cfg.tenant);
+    if (!string.eql(st.cfg.token, "")) {
+        h.set("authorization", "Bearer " + st.cfg.token);
+    }
+    return h;
+}
+
+fn isSuccess(resp: response.Response): bool {
+    let code = Status.toCode(resp.status);
+    return code >= 200 && code < 300;
+}
+
+/// Verifies a pulled config response against the control-plane public key (R5 +
+/// R4). When `cp_pubkey` is unset the check is skipped (returns true, backward
+/// compatible with an unsigned control plane). When it IS set, the response MUST
+/// carry a valid `x-acp-signature` over its body or verification fails: the
+/// sidecar then refuses to apply the config and keeps last-good (fail-closed).
+pub fn verifyPulled(st: state.SidecarState, resp: response.Response): bool {
+    if (string.eql(st.cfg.cp_pubkey, "")) { return true; }
+    let sig = resp.getHeader("x-acp-signature") ?? "";
+    if (string.eql(sig, "")) { return false; }
+    return sign.verifyHex(st.cfg.cp_pubkey, resp.body as ptr, resp.body.length, sig);
+}
+
+/// Polls the control plane for the policy bundle. On success refreshes the cache
+/// (memory + disk); on any failure keeps the last-good bundle and records the
+/// error.
+pub fn syncOnce(st: state.SidecarState): void {
+    let url = st.cfg.control_plane + "/v1/bundles/" + st.cfg.bundle_name;
+    let resp = client.Http.request("GET", url, authHeaders(st), "");
+    if (isSuccess(resp)) {
+        if (!verifyPulled(st, resp)) {
+            st.markError("bundle signature verification failed (kept last-good)");
+            return;
+        }
+        let changed = st.setBundle(resp.body);
+        if (changed) { console.log("policy synced, revision " + st.revision); }
+    } else {
+        st.markError("control plane returned " + `${Status.toCode(resp.status)}`);
+    }
+}
+
+/// Pulls the governed AI-endpoint registry. When it changes and an envoy dir is
+/// configured, regenerates the Envoy config (clusters first, then listener).
+pub fn syncEndpoints(st: state.SidecarState): void {
+    let url = st.cfg.control_plane + "/ai-endpoints";
+    let resp = client.Http.request("GET", url, authHeaders(st), "");
+    if (!isSuccess(resp)) { return; }
+    if (!verifyPulled(st, resp)) {
+        st.markError("endpoint registry signature verification failed (kept last-good)");
+        return;
+    }
+    let eps = parseEndpoints(resp.body);
+    let changed = st.setEndpoints(eps);
+    if (changed) { st.renderEnvoy(); }
+}
+
+/// Parses `{"endpoints":[{host,port,enabled}]}` into a list of `Endpoint`.
+pub fn parseEndpoints(body: string): list.List<envoy.Endpoint> {
+    let out = list.List<envoy.Endpoint>();
+    let src = source.fromJson(body);
+    let n = src.arrayLen("endpoints");
+    let i = 0;
+    while (i < n) {
+        let e = src.itemChild("endpoints", i);
+        let host = e.getString("host");
+        let port = e.getInt("port");
+        if (port == 0) { port = 443; }
+        let enabled = if (e.has("enabled")) e.getBool("enabled") else true;
+        out.push(envoy.Endpoint(host, port as int, enabled));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Drains a batch of queued violations to the control plane and removes the ones
+/// it confirms. Leaves the queue intact on failure (store-and-forward retry).
+pub fn flushOnce(st: state.SidecarState): void {
+    let batch = st.vs.unflushedBatchJson(500);
+    if (batch.size() == 0) { return; }
+    let body = "[" + string.join(batch, ",") + "]";
+    let url = st.cfg.control_plane + "/logs";
+    let h = authHeaders(st);
+    h.set("content-type", "application/json");
+    // The control plane can verify each record's Ed25519 signature and chain; we
+    // also pass our public key so it can key verification to this edge.
+    h.set("x-acp-edge-pubkey", st.pubHex);
+    let resp = client.Http.request("POST", url, h, body);
+    st.lastFlushMs = state.nowMs();
+    if (isSuccess(resp)) {
+        // Advance the flush cursor; records stay in the local history (not deleted).
+        st.vs.markFlushed(batch.size());
+        st.lastFlushOk = true;
+    } else {
+        st.lastFlushOk = false;
+    }
+}
+
+/// Pulls the installed policy packs (R5) so the console can show WHAT is being
+/// enforced (packs by name), not merely that a bundle is loaded. Stored as the
+/// last-good packs list; a failed pull keeps the previous one. Tolerant of shape:
+/// a top-level array is stored as-is, otherwise an empty array is kept.
+pub fn syncPacks(st: state.SidecarState): void {
+    let url = st.cfg.control_plane + "/policy-packs/installed";
+    let resp = client.Http.request("GET", url, authHeaders(st), "");
+    if (!isSuccess(resp)) { return; }
+    if (!verifyPulled(st, resp)) {
+        st.markError("policy-packs signature verification failed (kept last-good)");
+        return;
+    }
+    let t = string.trim(resp.body);
+    let packs = if (t.length > 0 && t[0] == 91) t else "[]"; // '[' -> a JSON array
+    let changed = st.setPacks(packs);
+    if (changed) { console.log("installed packs updated"); }
+}
+
+/// Pulls the active content-firewall rule set (content firewall), verifies the
+/// signature fail-closed (R5 + R4), and on change recompiles the engine set. A
+/// failed pull or bad signature keeps the last-good rules.
+pub fn syncContentRules(st: state.SidecarState): void {
+    if (!st.cfg.content_firewall) { return; }
+    let url = st.cfg.control_plane + "/content-rules";
+    let resp = client.Http.request("GET", url, authHeaders(st), "");
+    if (!isSuccess(resp)) { return; }
+    if (!verifyPulled(st, resp)) {
+        st.markError("content-rules signature verification failed (kept last-good)");
+        return;
+    }
+    let changed = st.setContentRules(resp.body);
+    if (changed) { console.log("content rules updated: " + `${st.cfRuleCount()}` + " active"); }
+}

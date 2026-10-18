@@ -1,0 +1,22 @@
+// Content-firewall rule authoring routes. The control plane authors + signs; the
+// edge sidecar pulls the signed ActiveSet and enforces. Only registration here;
+// each handler is in its own <UseCase>/handler.ky. Register the console view
+// BEFORE any param route, per the router's registration-order matching.
+import web.app;
+import Shared.AppContext;
+import Features.ContentRules.Shared.ContentRuleRepository;
+import Features.ContentRules.ActiveSet.handler;
+import Features.ContentRules.RulesView.handler;
+import Features.ContentRules.RulesConsole.handler;
+
+pub fn registerContentRules(ctx: AppContext): void {
+    let repo = ContentRuleRepository(ctx.db);
+    // Console (human) surface.
+    ctx.app.get("/content-rules/view", RulesViewHandler(repo, ctx));
+    ctx.app.post("/console/content-rules/save", RulesSaveHandler(repo, ctx));
+    ctx.app.post("/console/content-rules/delete", RulesDeleteHandler(repo, ctx));
+    ctx.app.post("/console/content-rules/toggle", RulesToggleHandler(repo, ctx));
+    ctx.app.post("/console/content-rules/test", RulesTestHandler(repo, ctx));
+    // Machine surface: the SIGNED active set the edge sidecar pulls.
+    ctx.app.get("/content-rules", ActiveSetHandler(repo, ctx));
+}

@@ -1,0 +1,75 @@
+//! Ticketing integration (design-refinements R3).
+//!
+//! When a violation warrants it (its verdict is in `ticket_on`), the sidecar
+//! raises a ticket in the customer's ticketing system. The per-system REST
+//! details now live in the shared client packages (`jira-client`,
+//! `servicenow-client`, `itsm-client`) so the control plane and the sidecar use
+//! one implementation per system.
+//!
+//! Raising happens off the ingest hot path, in a background loop: the ingest
+//! handler stays fast (durable-write then ack), and this loop later picks up
+//! records whose `ticket_number` is still empty. So a ticketing outage means
+//! tickets are raised late, never that a violation is lost. The store itself is
+//! the dedup: `awaitingTicket` only returns records with no number yet.
+
+import state;
+import violation;
+import settings;
+import string;
+import ticketclient;
+
+/// Whether ticketing is configured (a base URL is set).
+pub fn enabled(cfg: settings.Config): bool {
+    return !string.eql(cfg.ticketing_url, "");
+}
+
+fn firstNonEmpty(a: string, b: string): string {
+    if (!string.eql(a, "")) { return a; }
+    return b;
+}
+
+/// A human summary and description shared by every system's payload.
+fn summary(v: violation.Violation): string {
+    return "Policy violation: " + v.verdict + " on " + v.endpointHost;
+}
+fn description(v: violation.Violation): string {
+    return "Verdict " + v.verdict + " · policy " + firstNonEmpty(v.policyName, v.ruleRegoPath) +
+        " · principal " + v.principal + " · endpoint " + v.endpointHost +
+        " · decision " + v.decisionId + " · prompt_sha " + v.promptSha;
+}
+
+/// Raises a single ticket for `v` in the configured system via the shared client
+/// packages. Returns the ticket number/key, or "" on failure (the record is left
+/// untouched so the next loop retries).
+pub fn raise(cfg: settings.Config, v: violation.Violation): string {
+    let tk = ticketclient.Ticketing(cfg.ticketing_system, cfg.ticketing_url, cfg.ticketing_user, cfg.ticketing_token, cfg.ticketing_project, 10000);
+    // Stable idempotency key (id + signature) so a retry after a crash between
+    // "ticket created" and "number written back" does not open a duplicate.
+    let idem = `${v.id}` + "-" + v.sigHex;
+    let r = tk.raise(summary(v), description(v), v.verdict, idem);
+    if (r.ok) { return r.id; }
+    return "";
+}
+
+/// One pass of the ticketing loop: for each record awaiting a ticket whose
+/// verdict is in `ticket_on`, raise a ticket and record its number. Persists the
+/// store if any record changed (ticket fields are outside the signed core, so
+/// rewriting the log does not disturb signatures). Returns the number raised.
+pub fn raiseOnce(st: state.SidecarState): int {
+    if (!enabled(st.cfg)) { return 0; }
+    let pending = st.vs.awaitingTicket(st.cfg.ticket_on);
+    let raised = 0;
+    let i = 0;
+    while (i < pending.size()) {
+        let rec = pending.get(i) ?? violation.Violation();
+        let num = raise(st.cfg, rec);
+        if (!string.eql(num, "")) {
+            rec.ticketNumber = num;
+            rec.ticketStatus = "open";
+            raised = raised + 1;
+        }
+        i = i + 1;
+    }
+    if (raised > 0) { st.vs.rewriteAll(); }
+    return raised;
+}

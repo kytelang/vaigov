@@ -1,0 +1,186 @@
+// SystemRepository: ai_systems/system_roles/soa_entries/evidence/grc_audit over
+// the shared `acp` Postgres db. SQL mirrors acp-server store.rs (tenant_id column,
+// jurisdictions/evidence_refs as JSON-text columns).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.SystemDtos;
+
+pub struct SystemRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn listSystems(self: SystemRepository, tenant: string): Rows<SystemRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<SystemRow>(conn, "ai_systems").query(
+            "SELECT id, name, purpose, owner, lifecycle_state, risk_tier, sector, asset_type, jurisdictions, tenant_id AS tenant, created_ms, updated_ms FROM ai_systems WHERE tenant_id = $1 ORDER BY created_ms DESC", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn getSystem(self: SystemRepository, id: string, tenant: string): Rows<SystemRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<SystemRow>(conn, "ai_systems").query(
+            "SELECT id, name, purpose, owner, lifecycle_state, risk_tier, sector, asset_type, jurisdictions, tenant_id AS tenant, created_ms, updated_ms FROM ai_systems WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addSystem(self: SystemRepository, id: string, name: string, purpose: string, owner: string, lifecycle: string, riskTier: string, sector: string, assetType: string, jurisdictions: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(name)); p.push(db.dbText(purpose)); p.push(db.dbText(owner));
+        p.push(db.dbText(lifecycle)); p.push(db.dbText(riskTier)); p.push(db.dbText(sector)); p.push(db.dbText(assetType));
+        p.push(db.dbText(jurisdictions)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO ai_systems (id, name, purpose, owner, lifecycle_state, risk_tier, sector, asset_type, jurisdictions, tenant_id, created_ms, updated_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn updateSystem(self: SystemRepository, id: string, name: string, purpose: string, owner: string, lifecycle: string, riskTier: string, sector: string, assetType: string, jurisdictions: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(purpose)); p.push(db.dbText(owner)); p.push(db.dbText(lifecycle));
+        p.push(db.dbText(riskTier)); p.push(db.dbText(sector)); p.push(db.dbText(assetType)); p.push(db.dbText(jurisdictions));
+        p.push(db.dbLong(nowMs)); p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE ai_systems SET name=$1, purpose=$2, owner=$3, lifecycle_state=$4, risk_tier=$5, sector=$6, asset_type=$7, jurisdictions=$8, updated_ms=$9 WHERE id=$10 AND tenant_id=$11", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn deleteSystem(self: SystemRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p1 = list.List<DbValue>(); p1.push(db.dbText(id));
+        let _a = await conn.exec("DELETE FROM system_roles WHERE system_id = $1", p1);
+        let p2 = list.List<DbValue>(); p2.push(db.dbText(id));
+        let _b = await conn.exec("DELETE FROM soa_entries WHERE system_id = $1", p2);
+        let p3 = list.List<DbValue>(); p3.push(db.dbText(id));
+        let _c = await conn.exec("DELETE FROM evidence WHERE system_id = $1", p3);
+        let p4 = list.List<DbValue>(); p4.push(db.dbText(id)); p4.push(db.dbText(tenant));
+        let _d = await conn.exec("DELETE FROM ai_systems WHERE id = $1 AND tenant_id = $2", p4);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listRoles(self: SystemRepository, id: string, tenant: string): Rows<SystemRoleRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<SystemRoleRow>(conn, "system_roles").query(
+            "SELECT id, system_id, role, jurisdiction, market_date, created_ms FROM system_roles WHERE system_id = $1 AND tenant_id = $2 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addRole(self: SystemRepository, rid: string, systemId: string, role: string, jurisdiction: string, marketDate: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(rid)); p.push(db.dbText(systemId)); p.push(db.dbText(role)); p.push(db.dbText(jurisdiction));
+        p.push(db.dbText(marketDate)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO system_roles (id, system_id, role, jurisdiction, market_date, tenant_id, created_ms) VALUES ($1,$2,$3,$4,$5,$6,$7)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn deleteRole(self: SystemRepository, rid: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(rid)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM system_roles WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listSoa(self: SystemRepository, id: string, framework: string, tenant: string): Rows<SoaStoredRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(framework)); p.push(db.dbText(tenant));
+        let r = await Repository<SoaStoredRow>(conn, "soa_entries").query(
+            "SELECT framework, control_id, applicable, justification, status, updated_ms FROM soa_entries WHERE system_id = $1 AND framework = $2 AND tenant_id = $3", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn listAllSoa(self: SystemRepository, id: string, tenant: string): Rows<SoaStoredRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<SoaStoredRow>(conn, "soa_entries").query(
+            "SELECT framework, control_id, applicable, justification, status, updated_ms FROM soa_entries WHERE system_id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn setSoa(self: SystemRepository, soaId: string, id: string, framework: string, controlId: string, applicable: int, justification: string, status: string, evidenceRefs: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let pd = list.List<DbValue>();
+        pd.push(db.dbText(id)); pd.push(db.dbText(framework)); pd.push(db.dbText(controlId)); pd.push(db.dbText(tenant));
+        let _d = await conn.exec("DELETE FROM soa_entries WHERE system_id=$1 AND framework=$2 AND control_id=$3 AND tenant_id=$4", pd);
+        let p = list.List<DbValue>();
+        p.push(db.dbText(soaId)); p.push(db.dbText(id)); p.push(db.dbText(framework)); p.push(db.dbText(controlId));
+        p.push(db.dbInt(applicable)); p.push(db.dbText(justification)); p.push(db.dbText(status)); p.push(db.dbText(evidenceRefs));
+        p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO soa_entries (id, system_id, framework, control_id, applicable, justification, status, evidence_refs, tenant_id, updated_ms, checklist_item_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'')", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listEvidence(self: SystemRepository, id: string, tenant: string): Rows<SystemEvidenceRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<SystemEvidenceRow>(conn, "evidence").query(
+            "SELECT id, framework, control_id, title, source, owner, produced_ms, valid_until_ms FROM evidence WHERE system_id = $1 AND tenant_id = $2 ORDER BY created_ms DESC", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addEvidence(self: SystemRepository, eid: string, systemId: string, framework: string, controlId: string, title: string, source: string, owner: string, producedMs: long, validUntilMs: long, artefactRef: string, note: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(eid)); p.push(db.dbText(systemId)); p.push(db.dbText(framework)); p.push(db.dbText(controlId));
+        p.push(db.dbText(title)); p.push(db.dbText(source)); p.push(db.dbText(owner)); p.push(db.dbLong(producedMs));
+        p.push(db.dbLong(validUntilMs)); p.push(db.dbText(artefactRef)); p.push(db.dbText(note)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO evidence (id, system_id, framework, control_id, title, source, owner, produced_ms, valid_until_ms, artefact_ref, note, tenant_id, created_ms, checklist_item_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'')", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listAudit(self: SystemRepository, id: string, tenant: string): Rows<SystemAuditRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<SystemAuditRow>(conn, "grc_audit").query(
+            "SELECT id, action, actor, detail, ts_ms FROM grc_audit WHERE entity_id = $1 AND tenant_id = $2 ORDER BY ts_ms DESC LIMIT 500", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addAudit(self: SystemRepository, aid: string, entityId: string, action: string, actor: string, detail: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(aid)); p.push(db.dbText(entityId)); p.push(db.dbText(action)); p.push(db.dbText(actor));
+        p.push(db.dbText(detail)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO grc_audit (id, entity_type, entity_id, action, actor, detail, tenant_id, ts_ms) VALUES ($1,'system',$2,$3,$4,$5,$6,$7)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn grcForSubject(self: SystemRepository, subject: string, tenant: string): Rows<SystemGrcRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(subject)); p.push(db.dbText(tenant));
+        let r = await Repository<SystemGrcRow>(conn, "grc_records").query(
+            "SELECT id, kind, title, status, subject FROM grc_records WHERE subject = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn packBody(self: SystemRepository, pid: string): Rows<SystemPackRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(pid));
+        let r = await Repository<SystemPackRow>(conn, "control_packs").query(
+            "SELECT doc_json FROM control_packs WHERE id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+}

@@ -1,0 +1,80 @@
+// POST /grc/risk {subject,title?,likelihood,impact,treatment?,owner?} ->
+//   {"ok":true,"id","score","band"}. Risk register entry (kind=risk); score =
+//   likelihood*impact, band from the score (acp riskregister).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+import Features.Grc.AssessGrc.handler;
+
+pub fn grcLevel(s: string): int {
+    if (string.eql(s, "low")) { return 1; }
+    if (string.eql(s, "medium")) { return 2; }
+    if (string.eql(s, "high")) { return 3; }
+    return 0;
+}
+
+pub fn grcBand(score: int): string {
+    if (score <= 2) { return "low"; }
+    if (score <= 4) { return "medium"; }
+    if (score <= 6) { return "high"; }
+    return "critical";
+}
+
+pub struct RiskGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RiskGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let subject = string.trim(grcsign.grcStr(body, "subject"));
+        if (subject.length == 0) { return grcErr("subject is required"); }
+        let title = grcsign.grcStr(body, "title");
+        if (title.length == 0) { title = "Risk"; }
+        let lk = grcsign.grcStr(body, "likelihood");
+        let im = grcsign.grcStr(body, "impact");
+        let lkl = grcLevel(lk);
+        if (lkl == 0) { return grcErr("likelihood must be low|medium|high"); }
+        let iml = grcLevel(im);
+        if (iml == 0) { return grcErr("impact must be low|medium|high"); }
+        let treatment = grcsign.grcStr(body, "treatment");
+        if (treatment.length == 0) { treatment = "mitigate"; }
+        let owner = grcsign.grcStr(body, "owner");
+        if (owner.length == 0) { owner = "console"; }
+        let score = lkl * iml;
+        let band = grcBand(score);
+
+        let db = Map<string, json.JsonValue>(8, string.hash);
+        db.set("kind", json.str("risk"));
+        db.set("likelihood", json.str(lk));
+        db.set("impact", json.str(im));
+        db.set("treatment", json.str(treatment));
+        db.set("owner", json.str(owner));
+        db.set("score", json.number(score as long));
+        db.set("band", json.str(band));
+        let docBody = json.stringify(json.object(db));
+
+        let id = string.concat("grc-", random.randomHex(6));
+        let now = Http.nowMs();
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let doc = grcsign.grcDoc(id, "risk", subject, title, "open", docBody);
+        let sig = grcsign.grcSignHex(self.app.trust.keypair.privHex, doc);
+        await self.repo.add(id, "risk", subject, title, "open", docBody, "console", now, self.app.trust.keypair.pubHex, sig, "[]", "{}", "", 0, "open", tenant);
+
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("score", json.number(score as long));
+        m.set("band", json.str(band));
+        return Http.okObj(m);
+    }
+}

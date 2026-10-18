@@ -1,0 +1,26 @@
+// GET /policy-packs/{slug}/redteam -> the pack's attack corpus (text/yaml), or 404.
+import web.routing;
+import web.response;
+import web.status;
+import serde.json;
+import Shared.AppContext;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+
+pub struct RedteamHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RedteamHandler, ctx: routing.Context): response.Response {
+        let slug = ctx.param("slug");
+        let p = packdata.findPack(slug);
+        if (p == undefined) {
+            return response.Response(Status.NotFound, "no corpus");
+        }
+        let corpus = json.asString(json.get(p ?? json.null(), "redteam_corpus")) ?? "";
+        let r = response.Response(Status.Ok, corpus);
+        r.headers.set("Content-Type", "text/yaml");
+        return r;
+    }
+}

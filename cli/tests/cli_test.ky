@@ -1,0 +1,181 @@
+//! Offline gate for varman-cli: drives the command FUNCTIONS directly (no
+//! process fork, no network). Covers policy-compile round-trip, policy-test and
+//! --diff, content-scan, sign/verify-artifact, init->compile, and verify-pack.
+
+import assert;
+import string;
+import list;
+import map;
+import serde.json;
+import io.file;
+import io.dir;
+import rego;
+import cmd_policy;
+import cmd_content;
+import cmd_artifact;
+import cmd_evidence;
+import cmd_init;
+
+const SEED: string = "9d61b19deffebc3f0dca8b11ad8f0d17a6b5a2b5a7a8b9c0d1e2f30415263748";
+
+// A known rego-model rule (byte-identical to varman-core's policy gate), whose
+// compiled Rego is a fixed known answer.
+const RULE_DELETE: string =
+    "{\"rule_id\":\"r1\",\"verdict\":\"deny\",\"enabled\":true,\"controls\":[{\"act\":\"require\",\"control_id\":\"C-1\"}],\"obligations\":[],\"match\":{\"combinator\":\"all\",\"groups\":[{\"combinator\":\"all\",\"conditions\":[{\"target\":\"operation\",\"op\":\"eq\",\"value\":\"delete\"}]}]}}";
+
+fn tmpDir(): string {
+    let d = "build/clitest";
+    Dir.create("build", 493);
+    Dir.create(d, 493);
+    return d;
+}
+
+fn writeFile(path: string, content: string): void {
+    assert.isTrue(File.writeTextOk(path, content));
+}
+
+fn rulesFrom(ruleSrc: string): List<json.JsonValue> {
+    let r = List<json.JsonValue>();
+    r.push(json.parse(ruleSrc));
+    return r;
+}
+
+// ---- policy-compile round-trip -------------------------------------------
+
+@test
+fn policy_compile_round_trips_through_cli_parse_path(): void {
+    let dir = tmpDir();
+    let docSrc = "{\"default\":\"allow\",\"rules\":[" + RULE_DELETE + "]}";
+    let path = `${dir}/policy.json`;
+    writeFile(path, docSrc);
+
+    // CLI parse path: read the file, parse, compile.
+    let doc = cmd_policy.loadDoc(path);
+    assert.isTrue(doc != undefined);
+    let viaCli = cmd_policy.compileDoc(doc ?? json.null());
+    assert.isTrue(viaCli != undefined);
+
+    // Direct: rego.compileRules on the same rule set + default.
+    let direct = rego.compileRules(rulesFrom(RULE_DELETE), "allow");
+    assert.equalStr(viaCli ?? "", direct);
+
+    // and it is a real Rego module.
+    assert.contains(viaCli ?? "", "package acp");
+    assert.contains(viaCli ?? "", "input.operation == \"delete\"");
+}
+
+// ---- policy-test + --diff -------------------------------------------------
+
+fn denyDeleteDoc(): json.JsonValue {
+    return json.parse("{\"default\":\"allow\",\"rules\":[" + RULE_DELETE + "]}");
+}
+
+fn allowAllDoc(): json.JsonValue {
+    return json.parse("{\"default\":\"allow\",\"rules\":[]}");
+}
+
+@test
+fn policy_test_per_call_verdicts(): void {
+    let doc = denyDeleteDoc();
+    let calls = List<json.JsonValue>();
+    calls.push(json.parse("{\"operation\":\"delete\"}"));
+    calls.push(json.parse("{\"operation\":\"read\"}"));
+    let verdicts = cmd_policy.testVerdicts(doc, calls);
+    assert.equalInt(verdicts.size(), 2);
+    assert.equalStr(verdicts.at(0), "deny");
+    assert.equalStr(verdicts.at(1), "allow");
+}
+
+@test
+fn policy_test_diff_detects_flip(): void {
+    let calls = List<json.JsonValue>();
+    calls.push(json.parse("{\"operation\":\"delete\"}"));
+    calls.push(json.parse("{\"operation\":\"read\"}"));
+    // allow-all -> deny-on-delete: exactly one call (delete) flips.
+    let flips = cmd_policy.diffFlips(allowAllDoc(), denyDeleteDoc(), calls);
+    assert.equalInt(flips, 1);
+    // identical policies: no flips.
+    assert.equalInt(cmd_policy.diffFlips(denyDeleteDoc(), denyDeleteDoc(), calls), 0);
+}
+
+// ---- content-scan ---------------------------------------------------------
+
+@test
+fn content_scan_blocks_pii_allows_benign(): void {
+    let email = cmd_content.scan("please contact ebella@gmail.com today", false);
+    assert.isTrue(email.blocked);
+    assert.equalInt(cmd_content.scanExitCode(email), 3);
+    assert.isTrue(string.contains(email.redacted, "[REDACTED]"));
+
+    let ssn = cmd_content.scan("my ssn is 123-45-6789 ok", false);
+    assert.isTrue(ssn.blocked);
+    assert.equalInt(cmd_content.scanExitCode(ssn), 3);
+
+    let benign = cmd_content.scan("the quick brown fox jumps", false);
+    assert.isFalse(benign.blocked);
+    assert.equalInt(cmd_content.scanExitCode(benign), 0);
+
+    // secrets block only with --block-secrets.
+    let sk = "sk-abcdefghijklmnopqrstuvwxyz";
+    assert.isFalse(cmd_content.scan(sk, false).blocked);
+    assert.isTrue(cmd_content.scan(sk, true).blocked);
+}
+
+// ---- sign-artifact / verify-artifact --------------------------------------
+
+@test
+fn sign_artifact_round_trips_and_tamper_fails(): void {
+    let data = "the varman release artifact v1";
+    let r = cmd_artifact.signBytes(data, SEED);
+    assert.equalInt(string.len(r.pubHex), 64);
+    assert.equalInt(string.len(r.sigHex), 128);
+    assert.isTrue(cmd_artifact.verifyBytes(data, r.pubHex, r.sigHex));
+    // a tampered artifact must not verify.
+    assert.isFalse(cmd_artifact.verifyBytes(data + "!", r.pubHex, r.sigHex));
+
+    // the file-based CLI path: sign writes .sig/.pub, verify reads them.
+    let dir = tmpDir();
+    let f = `${dir}/artifact.bin`;
+    let k = `${dir}/signer.key`;
+    writeFile(f, data);
+    writeFile(k, SEED);
+    assert.equalInt(cmd_artifact.cmdSignArtifact(f, k), 0);
+    assert.equalInt(cmd_artifact.cmdVerifyArtifact(f, `${k}.pub`, `${f}.sig`), 0);
+    // tamper the file on disk -> verify fails.
+    writeFile(f, data + " tampered");
+    assert.equalInt(cmd_artifact.cmdVerifyArtifact(f, `${k}.pub`, `${f}.sig`), 1);
+}
+
+// ---- init -> policy-compile ----------------------------------------------
+
+@test
+fn init_writes_a_compilable_starter_policy(): void {
+    let dir = `${tmpDir()}/ws`;
+    let policy = cmd_init.writeWorkspace(dir);
+    assert.isTrue(policy != undefined);
+    let doc = cmd_policy.loadDoc(policy ?? "");
+    assert.isTrue(doc != undefined);
+    let compiled = cmd_policy.compileDoc(doc ?? json.null());
+    assert.isTrue(compiled != undefined);
+    assert.contains(compiled ?? "", "package acp");
+    // the starter's prod-delete rule compiles into a deny block.
+    assert.contains(compiled ?? "", "\"verdict\":\"deny\"");
+}
+
+// ---- verify-pack ----------------------------------------------------------
+
+@test
+fn verify_pack_accepts_good_rejects_tampered(): void {
+    let body = json.parse("{\"hello\":\"world\",\"n\":42}");
+    let good = cmd_evidence.makeDetachedPack(body, SEED);
+    assert.isTrue(cmd_evidence.verifyPackValue(good));
+
+    // Reuse the good signature/pubkey over a different body -> must fail.
+    let pubHex = json.asString(json.get(good, "pubkey_hex")) ?? "";
+    let sig = json.asString(json.get(good, "sig_hex")) ?? "";
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("body", json.parse("{\"hello\":\"WORLD\",\"n\":42}"));
+    m.set("pubkey_hex", json.str(pubHex));
+    m.set("sig_hex", json.str(sig));
+    assert.isFalse(cmd_evidence.verifyPackValue(json.object(m)));
+}

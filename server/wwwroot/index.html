@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Varman Control Plane</title>
+  <link rel="stylesheet" href="/index.css">
+  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"></script>
+</head>
+<body class="min-h-full" data-signals="{route: 'landing', view: 'overview', title: 'Overview', blurb: 'Where to start, and the live posture of the control plane.', placeholder: false, light: false, enterprise: false, suOrg: '', suLine1: '', suLine2: '', suCity: '', suPostcode: '', suCountry: '', suJurisdiction: '', suReg: '', suIndustry: '', suSize: '1-10', suWebsite: '', suName: '', suEmail: '', suPhone: '', suDpo: '', suPlan: 'pro', suShowAll: false, suActs: {}, epModal: '', epId: '', epHost: '', epPort: '443', epNote: '', epEnabled: true, epErr: '', sysModal: '', sysId: '', sysName: '', sysOwner: '', sysTier: 'high', sysSector: '', sysJur: '', sysPurpose: '', sysErr: '', mdlModal: '', mdlId: '', mdlName: '', mdlProvider: '', mdlVersion: '', mdlModality: 'text', mdlDesc: '', mdlErr: '', tkModal: '', tkId: '', tkName: '', tkVerdict: 'deny', tkControl: '', tkResource: '', tkConnector: 'webhook', tkThrottle: '3600', tkUrl: '', tkInstance: '', tkTable: 'incident', tkBase: '', tkProject: 'GOV', tkLabel: 'varman', tkErr: '', plModal: '', plId: '', plName: '', plDesc: '', plVerdict: 'deny', plResource: '', plOperation: '', plApprover: '', plPriority: '100', plEnabled: true, plErr: '', pkSlug: '', pkMsg: '', grModal: '', grId: '', grKind: 'risk', grSubject: '', grTitle: '', grStatus: 'open', grAssignee: '', grDesc: '', grErr: '', crModal: '', crId: '', crName: '', crKind: 'substr', crPattern: '', crThreshold: '0', crTarget: 'request', crAction: 'shadow', crSeverity: 'medium', crControls: '', crErr: '', crTest: '', crTestResult: ''}" data-class="{light: $light}">
+
+<!-- ============================ LANDING (matches LandingView.vue) ============================ -->
+<div data-show="$route=='landing'" class="min-h-full bg-bg text-txt">
+  <header class="border-b border-line">
+    <div class="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span class="text-lg font-semibold tracking-tight">Varman</span>
+      </div>
+      <div class="flex items-center gap-4">
+        <button class="text-sm text-dim hover:text-txt" data-on:click="$route='pricing'">Pricing</button>
+        <button class="text-sm text-dim hover:text-txt" data-on:click="$route='login'">Login</button>
+      </div>
+    </div>
+  </header>
+  <section class="max-w-5xl mx-auto px-6 pt-20 pb-16 text-center">
+    <div class="inline-block text-xs font-medium text-accent bg-panel2 border border-line rounded-full px-3 py-1 mb-5">AI governance, enforced</div>
+    <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight leading-tight">Govern every AI call<br />your organisation makes.</h1>
+    <p class="text-dim text-lg mt-5 max-w-2xl mx-auto">Author policy once, enforce it inline on your AI traffic, and turn every decision into audit-ready compliance evidence, across the EU AI Act, ISO 42001, SOC 2, NIST and more.</p>
+    <div class="flex items-center justify-center gap-3 mt-8">
+      <button class="rounded-lg bg-accent text-white px-5 py-2.5 text-sm font-medium hover:opacity-90" data-on:click="$route='signup'">Get started</button>
+      <button class="rounded-lg border border-line2 px-5 py-2.5 text-sm font-medium hover:bg-panel2" data-on:click="$route='pricing'">See pricing</button>
+    </div>
+  </section>
+  <section class="max-w-5xl mx-auto px-6 pb-16 grid sm:grid-cols-3 gap-4">
+    <div class="bg-panel border border-line rounded-xl p-5">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg>
+      <h3 class="font-semibold mt-3">Author policy in the UI</h3>
+      <p class="text-sm text-dim mt-1.5 leading-relaxed">Build rules from a visual match builder, tag each to the regulatory controls it satisfies, and test it before you ship. No YAML.</p>
+    </div>
+    <div class="bg-panel border border-line rounded-xl p-5">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg>
+      <h3 class="font-semibold mt-3">Enforce at the edge</h3>
+      <p class="text-sm text-dim mt-1.5 leading-relaxed">A proxy on stock Envoy + OPA intercepts only the AI endpoints you register and applies your policy per request: allow, block, or step up.</p>
+    </div>
+    <div class="bg-panel border border-line rounded-xl p-5">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><rect width="8" height="4" x="8" y="2" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/></svg>
+      <h3 class="font-semibold mt-3">Prove compliance</h3>
+      <p class="text-sm text-dim mt-1.5 leading-relaxed">Every decision flows back into a per-control coverage matrix and signed, audit-ready conformance reports.</p>
+    </div>
+  </section>
+  <section class="max-w-5xl mx-auto px-6 pb-20">
+    <div class="bg-panel2 border border-line rounded-xl px-6 py-5">
+      <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 text-sm">
+        <span class="text-txt font-medium">Author a rule</span><span class="text-dim">&rarr;</span>
+        <span class="text-txt font-medium">Compile to policy</span><span class="text-dim">&rarr;</span>
+        <span class="text-txt font-medium">Enforce on AI traffic</span><span class="text-dim">&rarr;</span>
+        <span class="text-txt font-medium">Report &amp; evidence</span>
+      </div>
+    </div>
+    <p class="text-center text-xs text-dim mt-4">Built on stock Envoy and Open Policy Agent. We own the policy and the compliance mapping, not the data path.</p>
+  </section>
+  <footer class="border-t border-line">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between text-xs text-dim">
+      <span>Varman</span>
+      <button class="hover:text-txt" data-on:click="$route='login'">Login</button>
+    </div>
+  </footer>
+</div>
+
+<!-- ============================ LOGIN (matches LoginView.vue, dev mode) ============================ -->
+<div data-show="$route=='login'" data-signals="{liHint: ''}" class="min-h-full bg-bg text-txt flex flex-col">
+  <header class="border-b border-line">
+    <div class="max-w-5xl mx-auto px-6 h-16 flex items-center">
+      <button class="flex items-center gap-2" data-on:click="$route='landing'">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span class="text-lg font-semibold tracking-tight">Varman</span>
+      </button>
+    </div>
+  </header>
+  <main class="flex-1 flex items-center justify-center px-6 py-12">
+    <div class="w-full max-w-sm bg-panel border border-line rounded-2xl p-7">
+      <h1 class="text-xl font-semibold text-center">Sign in to Varman</h1>
+      <p class="text-sm text-dim text-center mt-1">Use your organisation's Microsoft account.</p>
+      <div class="grid gap-3 mt-6">
+        <label class="grid gap-1"><span class="text-xs text-dim">Work email or domain\username</span>
+          <input type="text" data-bind="liHint" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="username" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="you@company.com or CONTOSO\you" /></label>
+        <a href="/auth/login" data-attr-href="'/auth/login' + ($liHint ? ('?login_hint=' + encodeURIComponent($liHint)) : '')"
+           class="mt-1 inline-flex items-center justify-center gap-2 rounded-lg bg-accent text-white px-4 py-2.5 text-sm font-medium hover:opacity-90">
+          <svg width="16" height="16" viewBox="0 0 23 23" aria-hidden="true"><rect x="1" y="1" width="10" height="10" fill="#f35325"/><rect x="12" y="1" width="10" height="10" fill="#81bc06"/><rect x="1" y="12" width="10" height="10" fill="#05a6f0"/><rect x="12" y="12" width="10" height="10" fill="#ffba08"/></svg>
+          Sign in with Microsoft
+        </a>
+        <p class="text-[11px] text-dim text-center">You'll be sent to Microsoft to enter your password. Varman never sees it.</p>
+      </div>
+      <div class="flex items-center gap-3 my-5"><div class="flex-1 h-px bg-line"></div><span class="text-xs text-dim">or</span><div class="flex-1 h-px bg-line"></div></div>
+      <a href="/auth/dev-login?role=PolicyAdmin&return_to=/" class="block text-center w-full rounded-lg border border-line2 px-4 py-2.5 text-sm font-medium hover:bg-panel2">Developer sign-in (localhost)</a>
+      <p class="text-center mt-4"><button class="text-xs text-dim hover:text-txt" data-on:click="$route='signup'">New to Varman? Create a workspace</button></p>
+      <p class="text-center mt-2"><button class="text-xs text-dim hover:text-txt" data-on:click="$route='landing'">&larr; Back to home</button></p>
+    </div>
+  </main>
+</div>
+
+<!-- ============================ PRICING ============================ -->
+<div data-show="$route=='pricing'" class="min-h-full bg-bg text-txt">
+  <header class="border-b border-line">
+    <div class="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+      <button class="flex items-center gap-2" data-on:click="$route='landing'">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span class="text-lg font-semibold tracking-tight">Varman</span>
+      </button>
+      <button class="text-sm text-dim hover:text-txt" data-on:click="$route='login'">Login</button>
+    </div>
+  </header>
+  <section class="max-w-5xl mx-auto px-6 pt-16 pb-10 text-center">
+    <h1 class="text-3xl sm:text-4xl font-semibold tracking-tight">Simple, usage-based pricing</h1>
+    <p class="text-dim mt-3">Priced on the AI calls you govern. Start free, upgrade when you ship to production.</p>
+  </section>
+  <section class="max-w-5xl mx-auto px-6 pb-20 grid md:grid-cols-3 gap-4">
+    <div class="bg-panel border border-line rounded-xl p-6 flex flex-col">
+      <h3 class="font-semibold text-lg">Free</h3>
+      <div class="text-3xl font-semibold mt-2">$0</div>
+      <div class="text-xs text-dim mt-1">1,000 decisions / month</div>
+      <p class="text-sm text-dim mt-3 flex-1">Get started governing a single workload.</p>
+      <button class="rounded-lg border border-line2 px-4 py-2 text-sm font-medium hover:bg-panel2 mt-4" data-on:click="$suPlan='free'; $route='signup'">Start free</button>
+    </div>
+    <div class="bg-panel border border-accent rounded-xl p-6 flex flex-col">
+      <h3 class="font-semibold text-lg">Pro</h3>
+      <div class="text-3xl font-semibold mt-2">$49 <span class="text-sm text-dim font-normal">/ month</span></div>
+      <div class="text-xs text-dim mt-1">100,000 decisions / month</div>
+      <p class="text-sm text-dim mt-3 flex-1">For teams putting AI into production.</p>
+      <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90 mt-4" data-on:click="$suPlan='pro'; $route='signup'">Choose Pro</button>
+    </div>
+    <div class="bg-panel border border-line rounded-xl p-6 flex flex-col">
+      <h3 class="font-semibold text-lg">Enterprise</h3>
+      <div class="text-3xl font-semibold mt-2">Custom</div>
+      <div class="text-xs text-dim mt-1">Unlimited, SSO, compliance module</div>
+      <p class="text-sm text-dim mt-3 flex-1">Unlimited scale, SSO and the EU AI Act / ISO 42001 compliance module.</p>
+      <button class="rounded-lg border border-line2 px-4 py-2 text-sm font-medium hover:bg-panel2 mt-4" data-on:click="$suPlan='enterprise'; $route='signup'">Contact sales</button>
+    </div>
+  </section>
+</div>
+
+<!-- ============================ SIGNUP (self-serve onboarding) ============================ -->
+<div data-show="$route=='signup'" class="min-h-full bg-bg text-txt flex flex-col">
+  <header class="border-b border-line">
+    <div class="max-w-5xl mx-auto px-6 h-16 flex items-center">
+      <button class="flex items-center gap-2" data-on:click="$route='landing'">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-accent"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span class="text-lg font-semibold tracking-tight">Varman</span>
+      </button>
+    </div>
+  </header>
+  <main class="flex-1 flex items-center justify-center px-6 py-12">
+    <div class="w-full max-w-2xl bg-panel border border-line rounded-2xl p-7">
+      <h1 class="text-xl font-semibold">Create your organisation</h1>
+      <p class="text-sm text-dim mt-1">Start governing your AI traffic in minutes.</p>
+
+      <div class="mt-6">
+        <h2 class="text-xs uppercase tracking-wide text-muted mb-2">Organisation</h2>
+        <div class="grid gap-3">
+          <label class="grid gap-1"><span class="text-xs text-dim">Name *</span>
+            <input type="text" data-bind="suOrg" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="Acme Ltd" /></label>
+          <label class="grid gap-1"><span class="text-xs text-dim">Address line 1</span>
+            <input type="text" data-bind="suLine1" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="Street address" /></label>
+          <label class="grid gap-1"><span class="text-xs text-dim">Address line 2</span>
+            <input type="text" data-bind="suLine2" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="Suite, floor (optional)" /></label>
+          <div class="grid sm:grid-cols-3 gap-3">
+            <label class="grid gap-1"><span class="text-xs text-dim">City</span>
+              <input type="text" data-bind="suCity" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="Berlin" /></label>
+            <label class="grid gap-1"><span class="text-xs text-dim">Zip / postcode</span>
+              <input type="text" data-bind="suPostcode" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="10115" /></label>
+            <label class="grid gap-1"><span class="text-xs text-dim">Country</span>
+              <select id="suCountrySel" data-bind="suCountry" data-on-intersect="@get('/signup/countries')" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm">
+                <option value="">Select a country…</option>
+              </select></label>
+          </div>
+          <div class="grid sm:grid-cols-2 gap-3">
+            <label class="grid gap-1"><span class="text-xs text-dim">Primary jurisdiction</span>
+              <input type="text" data-bind="suJurisdiction" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="e.g. UK, EU, US" /></label>
+            <label class="grid gap-1"><span class="text-xs text-dim">Company / VAT registration no.</span>
+              <input type="text" data-bind="suReg" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="e.g. GB123456789" /></label>
+            <label class="grid gap-1"><span class="text-xs text-dim">Industry</span>
+              <input type="text" data-bind="suIndustry" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="e.g. Healthcare, Finance" /></label>
+            <label class="grid gap-1"><span class="text-xs text-dim">Company size</span>
+              <select data-bind="suSize" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm">
+                <option value="1-10">1-10</option><option value="11-50">11-50</option><option value="51-200">51-200</option><option value="201-1000">201-1000</option><option value="1000+">1000+</option>
+              </select></label>
+            <label class="grid gap-1 sm:col-span-2"><span class="text-xs text-dim">Website</span>
+              <input type="text" data-bind="suWebsite" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="https://acme.com" /></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <h2 class="text-xs uppercase tracking-wide text-muted mb-2">Primary contact</h2>
+        <div class="grid sm:grid-cols-3 gap-3">
+          <label class="grid gap-1"><span class="text-xs text-dim">Name</span>
+            <input type="text" data-bind="suName" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="Jane Doe" /></label>
+          <label class="grid gap-1"><span class="text-xs text-dim">Email</span>
+            <input type="email" data-bind="suEmail" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="jane@acme.com" /></label>
+          <label class="grid gap-1"><span class="text-xs text-dim">Phone</span>
+            <input type="text" data-bind="suPhone" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="+44 ..." /></label>
+          <label class="grid gap-1 sm:col-span-3"><span class="text-xs text-dim">Data protection officer (DPO) email</span>
+            <input type="email" data-bind="suDpo" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm" placeholder="dpo@acme.com" /></label>
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <div class="flex items-center mb-2">
+          <h2 class="text-xs uppercase tracking-wide text-muted">Regulations to comply with</h2>
+          <label class="ml-auto flex items-center gap-1.5 text-xs text-dim cursor-pointer">
+            <input type="checkbox" data-bind="suShowAll" data-on-change="@get('/signup/acts?country=' + $suCountry + '&all=' + ($suShowAll ? '1' : '0'))" /> show all
+          </label>
+        </div>
+        <div id="suActs" data-on-intersect="@get('/signup/acts?country=' + $suCountry + '&all=0')" class="grid gap-1">
+          <div class="max-h-56 overflow-y-auto border border-line rounded-lg p-2 grid gap-1">
+            <p class="text-xs text-dim px-2 py-3 text-center">Select your country above to see the regulations that apply, or tick "show all".</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <h2 class="text-xs uppercase tracking-wide text-muted mb-2">Plan</h2>
+        <label class="grid gap-1"><span class="text-xs text-dim">Choose a plan</span>
+          <select data-bind="suPlan" class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm">
+            <option value="free">Free - 1,000 decisions / month</option>
+            <option value="pro">Pro - $49 / month</option>
+            <option value="enterprise">Enterprise - custom</option>
+          </select></label>
+      </div>
+
+      <div class="mt-6 flex items-center gap-3">
+        <button class="rounded-lg bg-accent text-white px-4 py-2.5 text-sm font-medium hover:opacity-90" data-on:click="@post('/signup')">Create organisation</button>
+        <button class="text-xs text-dim hover:text-txt" data-on:click="$route='login'">Already have a workspace? Sign in</button>
+      </div>
+      <div id="su-status" class="mt-2"></div>
+      <p class="text-xs text-dim mt-4">You can choose which regulations apply on the Organisation screen after signup.</p>
+    </div>
+  </main>
+</div>
+
+<!-- ============================ CONSOLE (matches App.vue + Sidebar.vue + TopBar.vue) ============================ -->
+<div data-show="$route=='console'" class="h-full flex flex-col">
+  <header class="app-topbar h-14 shrink-0 flex items-center gap-3 px-5 border-b border-line">
+    <button class="flex items-center gap-2 font-semibold tracking-tight" data-on:click="$route='landing'">
+      <span class="w-6 h-6 rounded-md bg-accent inline-flex items-center justify-center text-white text-xs">V</span>
+      Varman
+    </button>
+    <span class="flex items-center gap-1.5 text-xs text-ok ml-1"><span class="w-2 h-2 rounded-full bg-ok"></span> live</span>
+    <div class="ml-auto flex items-center gap-3">
+      <span class="text-xs px-2 py-1 rounded-md bg-panel2 border border-line text-dim">default</span>
+      <button class="text-xs px-2 py-1 rounded-md border border-line hover:bg-panel2" data-class="{'text-accent border-accent': $enterprise, 'text-dim': !$enterprise}" data-on:click="$enterprise = !$enterprise" data-text="$enterprise ? 'Compliance: on' : 'Compliance: off'">Compliance: off</button>
+      <button class="text-dim hover:text-txt text-xs" data-on:click="$light = !$light" data-text="$light ? 'Dark' : 'Light'">Light</button>
+      <button class="text-dim hover:text-txt text-xs" data-on:click="$route='landing'">Sign out</button>
+    </div>
+  </header>
+
+  <div class="flex-1 flex min-h-0">
+    <aside class="app-sidebar w-[236px] shrink-0 border-r border-line overflow-y-auto">
+      <nav class="py-3">
+        <div class="mb-4">
+          <div class="grp-label">Overview</div>
+          <button class="nav-item" data-class="{'nav-active': $view=='overview'}" data-on:click="$view='overview'; $title='Overview'; $blurb='Where to start, and the live posture of the control plane.'; $placeholder=false; @get('/overview')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg> Overview</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='billing'}" data-on:click="$view='billing'; $title='Billing & usage'; $blurb='Your plan, governed-decision usage this month, and the plan catalogue.'; $placeholder=false; @get('/billing/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/></svg> Billing &amp; usage</button>
+        </div>
+        <div class="mb-4">
+          <div class="grp-label">Compliance</div>
+          <button class="nav-item" data-class="{'nav-active': $view=='organisation'}" data-on:click="$view='organisation'; $title='Organisation'; $blurb='Onboard your organisation and choose the regulations that apply.'; $placeholder=false; @get('/organisation/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M6 12H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/><path d="M18 9h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/><path d="M10 6h4M10 10h4M10 14h4M10 18h4"/></svg> Organisation</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='acts'}" data-on:click="$view='acts'; $title='Acts & controls'; $blurb='The regulatory catalogue: acts and the conformance controls you assess against.'; $placeholder=false; @get('/acts/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M7 21h10"/><path d="M12 3v18"/><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg> Acts & controls</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='systems'}" data-on:click="$view='systems'; $title='AI systems'; $blurb='The AI systems you govern. Open one to assess it against a framework.'; $placeholder=false; @get('/systems/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42Z"/><path d="m7 16.5-4.74-2.85M7 16.5l5-3M7 16.5v5.17"/><path d="M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3Z"/></svg> AI systems</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='grc'}" data-on:click="$view='grc'; $title='Governance'; $blurb='Governance records per system: risks, assessments (FRIA), model cards and datasets.'; $placeholder=false; @get('/grc/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M8 13h8M8 17h8M8 9h2"/></svg> Governance</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='reports'}" data-on:click="$view='reports'; $title='Reports'; $blurb='Signed, per-framework conformance reports you can download for an audit.'; $placeholder=false; @get('/reports/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4M12 16h4M8 11h.01M8 16h.01"/></svg> Reports</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='coverage'}" data-on:click="$view='coverage'; $title='Coverage'; $blurb='For each enforceable control in your acts, whether a policy rule covers it and whether it is being exercised.'; $placeholder=false; @get('/coverage/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg> Coverage</button>
+        </div>
+        <div class="mb-4">
+          <div class="grp-label">Policy</div>
+          <button class="nav-item" data-class="{'nav-active': $view=='policy'}" data-on:click="$view='policy'; $title='Policy'; $blurb='Author policy rules in the UI and tag each with the controls it satisfies; compiled to OPA.'; $placeholder=false; @get('/policy/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Policy</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='versions'}" data-on:click="$view='versions'; $title='Policy versions'; $blurb='Version history of the compiled policy: active, baseline, rollback, and the downloadable bundle.'; $placeholder=false; @get('/policy-versions/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg> Policy versions</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='packs'}" data-on:click="$view='packs'; $title='Policy packs'; $blurb='Curated enforceable rule sets per act. Install one to add its rules to your policy; each ships a red-team corpus.'; $placeholder=false; @get('/policy-packs/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg> Policy packs</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='endpoints'}" data-on:click="$view='endpoints'; $title='AI endpoints'; $blurb='The AI endpoints the proxy intercepts and applies policy to; everything else passes through untouched.'; $placeholder=false; @get('/ai-endpoints/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5M9 8V2M15 8V2M18 8v4a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V8Z"/></svg> AI endpoints</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='contentrules'}" data-on:click="$view='contentrules'; $title='Content firewall'; $blurb='Deterministic content rules enforced at the edge over request bodies; authored here, signed, pulled by the sidecar.'; $placeholder=false; @get('/content-rules/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 10 4.6-1.5 8-5 8-10V5l-8-3Z"/></svg> Content firewall</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='ticketing'}" data-on:click="$view='ticketing'; $title='Ticketing'; $blurb='Turn matching decisions into tickets in ServiceNow, Jira or a webhook, centrally with dedup and throttling.'; $placeholder=false; @get('/ticketing/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2M13 17v2M13 11v2"/></svg> Ticketing</button>
+          <button class="nav-item" data-class="{'nav-active': $view=='integration'}" data-on:click="$view='integration'; $title='Integration'; $blurb='Connect a stock OPA sidecar at your firewall: it polls the compiled policy bundle and pushes decision logs back.'; $placeholder=false; @get('/integration/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5M9 8V2M15 8V2M18 8v4a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V8Z"/></svg> Integration</button>
+        </div>
+        <div class="mb-4">
+          <div class="grp-label">Assurance</div>
+          <button class="nav-item" data-class="{'nav-active': $view=='decisions'}" data-on:click="$view='decisions'; $title='Decisions'; $blurb='The audit trail of what the policy did: every decision OPA pushed back from the enforcement point.'; $placeholder=false; @get('/decisions/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></svg> Decisions</button>
+          <button class="nav-item" data-show="$enterprise" data-class="{'nav-active': $view=='models'}" data-on:click="$view='models'; $title='Models'; $blurb='The AI models in use, with their cards, scans and vendor.'; $placeholder=false; @get('/models/view')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg> Models</button>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="app-content flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
+      <div class="max-w-content mx-auto px-6 py-6">
+        <div class="mb-4">
+          <h1 class="text-lg font-semibold" data-text="$title">Overview</h1>
+          <p class="text-sm text-dim mt-0.5" data-text="$blurb"></p>
+        </div>
+        <!-- Real hypermedia views (load from the backend via Datastar). -->
+        <section data-show="!$placeholder && $view=='overview'"><div id="overview" data-on-intersect="@get('/overview')"></div></section>
+        <section data-show="!$placeholder && $view=='billing'"><div id="billing"></div></section>
+        <section data-show="!$placeholder && $view=='acts'"><div id="acts"></div></section>
+        <section data-show="!$placeholder && $view=='grc'"><div id="grc"></div></section>
+        <section data-show="!$placeholder && $view=='decisions'"><div id="decisions"></div></section>
+        <section data-show="!$placeholder && $view=='integration'"><div id="integration"></div></section>
+        <section data-show="!$placeholder && $view=='models'"><div id="models"></div></section>
+        <section data-show="!$placeholder && $view=='coverage'"><div id="coverage"></div></section>
+        <section data-show="!$placeholder && $view=='systems'"><div id="systems"></div></section>
+        <section data-show="!$placeholder && $view=='endpoints'"><div id="endpoints"></div></section>
+        <section data-show="!$placeholder && $view=='contentrules'"><div id="contentrules"></div></section>
+        <section data-show="!$placeholder && $view=='packs'"><div id="packs"></div></section>
+        <section data-show="!$placeholder && $view=='ticketing'"><div id="ticketing"></div></section>
+        <section data-show="!$placeholder && $view=='organisation'"><div id="organisation"></div></section>
+        <section data-show="!$placeholder && $view=='policy'"><div id="policy"></div></section>
+        <section data-show="!$placeholder && $view=='versions'"><div id="versions"></div></section>
+        <section data-show="!$placeholder && $view=='reports'"><div id="reports"></div></section>
+        <!-- Views whose backend is still part of the migration: a themed placeholder that
+             mirrors the Vue console chrome, so the IA is complete and honest. -->
+        <section data-show="$placeholder">
+          <div class="bg-panel border border-line rounded-xl px-8 py-16 text-center">
+            <div class="inline-flex w-10 h-10 rounded-lg bg-panel2 items-center justify-center text-accent mb-3">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+            </div>
+            <h3 class="font-semibold" data-text="$title">Overview</h3>
+            <p class="text-sm text-dim mt-1 max-w-md mx-auto" data-text="$blurb"></p>
+            <p class="text-xs text-muted mt-4">This console view is being migrated from the Vue implementation to Kyte + Datastar.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+</body>
+</html>

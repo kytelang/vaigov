@@ -1,0 +1,61 @@
+// AppRepository: the `apps` table in the shared `acp` Postgres db. SQL mirrors
+// acp-server store.rs (tenant_id column; select aliases tenant_id AS tenant to
+// match acp's serialized App field name).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.AppListRow;
+import Domain.Dtos.PrincipalListRow;
+
+pub struct AppRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: AppRepository, tenant: string): Rows<AppListRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<AppListRow>(conn, "apps").query(
+            "SELECT id, name, owner, metadata_json, tenant_id AS tenant, created_ms FROM apps WHERE tenant_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn add(self: AppRepository, id: string, name: string, owner: string, metadataJson: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(name)); p.push(db.dbText(owner));
+        p.push(db.dbText(metadataJson)); p.push(db.dbText(tenant)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO apps (id, name, owner, metadata_json, tenant_id, created_ms) VALUES ($1, $2, $3, $4, $5, $6)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn update(self: AppRepository, id: string, name: string, owner: string, metadataJson: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(owner)); p.push(db.dbText(metadataJson));
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE apps SET name = $1, owner = $2, metadata_json = $3 WHERE id = $4 AND tenant_id = $5", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: AppRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM apps WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    // Referential-integrity probe used by agent registration.
+    pub async fn exists(self: AppRepository, id: string, tenant: string): bool {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let r = await Repository<ProbeRow>(conn, "apps").query("SELECT 1 AS one FROM apps WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+        return r.items.size() > 0;
+    }
+}

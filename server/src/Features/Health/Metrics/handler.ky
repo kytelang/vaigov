@@ -1,0 +1,20 @@
+// GET /metrics -> a minimal entity-counter snapshot.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct MetricsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: MetricsHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("decisions", json.number(self.app.trust.decisions.size() as long));
+        m.set("rules", json.number(self.app.trust.rules.size() as long));
+        m.set("seq", json.number(self.app.trust.seq));
+        return Http.okObj(m);
+    }
+}

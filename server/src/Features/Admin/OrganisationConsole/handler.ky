@@ -1,0 +1,55 @@
+// First-party console mutations for the Organisation screen (back views/organisation.kyx):
+// toggle an act's enabled state, and save the org name + jurisdiction. Both preserve
+// the other settings and return the refreshed #organisation fragment. Trusted /console/*.
+import web.routing;
+import web.response;
+import string;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Shared.orgpanel;
+import Domain.Dtos.AdminRows;
+
+fn orgTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+
+// POST /console/organisation/toggle-act {orgSlug} -> flip that act, re-render.
+pub struct OrgToggleActHandler impl RouteHandler {
+    app: AppContext,
+    repo: AdminRepository,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+    async fn serve(self: OrgToggleActHandler, ctx: routing.Context): Response {
+        let tenant = orgTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let slug = string.trim(json.asString(json.get(body, "orgSlug")) ?? "");
+        if (slug.length > 0) { await orgpanel.toggleAct(self.repo, tenant, slug, Http.nowMs()); }
+        let panel = await orgpanel.orgPanel(self.repo, tenant, false);
+        return await ConsoleDs.patchAndSignals(panel, "{\"orgErr\":\"\"}");
+    }
+}
+
+// POST /console/organisation/save-profile {orgName, orgJur} -> save name/jurisdiction,
+// preserving the enabled acts.
+pub struct OrgSaveProfileHandler impl RouteHandler {
+    app: AppContext,
+    repo: AdminRepository,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+    async fn serve(self: OrgSaveProfileHandler, ctx: routing.Context): Response {
+        let tenant = orgTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(json.asString(json.get(body, "orgName")) ?? "");
+        let jur = string.trim(json.asString(json.get(body, "orgJur")) ?? "");
+        // Preserve the currently enabled acts.
+        let acts = "[]";
+        let sr = await self.repo.tenantSettings(tenant);
+        if (sr.items.size() > 0) {
+            acts = sr.items.getOr(0, TenantSettingsRow{ onboarded: 0, jurisdiction: "", enabled_acts: "[]", org_name: "", address_line1: "", address_line2: "", city: "", postcode: "", country: "", contact_name: "", contact_email: "", contact_phone: "", profile_json: "{}" }).enabled_acts;
+        }
+        await self.repo.setTenantSettings(tenant, name, jur, acts, Http.nowMs());
+        let panel = await orgpanel.orgPanel(self.repo, tenant, false);
+        return await ConsoleDs.patchAndSignals(panel, "{\"orgErr\":\"\"}");
+    }
+}

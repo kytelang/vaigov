@@ -1,0 +1,77 @@
+//! Typed configuration sections, bound from app.yaml by the framework (`web.config`).
+//!
+//! Each is a plain `@serializable` struct with sensible defaults, so a missing key
+//! falls back rather than failing. Secrets (the signing seed, the session key) are
+//! left to app.yaml / the orchestrator, never an environment variable. A feature
+//! binds the section it needs from `ctx.cfg`.
+
+/// The Postgres store (the single control-plane store, per the design doc).
+@serializable pub struct DbConfig {
+    pub dsn: string,
+    pub poolSize: int,
+    init() {
+        self.dsn = "postgres://127.0.0.1:5432/varman";
+        self.poolSize = 16;
+    }
+}
+
+/// Microsoft Entra app registration for interactive sign-in (OIDC
+/// authorization-code flow). Bound from the `entra` section of app.yaml. The
+/// non-secret values live in app.yaml; `clientSecret` is left empty there (per
+/// the secrets convention) and falls back to the `ENTRA_CLIENT_SECRET`
+/// environment variable so the secret never has to be committed. When tenantId
+/// and clientId are empty the control plane stays in dev-auth mode.
+@serializable pub struct EntraSignInConfig {
+    pub tenantId: string,
+    pub clientId: string,
+    pub clientSecret: string,
+    pub redirectUri: string,
+    init() {
+        self.tenantId = "";
+        self.clientId = "";
+        self.clientSecret = "";
+        self.redirectUri = "http://127.0.0.1:8080/auth/callback";
+    }
+}
+
+/// TLS termination for the control plane. When `enabled`, the server speaks
+/// TLS 1.3 (self-hosted stack) and reads the PEM cert + key from these paths.
+/// Entra requires an https redirect URI, so the control plane is served over
+/// https even locally. Paths are relative to the server working directory.
+@serializable pub struct WebTlsConfig {
+    pub enabled: bool,
+    pub certPath: string,
+    pub keyPath: string,
+    init() {
+        self.enabled = false;
+        self.certPath = "certs/dev-cert.pem";
+        self.keyPath = "certs/dev-key.pem";
+    }
+}
+
+/// Trust-core and session settings: the Ed25519 signing seed for tree heads and
+/// compiled bundles, the HMAC session-cookie key, the rolling idle timeout, the
+/// tenant label, and the fail-closed default verdict.
+@serializable pub struct TrustConfig {
+    /// 32-byte Ed25519 seed (64 hex) for the tree-head / bundle signing key.
+    pub seedHex: string,
+    /// HMAC secret (hex) for the stateless session cookies.
+    pub sessionKeyHex: string,
+    /// Rolling idle timeout for sessions (ms).
+    pub sessionIdleMs: long,
+    pub tenant: string,
+    pub defaultVerdict: string,
+    init() {
+        // No built-in signing seed or session key: a real deployment MUST supply
+        // both from app.yaml / the orchestrator, and the server fails closed at
+        // startup when they are absent (see buildApp). Shipping a fixed default
+        // here would let anyone reproduce the signing key and the session HMAC
+        // and forge admin tokens / session cookies. The explicit `--dev-auth`
+        // flag (dev only) fills a working local key pair; production never does.
+        self.seedHex = "";
+        self.sessionKeyHex = "";
+        self.sessionIdleMs = 1800000;
+        self.tenant = "default";
+        self.defaultVerdict = "allow";
+    }
+}

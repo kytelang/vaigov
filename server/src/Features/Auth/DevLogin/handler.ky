@@ -1,0 +1,28 @@
+// GET /auth/dev-login?role=<Role>&return_to=<url> -> set a signed session cookie
+// for that role and redirect. Mirrors acp bff::auth_dev_login + finish_login.
+import web.routing;
+import web.response;
+import string;
+import list;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct DevLoginHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: DevLoginHandler, ctx: routing.Context): response.Response {
+        let role = ctx.query("role");
+        if (role.length == 0) { role = "PolicyAdmin"; }
+        let returnTo = ctx.query("return_to");
+        if (returnTo.length == 0) { returnTo = "/"; }
+        let roles = list.List<string>();
+        roles.push(role);
+        let now = Http.nowMs();
+        let tenantId = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let sess = Auth.Session("dev-oid", "dev@local", "common", tenantId, roles, now, now + 28800000);
+        let cookieVal = Auth.signSession(self.app.trustCfg.sessionKeyHex, sess);
+        return Http.redirectWithCookie(returnTo, Auth.sessionCookieHeader(Http.sessionCookieName(), cookieVal));
+    }
+}

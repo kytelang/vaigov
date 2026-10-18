@@ -1,0 +1,74 @@
+// ContentRuleRepository: the `content_rules` table in the shared `acp` db,
+// tenant-scoped. Authored by the control-plane console; the enabled rows are
+// compiled + signed into the active set the edge sidecar pulls.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.ContentRuleRow;
+
+pub struct ContentRuleRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: ContentRuleRepository, tenant: string): Rows<ContentRuleRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<ContentRuleRow>(conn, "content_rules").query(
+            "SELECT id, name, kind, pattern, threshold, target, action, severity, controls_json, enabled FROM content_rules WHERE tenant = $1 ORDER BY name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn listEnabled(self: ContentRuleRepository, tenant: string): Rows<ContentRuleRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<ContentRuleRow>(conn, "content_rules").query(
+            "SELECT id, name, kind, pattern, threshold, target, action, severity, controls_json, enabled FROM content_rules WHERE tenant = $1 AND enabled = 1 ORDER BY name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn add(self: ContentRuleRepository, id: string, tenant: string, name: string, kind: string,
+            pattern: string, threshold: int, target: string, action: string, severity: string,
+            controlsJson: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant)); p.push(db.dbText(name)); p.push(db.dbText(kind));
+        p.push(db.dbText(pattern)); p.push(db.dbInt(threshold)); p.push(db.dbText(target));
+        p.push(db.dbText(action)); p.push(db.dbText(severity)); p.push(db.dbText(controlsJson)); p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO content_rules (id, tenant, name, kind, pattern, threshold, target, action, severity, controls_json, enabled, updated_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, $11)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn update(self: ContentRuleRepository, id: string, tenant: string, name: string, kind: string,
+            pattern: string, threshold: int, target: string, action: string, severity: string,
+            controlsJson: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(kind)); p.push(db.dbText(pattern)); p.push(db.dbInt(threshold));
+        p.push(db.dbText(target)); p.push(db.dbText(action)); p.push(db.dbText(severity)); p.push(db.dbText(controlsJson));
+        p.push(db.dbLong(nowMs)); p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE content_rules SET name = $1, kind = $2, pattern = $3, threshold = $4, target = $5, action = $6, severity = $7, controls_json = $8, updated_ms = $9 WHERE id = $10 AND tenant = $11", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn toggle(self: ContentRuleRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE content_rules SET enabled = 1 - enabled WHERE id = $1 AND tenant = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn remove(self: ContentRuleRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM content_rules WHERE id = $1 AND tenant = $2", p);
+        self.db.pool.release(conn);
+    }
+}

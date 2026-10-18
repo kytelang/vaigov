@@ -1,0 +1,20 @@
+// GET /readyz -> readiness, including an evidence-ledger self-verify.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct ReadyzHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: ReadyzHandler, ctx: routing.Context): response.Response {
+        let ok = await self.app.trust.store.verify();
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(ok));
+        m.set("ledger_verified", json.bool(ok));
+        return Http.okObj(m);
+    }
+}

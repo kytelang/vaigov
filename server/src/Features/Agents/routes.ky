@@ -1,0 +1,24 @@
+// Agents registry routes (acp-compatible JSON over the shared `acp` db).
+// NOTE: POST /agents/{id}/auto-assess is an acp GRC handler (creates a risk record
+// from agent metadata); it belongs to the Grc feature and is not registered here.
+import web.app;
+import Shared.AppContext;
+import Features.Agents.Shared.AgentRepository;
+import Features.Agents.ListAgents.handler;
+import Features.Agents.CreateAgent.handler;
+import Features.Agents.UpdateAgent.handler;
+import Features.Agents.DeactivateAgent.handler;
+import Features.Agents.DeleteAgent.handler;
+import Features.Agents.ResolveKey.handler;
+import Features.Agents.VerifyAgent.handler;
+
+pub fn registerAgents(ctx: AppContext): void {
+    let repo = AgentRepository(ctx.db);
+    ctx.app.get("/agents", ListAgentsHandler(repo, ctx));
+    ctx.app.post("/agents", CreateAgentHandler(repo, ctx));
+    ctx.app.post("/agents/resolve-key", ResolveKeyHandler(repo, ctx));
+    ctx.app.post("/agents/verify", VerifyAgentHandler(repo, ctx));
+    ctx.app.post("/agents/{id}/deactivate", DeactivateAgentHandler(repo, ctx));
+    ctx.app.post("/agents/{id}/update", UpdateAgentHandler(repo, ctx));
+    ctx.app.post("/agents/{id}/delete", DeleteAgentHandler(repo, ctx));
+}

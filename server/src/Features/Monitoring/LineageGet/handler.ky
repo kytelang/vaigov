@@ -1,0 +1,35 @@
+// GET /monitor/lineage -> {"edges":[{data_class,tool,count}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Monitoring.Shared.MonitorRepository;
+import Domain.Dtos.MonitorRows;
+
+pub struct LineageGetHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: LineageGetHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.listLineage();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, LineageRow{ data_class: "", tool: "", count: 0 });
+            let m = Map<string, json.JsonValue>(4, string.hash);
+            m.set("data_class", json.str(r.data_class));
+            m.set("tool", json.str(r.tool));
+            m.set("count", json.number(r.count));
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("edges", json.array(arr));
+        return Http.okObj(out);
+    }
+}

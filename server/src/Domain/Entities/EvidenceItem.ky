@@ -1,0 +1,18 @@
+// Persistence entity: one row of the `evidence` table (an evidence artefact tied
+// to a system/framework/control). Named EvidenceItem to avoid clashing with any
+// framework/stdlib/varman-core type. Snake_case fields match the Postgres columns.
+@serializable
+pub struct EvidenceItem {
+    pub id: string,
+    pub system_id: string,
+    pub framework: string,
+    pub control_id: string,
+    pub title: string,
+    pub source: string,
+    pub owner: string,
+    pub produced_ms: long,
+    pub valid_until_ms: long,
+    pub artefact_ref: string,
+    pub note: string,
+    pub created_ms: long,
+}

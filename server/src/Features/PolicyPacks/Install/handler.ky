@@ -1,0 +1,31 @@
+// POST /policy-packs/{slug}/install {params:{...}} -> instantiate the pack's rules.
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+import Features.PolicyPacks.Shared.packinstall;
+
+pub struct InstallHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: InstallHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let slug = ctx.param("slug");
+        let pack = packdata.findPack(slug);
+        if (pack == undefined) { return Http.jsonStatus(Status.NotFound, "{\"ok\":false,\"error\":\"unknown pack\"}"); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let supplied = json.asObject(json.get(body, "params")) ?? Map<string, json.JsonValue>(1, string.hash);
+        let res = await packinstall.installPack(self.repo, pack ?? json.null(), supplied, tenant, Http.nowMs());
+        return Http.jsonResp(json.stringify(res));
+    }
+}

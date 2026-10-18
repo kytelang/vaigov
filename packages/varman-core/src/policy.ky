@@ -1,0 +1,507 @@
+//! The YAML policy manifest DSL: types, parsing, and direct evaluation.
+//!
+//! A faithful port of Rust `acp-core`'s `policy/dsl.rs` + `policy/eval.rs`, with
+//! one deliberate change from the migration design (Appendix / section 5.1): the
+//! Cedar engine is NOT ported. The `When`/`Matcher` AST is evaluated DIRECTLY in
+//! Kyte (the same strategy the Rego mirror in `rego.ky` uses), which keeps the
+//! four-way `PolicyOutcome` and its soundness properties without a Cedar runtime:
+//!
+//!   - namespaced context: agent-supplied data lives only under `context.args`;
+//!     identity (agent/app/principal/group), resource and operation come from the
+//!     trusted top-level fields the proxy injects and the agent cannot spoof;
+//!   - any evaluation error is fail-closed (Deny, rule_id "eval-error"), never a
+//!     silent fall-through to the default;
+//!   - when several rules co-determine, precedence is deny > step_up > shadow > allow;
+//!   - `observe` (dry-run) mode downgrades a would-block (deny/step_up) to shadow,
+//!     recording the intended verdict in the reason, but never downgrades a
+//!     fail-closed evaluation error (observe relaxes policy, not internal safety).
+//!
+//! The manifest is accepted as a structured `serde.json.JsonValue` (the same shape
+//! the YAML deserialises to); `parseJson` turns it into the typed `Policy`.
+
+import string;
+import list;
+import map;
+import serde.json;
+import types;
+
+/// An "allow but ..." obligation attached to a rule. `kind` is the snake_case
+/// wire string (confirm / redact / rate_limit / disclose).
+pub struct Obligation {
+    pub kind: string,
+    pub fields: List<string>,
+    pub max: long | undefined,
+    pub windowMs: long | undefined,
+
+    init(kind: string, fields: List<string>, max: long | undefined, windowMs: long | undefined) {
+        self.kind = kind;
+        self.fields = fields;
+        self.max = max;
+        self.windowMs = windowMs;
+    }
+}
+
+/// A single-key matcher, e.g. `{ gt: 50000 }` or `{ in: [a, b] }`. `op` is the
+/// comparator name; `value` the operand.
+pub struct Matcher {
+    pub op: string,
+    pub value: json.JsonValue,
+
+    init(op: string, value: json.JsonValue) {
+        self.op = op;
+        self.value = value;
+    }
+}
+
+/// One entry in the `arg` map: a key and its matcher (kept as a list so order is
+/// deterministic; the Rust side used a BTreeMap, so keys are sorted on parse).
+pub struct ArgMatcher {
+    pub key: string,
+    pub matcher: Matcher,
+
+    init(key: string, matcher: Matcher) {
+        self.key = key;
+        self.matcher = matcher;
+    }
+}
+
+/// The matching condition of a rule. Any absent field means "any".
+pub struct When {
+    pub tool: string | undefined,
+    pub app: string | undefined,
+    pub agent: string | undefined,
+    pub principal: string | undefined,
+    pub group: string | undefined,
+    pub resource: string | undefined,
+    pub operation: string | undefined,
+    pub args: List<ArgMatcher>,
+    pub env: Matcher | undefined,
+    pub impact: Matcher | undefined,
+
+    init(tool: string | undefined, app: string | undefined, agent: string | undefined,
+         principal: string | undefined, group: string | undefined, resource: string | undefined,
+         operation: string | undefined, args: List<ArgMatcher>, env: Matcher | undefined,
+         impact: Matcher | undefined) {
+        self.tool = tool;
+        self.app = app;
+        self.agent = agent;
+        self.principal = principal;
+        self.group = group;
+        self.resource = resource;
+        self.operation = operation;
+        self.args = args;
+        self.env = env;
+        self.impact = impact;
+    }
+}
+
+/// One policy rule: a match condition, a verdict, optional approvers/reason and
+/// obligations.
+pub struct Rule {
+    pub id: string,
+    pub when: When,
+    pub verdict: types.Verdict,
+    pub approvers: List<string>,
+    pub reason: string | undefined,
+    pub obligations: List<Obligation>,
+
+    init(id: string, when: When, verdict: types.Verdict, approvers: List<string>,
+         reason: string | undefined, obligations: List<Obligation>) {
+        self.id = id;
+        self.when = when;
+        self.verdict = verdict;
+        self.approvers = approvers;
+        self.reason = reason;
+        self.obligations = obligations;
+    }
+}
+
+/// A parsed policy manifest.
+pub struct Policy {
+    pub version: int,
+    pub defaultVerdict: types.Verdict,
+    pub mode: string | undefined,
+    pub rules: List<Rule>,
+
+    init(version: int, defaultVerdict: types.Verdict, mode: string | undefined, rules: List<Rule>) {
+        self.version = version;
+        self.defaultVerdict = defaultVerdict;
+        self.mode = mode;
+        self.rules = rules;
+    }
+}
+
+/// The resolved policy result for one action. Mirrors Rust `PolicyOutcome`.
+pub struct PolicyOutcome {
+    pub verdict: types.Verdict,
+    pub ruleId: string | undefined,
+    pub approvers: List<string>,
+    pub reason: string | undefined,
+    pub obligations: List<Obligation>,
+
+    init(verdict: types.Verdict, ruleId: string | undefined, approvers: List<string>,
+         reason: string | undefined, obligations: List<Obligation>) {
+        self.verdict = verdict;
+        self.ruleId = ruleId;
+        self.approvers = approvers;
+        self.reason = reason;
+        self.obligations = obligations;
+    }
+}
+
+// ---- parsing (from the structured JSON the YAML deserialises to) ----
+
+fn optStr(v: json.JsonValue, key: string): string | undefined {
+    if (!json.has(v, key)) { return undefined; }
+    return json.asString(json.get(v, key));
+}
+
+fn parseMatcher(v: json.JsonValue): Matcher | undefined {
+    if (v.kind != 5) { return undefined; }
+    let obj = json.asObject(v) ?? Map<string, json.JsonValue>(8, string.hash);
+    let keys = obj.keys();
+    if (keys.size() == 0) { return undefined; }
+    // single-key matcher: take the first key (sorted for determinism).
+    keys.sort((a, b) => { return string.compare(a, b); });
+    let k = keys.at(0);
+    return Matcher(k, obj.get(k) ?? json.null());
+}
+
+fn parseObligation(v: json.JsonValue): Obligation {
+    let kind = json.asString(json.get(v, "kind")) ?? "";
+    let fields = List<string>();
+    let fs = json.asArray(json.get(v, "fields"));
+    if (fs != undefined) {
+        let i = 0;
+        while (i < fs.size()) {
+            let s = json.asString(fs.at(i));
+            if (s != undefined) { fields.push(s); }
+            i = i + 1;
+        }
+    }
+    let max = if (json.has(v, "max")) (json.asNumber(json.get(v, "max"))) else (undefined);
+    let windowMs = if (json.has(v, "window_ms")) (json.asNumber(json.get(v, "window_ms"))) else (undefined);
+    return Obligation(kind, fields, max, windowMs);
+}
+
+fn parseWhen(v: json.JsonValue): When {
+    let args = List<ArgMatcher>();
+    if (json.has(v, "arg")) {
+        let argObj = json.get(v, "arg");
+        if (argObj.kind == 5) {
+            let obj = json.asObject(argObj) ?? Map<string, json.JsonValue>(8, string.hash);
+            let keys = obj.keys();
+            keys.sort((a, b) => { return string.compare(a, b); });
+            let i = 0;
+            while (i < keys.size()) {
+                let k = keys.at(i);
+                let m = parseMatcher(obj.get(k) ?? json.null());
+                if (m != undefined) { args.push(ArgMatcher(k, m)); }
+                else { args.push(ArgMatcher(k, Matcher("", json.null()))); }
+                i = i + 1;
+            }
+        }
+    }
+    let env = if (json.has(v, "env")) (parseMatcher(json.get(v, "env"))) else (undefined);
+    let impact = if (json.has(v, "impact")) (parseMatcher(json.get(v, "impact"))) else (undefined);
+    return When(
+        optStr(v, "tool"), optStr(v, "app"), optStr(v, "agent"),
+        optStr(v, "principal"), optStr(v, "group"), optStr(v, "resource"),
+        optStr(v, "operation"), args, env, impact);
+}
+
+fn parseRule(v: json.JsonValue): Rule {
+    let id = json.asString(json.get(v, "id")) ?? "";
+    let when = if (json.has(v, "when")) (parseWhen(json.get(v, "when"))) else (parseWhen(json.null()));
+    let verdict = types.Verdict.fromSnake(json.asString(json.get(v, "verdict")) ?? "allow");
+    let approvers = List<string>();
+    let ap = json.asArray(json.get(v, "approvers"));
+    if (ap != undefined) {
+        let i = 0;
+        while (i < ap.size()) {
+            let s = json.asString(ap.at(i));
+            if (s != undefined) { approvers.push(s); }
+            i = i + 1;
+        }
+    }
+    let reason = optStr(v, "reason");
+    let obligations = List<Obligation>();
+    let obs = json.asArray(json.get(v, "obligations"));
+    if (obs != undefined) {
+        let i = 0;
+        while (i < obs.size()) { obligations.push(parseObligation(obs.at(i))); i = i + 1; }
+    }
+    return Rule(id, when, verdict, approvers, reason, obligations);
+}
+
+/// Parse a policy manifest from the structured JSON the YAML deserialises to.
+pub fn parseJson(v: json.JsonValue): Policy {
+    let version = (json.asNumber(json.get(v, "version")) ?? 1) as int;
+    let dflt = types.Verdict.fromSnake(json.asString(json.get(v, "default")) ?? "allow");
+    let mode = optStr(v, "mode");
+    if (mode == undefined) { mode = optStr(v, "enforcement_mode"); }
+    let rules = List<Rule>();
+    let rs = json.asArray(json.get(v, "rules"));
+    if (rs != undefined) {
+        let i = 0;
+        while (i < rs.size()) { rules.push(parseRule(rs.at(i))); i = i + 1; }
+    }
+    return Policy(version, dflt, mode, rules);
+}
+
+/// Compile-time validation (decision D9): reject unsound/unsupported constructs.
+/// Returns undefined on success, else an error message. Mirrors `dsl::validate`.
+pub fn validate(policy: Policy): string | undefined {
+    if (policy.mode != undefined) {
+        let m = policy.mode;
+        if (!string.eql(m, "enforce") && !string.eql(m, "observe")) {
+            return `unknown enforcement_mode '${m}'; expected 'enforce' or 'observe'`;
+        }
+    }
+    let i = 0;
+    while (i < policy.rules.size()) {
+        let rule = policy.rules.at(i);
+        if (string.trim(rule.id).length == 0) { return "a rule has an empty id"; }
+        let a = 0;
+        while (a < rule.when.args.size()) {
+            let am = rule.when.args.at(a);
+            if (am.matcher.op.length == 0) {
+                return `rule '${rule.id}': empty matcher on '${am.key}'`;
+            }
+            if (string.eql(am.matcher.op, "regex")) {
+                return `rule '${rule.id}': the 'regex' matcher on '${am.key}' is not supported in v0`;
+            }
+            a = a + 1;
+        }
+        i = i + 1;
+    }
+    return undefined;
+}
+
+// ---- evaluation (direct AST walk; no Cedar) ----
+
+// A three-valued result for matching: matched, not matched, or an evaluation
+// error (which the Rust engine would have surfaced as a Cedar type error and
+// which we fail closed on).
+const M_NO: int = 0;
+const M_YES: int = 1;
+const M_ERR: int = 2;
+
+fn ctxStr(ctx: json.JsonValue, key: string): string {
+    return json.asString(json.get(ctx, key)) ?? "";
+}
+
+// Identity/tool match: "*" or absent -> any; a `*` in the pattern -> glob; else
+// exact. These fields are trusted (proxy-injected), always present (empty when
+// unknown). Mirrors the Cedar `id_cond`/`tool_cond`.
+fn idMatch(pattern: string | undefined, actual: string): bool {
+    if (pattern == undefined) { return true; }
+    let p = pattern;
+    if (string.eql(p, "*")) { return true; }
+    if (string.contains(p, "*")) { return globLike(p, actual); }
+    return string.eql(p, actual);
+}
+
+// Cedar `like`: only `*` is a wildcard (matches any run); all other characters
+// are literal.
+fn globLike(pattern: string, s: string): bool {
+    return likeAt(pattern, 0, s, 0);
+}
+
+fn likeAt(p: string, pi: int, s: string, si: int): bool {
+    if (pi >= p.length) { return si >= s.length; }
+    if (p[pi] == 42) { // '*'
+        // match zero or more characters.
+        let k = si;
+        while (k <= s.length) {
+            if (likeAt(p, pi + 1, s, k)) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if (si >= s.length) { return false; }
+    if (p[pi] != s[si]) { return false; }
+    return likeAt(p, pi + 1, s, si + 1);
+}
+
+// Evaluate one matcher against an actual JSON value (already resolved and known
+// to be present). Returns M_YES / M_NO / M_ERR. Mirrors the Cedar comparators.
+fn matchValue(m: Matcher, actual: json.JsonValue): int {
+    let op = m.op;
+    if (string.eql(op, "exists")) { return M_YES; } // presence handled by caller
+    if (string.eql(op, "eq")) { return boolToM(jsonScalarEq(actual, m.value)); }
+    if (string.eql(op, "ne")) { return boolToM(!jsonScalarEq(actual, m.value)); }
+    if (string.eql(op, "in")) {
+        if (m.value.kind != 4) { return M_ERR; } // `in` needs a sequence
+        let arr = json.asArray(m.value) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) {
+            if (jsonScalarEq(actual, arr.at(i))) { return M_YES; }
+            i = i + 1;
+        }
+        return M_NO;
+    }
+    if (string.eql(op, "contains")) {
+        // substring (Cedar `like "*v*"`): both sides must be strings.
+        let a = json.asString(actual);
+        let v = json.asString(m.value);
+        if (a == undefined || v == undefined) { return M_ERR; }
+        return boolToM(string.contains(a, v));
+    }
+    if (string.eql(op, "gt") || string.eql(op, "gte") || string.eql(op, "lt") || string.eql(op, "lte")) {
+        let av = numOf(actual);
+        let bv = numOf(m.value);
+        if (av == undefined || bv == undefined) { return M_ERR; } // Cedar type error -> fail closed
+        if (string.eql(op, "gt")) { return boolToM(av > bv); }
+        if (string.eql(op, "gte")) { return boolToM(av >= bv); }
+        if (string.eql(op, "lt")) { return boolToM(av < bv); }
+        return boolToM(av <= bv);
+    }
+    return M_ERR; // unknown matcher -> fail closed
+}
+
+fn boolToM(b: bool): int { return if (b) M_YES else M_NO; }
+
+fn numOf(v: json.JsonValue): double | undefined {
+    if (v.kind == 2) { return json.asFloat(v); }
+    return undefined;
+}
+
+// Scalar equality that tolerates string/number/bool, comparing by canonical
+// string form (matches the Rust evaluator's string-based comparisons).
+fn jsonScalarEq(a: json.JsonValue, b: json.JsonValue): bool {
+    let sa = scalarStr(a);
+    let sb = scalarStr(b);
+    if (sa == undefined || sb == undefined) { return false; }
+    return string.eql(sa, sb);
+}
+
+fn scalarStr(v: json.JsonValue): string | undefined {
+    if (v.kind == 3) { return v.sval; }
+    if (v.kind == 2) { return json.stringify(v); }
+    if (v.kind == 1) { return if (v.bval) "true" else "false"; }
+    return undefined;
+}
+
+// Evaluate a whole `when` against the context. Returns M_YES / M_NO / M_ERR.
+fn whenMatches(w: When, ctx: json.JsonValue): int {
+    if (!idMatch(w.tool, ctxStr(ctx, "tool"))) { return M_NO; }
+    if (!idMatch(w.app, ctxStr(ctx, "app"))) { return M_NO; }
+    if (!idMatch(w.agent, ctxStr(ctx, "agent"))) { return M_NO; }
+    if (!idMatch(w.principal, ctxStr(ctx, "principal"))) { return M_NO; }
+    let grp = w.group;
+    if (grp != undefined) {
+        if (!scopesContain(ctx, grp)) { return M_NO; }
+    }
+    if (!idMatch(w.resource, ctxStr(ctx, "resource"))) { return M_NO; }
+    if (!idMatch(w.operation, ctxStr(ctx, "operation"))) { return M_NO; }
+
+    let envM = w.env;
+    if (envM != undefined) {
+        let r = trustedField(ctx, "env", envM);
+        if (r != M_YES) { return r; }
+    }
+    let impM = w.impact;
+    if (impM != undefined) {
+        let r = trustedField(ctx, "impact", impM);
+        if (r != M_YES) { return r; }
+    }
+
+    // arg matchers: agent-supplied, under context.args.*, each guarded by a
+    // presence check (Cedar `has`): a missing arg is a non-match, not an error.
+    let args = json.get(ctx, "args");
+    let i = 0;
+    while (i < w.args.size()) {
+        let am = w.args.at(i);
+        if (string.eql(am.matcher.op, "contains_class")) {
+            // data class lives in the un-spoofable derived namespace (D9).
+            let derived = json.get(ctx, "derived");
+            let dk = `${am.key}_class`;
+            if (derived.kind != 5 || !json.has(derived, dk)) { return M_NO; }
+            let want = json.asString(am.matcher.value) ?? "";
+            if (!string.eql(json.asString(json.get(derived, dk)) ?? "", want)) { return M_NO; }
+        } else {
+            if (args.kind != 5 || !json.has(args, am.key)) { return M_NO; } // `has` guard
+            if (string.eql(am.matcher.op, "exists")) {
+                // presence already satisfied.
+            } else {
+                let r = matchValue(am.matcher, json.get(args, am.key));
+                if (r != M_YES) { return r; }
+            }
+        }
+        i = i + 1;
+    }
+    return M_YES;
+}
+
+fn trustedField(ctx: json.JsonValue, key: string, m: Matcher): int {
+    if (!json.has(ctx, key)) { return M_NO; }
+    if (string.eql(m.op, "exists")) { return M_YES; }
+    return matchValue(m, json.get(ctx, key));
+}
+
+fn scopesContain(ctx: json.JsonValue, group: string): bool {
+    let scopes = json.get(ctx, "principal_scopes");
+    if (scopes.kind != 4) { return false; }
+    let arr = json.asArray(scopes) ?? List<json.JsonValue>();
+    let i = 0;
+    while (i < arr.size()) {
+        let s = json.asString(arr.at(i));
+        if (s != undefined && string.eql(s, group)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn failClosed(reason: string): PolicyOutcome {
+    return PolicyOutcome(types.Verdict.Deny, "eval-error", List<string>(), reason, List<Obligation>());
+}
+
+fn outcomeFromRule(r: Rule): PolicyOutcome {
+    return PolicyOutcome(r.verdict, r.id, r.approvers, r.reason, r.obligations);
+}
+
+/// Evaluate a context against a policy, returning the four-way outcome. Any
+/// evaluation error fails closed to Deny/"eval-error". Precedence across
+/// co-determining rules is deny > step_up > shadow > allow. Mirrors
+/// `PolicyEngine::evaluate` + `apply_observe`, minus Cedar.
+pub fn evaluate(policy: Policy, ctx: json.JsonValue): PolicyOutcome {
+    let best: PolicyOutcome | undefined = undefined;
+    let bestRank = 0 - 1;
+    let i = 0;
+    while (i < policy.rules.size()) {
+        let r = policy.rules.at(i);
+        let m = whenMatches(r.when, ctx);
+        if (m == M_ERR) {
+            // Any evaluation error fails closed (never a silent fall-through).
+            return failClosed("policy evaluation error (fail-closed)");
+        }
+        if (m == M_YES) {
+            let candidate = outcomeFromRule(r);
+            let cr = types.rank(candidate.verdict);
+            // keep the first of equal rank; a strictly higher rank wins.
+            if (best == undefined || cr > bestRank) { best = candidate; bestRank = cr; }
+        }
+        i = i + 1;
+    }
+
+    if (best != undefined) { return applyObserve(policy, best); }
+    let dflt = PolicyOutcome(policy.defaultVerdict, undefined, List<string>(), undefined, List<Obligation>());
+    return applyObserve(policy, dflt);
+}
+
+// In observe mode, a deny or step_up is recorded but not enforced: the effective
+// verdict becomes `shadow` and the reason records the intended verdict. Allow and
+// shadow pass through. Fail-closed errors never reach here (they return early).
+fn applyObserve(policy: Policy, o: PolicyOutcome): PolicyOutcome {
+    if (policy.mode == undefined || !string.eql(policy.mode, "observe")) { return o; }
+    let would = "";
+    if (o.verdict == types.Verdict.Deny) { would = "would deny"; }
+    else if (o.verdict == types.Verdict.StepUp) { would = "would step_up"; }
+    else { return o; }
+
+    let newReason = "";
+    if (o.reason == undefined) { newReason = `observe mode: ${would}`; }
+    else { newReason = `observe mode: ${would} (${o.reason})`; }
+    return PolicyOutcome(types.Verdict.Shadow, o.ruleId, o.approvers, newReason, o.obligations);
+}

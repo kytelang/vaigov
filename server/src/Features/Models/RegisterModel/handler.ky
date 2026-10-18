@@ -1,0 +1,41 @@
+// POST /models -> register a model (RegisterApp). acp model_register: body
+// {name, provider, version, card}; scan_status defaults "unscanned" when no
+// scanner is configured. Returns {ok, id, name, scan_status}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import datetime;
+import crypto.random;
+import Features.Models.Shared.ModelRepository;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct ModelRegisterHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelRegisterHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Capability.RegisterApp)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(json.asString(json.get(body, "name")) ?? "");
+        if (name.length == 0) { return Http.jsonResp("{\"ok\":false,\"error\":\"name is required\"}"); }
+        let provider = json.asString(json.get(body, "provider")) ?? "";
+        let version = json.asString(json.get(body, "version")) ?? "";
+        let card = if (json.has(body, "card")) (json.stringify(json.get(body, "card"))) else ("{}");
+        let nowMs = datetime.nowNs() / 1000000;
+        let id = string.concat("mdl-", random.randomHex(6));
+        let th = ctx.request.getHeader("x-acp-tenant");
+        let tenant = if (th == undefined) (self.app.trustCfg.tenant) else (th ?? "");
+        await self.repo.insert(id, name, provider, version, card, "unscanned", "", tenant, nowMs);
+        let o = Map<string, json.JsonValue>(4, string.hash);
+        o.set("ok", json.bool(true));
+        o.set("id", json.str(id));
+        o.set("name", json.str(name));
+        o.set("scan_status", json.str("unscanned"));
+        return Http.okObj(o);
+    }
+}

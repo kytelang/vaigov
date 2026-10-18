@@ -1,0 +1,88 @@
+// GET /grc -> {"records":[{id,kind,subject,title,status,body,operator,created_ms,
+//   verified,assignee,due_ms,stage,tier,controls_done,controls_total,linked_refs,
+//   verified_refs,total_refs,links}]}. Mirrors acp grc_list (verify-on-read +
+//   checklist/tier/linked-ref enrichment).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.Shared.grcsign;
+import Domain.Dtos.GrcRow;
+
+pub struct ListGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListGrcHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let r = rows.items.getOr(i, GrcRow{ id: "", kind: "", subject: "", title: "", status: "", body: "{}", operator: "", created_ms: 0, pubkey_hex: "", sig_hex: "", linked_refs: "[]", answers_json: "{}", assignee: "", due_ms: 0, stage: "", tenant: "" });
+            let doc = grcsign.grcDoc(r.id, r.kind, r.subject, r.title, r.status, r.body);
+            let verified = grcsign.grcVerify(r.pubkey_hex, doc, r.sig_hex);
+
+            // linked_refs: advisory; count how many reference an ingested decision id.
+            let refsV = json.tryParse(r.linked_refs) ?? json.array(list.List<json.JsonValue>());
+            let refsArr = json.asArray(refsV) ?? list.List<json.JsonValue>();
+            let totalRefs = refsArr.size();
+            let verifiedRefs = 0;
+            let k = 0;
+            while (k < refsArr.size()) {
+                let rf = refsArr.get(k) ?? json.null();
+                let did = if (rf.kind == 3) (rf.sval) else (json.asString(json.get(rf, "id")) ?? "");
+                if (did.length > 0 && await self.repo.ingestedExists(did)) { verifiedRefs = verifiedRefs + 1; }
+                k = k + 1;
+            }
+
+            // body: checklist progress + tier.
+            let parsed = json.tryParse(r.body) ?? json.object(Map<string, json.JsonValue>(1, string.hash));
+            let controlsTotal = 0;
+            let controlsDone = 0;
+            if (parsed.kind == 5 && json.has(parsed, "checklist")) {
+                let cl = json.asArray(json.get(parsed, "checklist")) ?? list.List<json.JsonValue>();
+                controlsTotal = cl.size();
+                let j = 0;
+                while (j < cl.size()) {
+                    let it = cl.get(j) ?? json.null();
+                    if (it.kind == 5 && json.has(it, "done") && (json.asBool(json.get(it, "done")) ?? false)) { controlsDone = controlsDone + 1; }
+                    j = j + 1;
+                }
+            }
+            let tier = if (parsed.kind == 5 && json.has(parsed, "tier")) (json.asString(json.get(parsed, "tier")) ?? "") else ("");
+
+            let m = Map<string, json.JsonValue>(24, string.hash);
+            m.set("id", json.str(r.id));
+            m.set("kind", json.str(r.kind));
+            m.set("subject", json.str(r.subject));
+            m.set("title", json.str(r.title));
+            m.set("status", json.str(r.status));
+            m.set("body", json.str(r.body));
+            m.set("operator", json.str(r.operator));
+            m.set("created_ms", json.number(r.created_ms));
+            m.set("verified", json.bool(verified));
+            m.set("assignee", json.str(r.assignee));
+            m.set("due_ms", json.number(r.due_ms));
+            m.set("stage", json.str(r.stage));
+            m.set("tier", json.str(tier));
+            m.set("controls_done", json.number(controlsDone as long));
+            m.set("controls_total", json.number(controlsTotal as long));
+            m.set("linked_refs", json.array(refsArr));
+            m.set("verified_refs", json.number(verifiedRefs as long));
+            m.set("total_refs", json.number(totalRefs as long));
+            m.set("links", json.null());
+            arr.push(json.object(m));
+            i = i + 1;
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("records", json.array(arr));
+        return Http.okObj(out);
+    }
+}

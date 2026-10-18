@@ -1,0 +1,98 @@
+//! The deterministic content-firewall engine (content-firewall-design §4).
+//!
+//! Compiles a rule set once, then evaluates request/response text against it.
+//! Regex rules use a per-rule cached `text.regex`; every other kind delegates to
+//! the shared `cfmatch` matchers in varman-core, so the edge and the control
+//! plane's test box use one implementation and cannot drift. Side-effect free:
+//! it returns a verdict, the caller decides what to do with it.
+
+import cfrule;
+import cfmatch;
+import text.regex;
+import string;
+import list;
+
+/// The outcome of evaluating text against the rule set.
+pub class ContentVerdict {
+    pub decision: string,          // allow | deny | step_up | shadow
+    pub ruleId: string,
+    pub ruleName: string,
+    pub severity: string,
+    pub controlsCsv: string,       // matched rule's controls, comma-joined
+
+    init() {
+        self.decision = "allow";
+        self.ruleId = "";
+        self.ruleName = "";
+        self.severity = "";
+        self.controlsCsv = "";
+    }
+}
+
+/// A compiled rule: the rule plus its prepared regex (when kind="regex").
+pub class Compiled {
+    pub rule: cfrule.ContentRule,
+    pub rx: regex.Regex | undefined,
+    init(rule: cfrule.ContentRule) { self.rule = rule; self.rx = undefined; }
+}
+
+/// Compiles a rule set once (called when provisioning installs a new set).
+pub fn compileAll(rules: list.List<cfrule.ContentRule>): list.List<Compiled> {
+    let out = list.List<Compiled>();
+    let i = 0;
+    while (i < rules.size()) {
+        let r = rules.get(i) ?? cfrule.ContentRule("", "", "substr", "");
+        let c = Compiled(r);
+        if (string.eql(r.kind, "regex") && r.pattern.length > 0) {
+            c.rx = regex.compile(r.pattern);
+        }
+        out.push(c);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Does a single compiled rule match `text`? Regex uses the per-rule cached
+/// `Regex` (hot path); every other kind delegates to the shared `cfmatch`
+/// matchers in varman-core, so the edge and the control-plane test box agree.
+fn ruleMatches(c: Compiled, text: string): bool {
+    let r = c.rule;
+    if (string.eql(r.kind, "regex")) {
+        if (c.rx == undefined) { return false; }
+        let rx = c.rx ?? regex.compile("");
+        return rx.test(text);
+    }
+    return cfmatch.matchesOneShot(r.kind, r.pattern, r.threshold, text);
+}
+
+/// Evaluates `text` against the compiled set. deny beats step_up beats shadow
+/// beats allow; the first blocking match short-circuits. A shadow match is
+/// recorded in the verdict but does not change an otherwise-allow decision.
+pub fn evaluate(set: list.List<Compiled>, text: string): ContentVerdict {
+    let v = ContentVerdict();
+    let i = 0;
+    while (i < set.size()) {
+        let c = set.get(i) ?? Compiled(cfrule.ContentRule("", "", "substr", ""));
+        if (ruleMatches(c, text)) {
+            let act = c.rule.action;
+            if (string.eql(act, "block")) { return fill(v, "deny", c); }
+            else if (string.eql(act, "step_up")) { if (!string.eql(v.decision, "deny")) { v = fill(v, "step_up", c); } }
+            else if (string.eql(act, "shadow")) { if (string.eql(v.decision, "allow")) { v = fill(v, "shadow", c); } }
+            // Any other action (a typo such as "deny" instead of "block", or an
+            // empty/unknown value) fails CLOSED: a matched rule we cannot interpret
+            // denies rather than silently passing the traffic through.
+            else { return fill(v, "deny", c); }
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn fill(v: ContentVerdict, decision: string, c: Compiled): ContentVerdict {
+    v.decision = decision;
+    v.ruleId = c.rule.id;
+    v.ruleName = c.rule.name;
+    v.severity = c.rule.severity;
+    v.controlsCsv = string.join(c.rule.controlIds, ",");
+    return v;
+}

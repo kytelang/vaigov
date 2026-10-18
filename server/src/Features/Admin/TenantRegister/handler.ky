@@ -1,0 +1,40 @@
+// POST /tenants/register {name,jurisdiction,acts,contact_*} -> {"ok":true,"tenant_id":id,"name":name}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Shared.adminjson;
+
+pub struct TenantRegisterHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: TenantRegisterHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(adminBodyStr(body, "name"));
+        if (name.length == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false));
+            e.set("error", json.str("organisation name is required"));
+            return Http.okObj(e);
+        }
+        let id = string.concat("ten-", random.randomHex(6));
+        let actsVal = if (body.kind == 5 && json.has(body, "acts")) (json.get(body, "acts")) else (json.array(list.List<json.JsonValue>()));
+        let actsJson = json.stringify(actsVal);
+        let profileVal = if (body.kind == 5 && json.has(body, "profile")) (json.get(body, "profile")) else (json.object(Map<string, json.JsonValue>(1, string.hash)));
+        let profileJson = json.stringify(profileVal);
+        await self.repo.registerTenant(id, name, adminBodyStr(body, "jurisdiction"), actsJson, profileJson, adminBodyStr(body, "contact_name"), adminBodyStr(body, "contact_email"), adminBodyStr(body, "contact_phone"), Http.nowMs());
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("tenant_id", json.str(id));
+        m.set("name", json.str(name));
+        return Http.okObj(m);
+    }
+}

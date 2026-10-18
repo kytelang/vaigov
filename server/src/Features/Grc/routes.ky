@@ -1,0 +1,41 @@
+// GRC feature route table (acp-compatible JSON over the shared `acp` db). Only
+// registration lives here; each handler is in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Grc.Shared.GrcRepository;
+import Features.Grc.ListGrc.handler;
+import Features.Grc.AssessGrc.handler;
+import Features.Grc.RiskGrc.handler;
+import Features.Grc.DatasetGrc.handler;
+import Features.Grc.ModelCardGrc.handler;
+import Features.Grc.AssignGrc.handler;
+import Features.Grc.StatusGrc.handler;
+import Features.Grc.DeleteGrc.handler;
+import Features.Grc.LinkGrc.handler;
+import Features.Grc.CommentsGet.handler;
+import Features.Grc.CommentsPost.handler;
+import Features.Grc.ControlToggle.handler;
+import Features.Grc.UsecaseTransition.handler;
+import Features.Grc.GrcTemplates.handler;
+import Features.Grc.GrcConsole.handler;
+
+pub fn registerGrc(ctx: AppContext): void {
+    let repo = GrcRepository(ctx.db);
+    ctx.app.get("/grc/view", GrcViewHandler(repo, ctx));
+    ctx.app.post("/console/grc/save", GrcSaveHandler(repo, ctx));
+    ctx.app.post("/console/grc/delete", GrcDeleteHandler(repo, ctx));
+    ctx.app.get("/grc", ListGrcHandler(repo, ctx));
+    ctx.app.get("/grc/templates", GrcTemplatesHandler(ctx));
+    ctx.app.post("/grc/assess", AssessGrcHandler(repo, ctx));
+    ctx.app.post("/grc/risk", RiskGrcHandler(repo, ctx));
+    ctx.app.post("/grc/dataset", DatasetGrcHandler(repo, ctx));
+    ctx.app.post("/grc/model-card", ModelCardGrcHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/assign", AssignGrcHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/status", StatusGrcHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/delete", DeleteGrcHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/link", LinkGrcHandler(repo, ctx));
+    ctx.app.get("/grc/{id}/comments", CommentsGetHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/comments", CommentsPostHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/control/{control_id}", ControlToggleHandler(repo, ctx));
+    ctx.app.post("/grc/{id}/usecase/{stage}", UsecaseTransitionHandler(repo, ctx));
+}

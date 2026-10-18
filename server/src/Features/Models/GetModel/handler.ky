@@ -1,0 +1,28 @@
+// GET /models/{id} -> the model object, or 404 {"error":"no such model"} (acp model_get).
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import serde.json;
+import Features.Models.Shared.ModelRepository;
+import Features.Models.Shared.modeljson;
+import Domain.Dtos.ModelRow;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct ModelGetHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelGetHandler, ctx: routing.Context): response.Response {
+        let th = ctx.request.getHeader("x-acp-tenant");
+        let tenant = if (th == undefined) (self.app.trustCfg.tenant) else (th ?? "");
+        let id = ctx.param("id");
+        let rows = await self.repo.get(id);
+        if (rows.items.size() == 0) { return Http.jsonStatus(Status.NotFound, "{\"error\":\"no such model\"}"); }
+        let m = rows.items.getOr(0, ModelRow{ id: "", name: "", provider: "", version: "", card_json: "", scan_status: "", aibom_json: "", tenant: "", created_ms: 0 });
+        if (!string.eql(m.tenant, tenant)) { return Http.jsonStatus(Status.NotFound, "{\"error\":\"no such model\"}"); }
+        return Http.jsonResp(json.stringify(modelRowJson(m, false)));
+    }
+}

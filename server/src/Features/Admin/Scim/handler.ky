@@ -1,0 +1,23 @@
+// GET /scim/v2/Users and /scim/v2/Groups -> empty SCIM ListResponse (no directory wired).
+import web.routing;
+import web.response;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.adminjson;
+
+pub struct ScimUsersHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: ScimUsersHandler, ctx: routing.Context): response.Response {
+        return Http.jsonResp(json.stringify(adminScimEmpty()));
+    }
+}
+
+pub struct ScimGroupsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: ScimGroupsHandler, ctx: routing.Context): response.Response {
+        return Http.jsonResp(json.stringify(adminScimEmpty()));
+    }
+}

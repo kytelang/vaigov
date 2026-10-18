@@ -1,0 +1,26 @@
+// POST /grc/{id}/delete -> {"ok":true}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Grc.Shared.GrcRepository;
+
+pub struct DeleteGrcHandler impl RouteHandler {
+    repo: GrcRepository,
+    app: AppContext,
+    init(repo: GrcRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DeleteGrcHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.remove(id, tenant);
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("ok", json.bool(true));
+        return Http.okObj(m);
+    }
+}

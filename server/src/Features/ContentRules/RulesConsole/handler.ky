@@ -1,0 +1,147 @@
+// First-party console mutation handlers for the content-rule authoring screen
+// (views/contentrules.kyx). They read the posted cr* signals, mutate via the
+// shared ContentRuleRepository, and answer with the refreshed #contentrules
+// fragment + a signal patch (close modal / clear / show test result). Trusted
+// console endpoints under /console/content-rules/*; no bearer (the machine
+// /content-rules ActiveSet pull is the signed edge surface).
+import web.routing;
+import web.response;
+import string;
+import list;
+import serde.json;
+import crypto.random;
+import cfmatch;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Shared.ConsoleDs;
+import Features.ContentRules.Shared.ContentRuleRepository;
+import Features.ContentRules.views.contentrules;
+import Domain.Dtos.ContentRuleRow;
+
+// The tenant for a console mutation is taken from the verified session, never
+// from the spoofable `x-acp-tenant` header. An unauthenticated caller yields
+// the configured default tenant and is in any case stopped by `requireCap`.
+fn crTenant(app: AppContext, ctx: routing.Context): string {
+    return Http.sessionTenant(app, ctx) ?? app.trustCfg.tenant;
+}
+
+fn bstr(body: json.JsonValue, key: string): string {
+    return string.trim(json.asString(json.get(body, key)) ?? "");
+}
+
+fn bint(body: json.JsonValue, key: string): int {
+    let n = json.asNumber(json.get(body, key));
+    if (n != undefined) { return (n ?? 0.0) as int; }
+    let s = json.asString(json.get(body, key)) ?? "0";
+    return string.parseInt(s) ?? 0;
+}
+
+// A comma-separated controls string -> a JSON array string (["a","b"]).
+fn controlsCsvToJson(csv: string): string {
+    let parts = string.split(csv, ",");
+    let out = list.List<string>();
+    let i = 0;
+    while (i < parts.size()) {
+        let c = string.trim(parts.get(i) ?? "");
+        if (c.length > 0) { out.push("\"" + string.replace(c, "\"", "") + "\""); }
+        i = i + 1;
+    }
+    return "[" + string.join(out, ",") + "]";
+}
+
+async fn refreshed(repo: ContentRuleRepository, tenant: string, signals: string): response.Response {
+    let rs = await repo.list(tenant);
+    return await ConsoleDs.patchAndSignals(contentrules.contentRulesPanel(rs.items), signals);
+}
+
+// POST /console/content-rules/save -> create (crId empty) or update.
+pub struct RulesSaveHandler impl RouteHandler {
+    repo: ContentRuleRepository,
+    app: AppContext,
+    init(repo: ContentRuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RulesSaveHandler, ctx: routing.Context): Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let tenant = crTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = bstr(body, "crName");
+        if (name.length == 0) {
+            return await refreshed(self.repo, tenant, "{\"crErr\":\"Name is required.\"}");
+        }
+        let kind = bstr(body, "crKind");
+        let pattern = bstr(body, "crPattern");
+        let threshold = bint(body, "crThreshold");
+        let target = bstr(body, "crTarget");
+        let action = bstr(body, "crAction");
+        // Reject an unknown/typo action at authoring time: only block/shadow/step_up
+        // are enforceable. A mistyped action (e.g. "deny") must not be stored, or it
+        // would be fail-closed-denied at the edge while looking active in the console.
+        if (!string.eql(action, "block") && !string.eql(action, "shadow") && !string.eql(action, "step_up")) {
+            return await refreshed(self.repo, tenant, "{\"crErr\":\"Action must be one of: block, shadow, step_up.\"}");
+        }
+        let severity = bstr(body, "crSeverity");
+        let controls = controlsCsvToJson(bstr(body, "crControls"));
+        let id = bstr(body, "crId");
+        if (id.length == 0) {
+            let newId = string.concat("cr-", random.randomHex(6));
+            await self.repo.add(newId, tenant, name, kind, pattern, threshold, target, action, severity, controls, Http.nowMs());
+        } else {
+            await self.repo.update(id, tenant, name, kind, pattern, threshold, target, action, severity, controls, Http.nowMs());
+        }
+        return await refreshed(self.repo, tenant,
+            "{\"crModal\":\"\",\"crErr\":\"\",\"crId\":\"\",\"crName\":\"\",\"crPattern\":\"\",\"crTest\":\"\",\"crTestResult\":\"\"}");
+    }
+}
+
+// POST /console/content-rules/delete {crId}
+pub struct RulesDeleteHandler impl RouteHandler {
+    repo: ContentRuleRepository,
+    app: AppContext,
+    init(repo: ContentRuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RulesDeleteHandler, ctx: routing.Context): Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let tenant = crTenant(self.app, ctx);
+        let id = bstr(Http.bodyJson(ctx), "crId");
+        if (id.length > 0) { await self.repo.remove(id, tenant); }
+        return await refreshed(self.repo, tenant, "{\"crModal\":\"\"}");
+    }
+}
+
+// POST /console/content-rules/toggle {crId}
+pub struct RulesToggleHandler impl RouteHandler {
+    repo: ContentRuleRepository,
+    app: AppContext,
+    init(repo: ContentRuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RulesToggleHandler, ctx: routing.Context): Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let tenant = crTenant(self.app, ctx);
+        let id = bstr(Http.bodyJson(ctx), "crId");
+        if (id.length > 0) { await self.repo.toggle(id, tenant); }
+        return await refreshed(self.repo, tenant, "{}");
+    }
+}
+
+// POST /console/content-rules/test {crKind,crPattern,crThreshold,crTest} -> sets
+// crTestResult using the SHARED cfmatch matcher (so the preview equals what the
+// edge enforces). Does not touch the DB.
+pub struct RulesTestHandler impl RouteHandler {
+    repo: ContentRuleRepository,
+    app: AppContext,
+    init(repo: ContentRuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RulesTestHandler, ctx: routing.Context): Response {
+        let tenant = crTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let kind = bstr(body, "crKind");
+        let pattern = bstr(body, "crPattern");
+        let threshold = bint(body, "crThreshold");
+        let sample = json.asString(json.get(body, "crTest")) ?? "";
+        let hit = cfmatch.matchesOneShot(kind, pattern, threshold, sample);
+        let result = if (sample.length == 0) ("enter sample text to test")
+            else if (hit) ("MATCHES this rule") else ("no match");
+        return await refreshed(self.repo, tenant, "{\"crTestResult\":\"" + result + "\"}");
+    }
+}

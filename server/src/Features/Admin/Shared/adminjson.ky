@@ -1,0 +1,52 @@
+// Shared JSON helpers for the Admin feature (prefixed to stay unique in the
+// global free-fn namespace).
+import string;
+import list;
+import map;
+import serde.json;
+import Domain.Dtos.AdminRows;
+
+pub fn adminCountryJson(c: CountryRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("code", json.str(c.code));
+    m.set("name", json.str(c.name));
+    m.set("region", json.str(c.region));
+    return json.object(m);
+}
+
+pub fn adminChecklistJson(c: ChecklistRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(16, string.hash);
+    m.set("item_id", json.str(c.item_id));
+    m.set("control_id", json.str(c.control_id));
+    m.set("ordinal", json.number(c.ordinal as long));
+    m.set("title", json.str(c.title));
+    m.set("description", json.str(c.description));
+    m.set("required_evidence", json.str(c.required_evidence));
+    m.set("reference", json.str(c.reference));
+    m.set("obligation_type", json.str(c.obligation_type));
+    let roles = json.tryParse(c.roles_json);
+    m.set("roles", roles ?? json.array(list.List<json.JsonValue>()));
+    m.set("applicability", json.str(c.applicability));
+    m.set("assessment_method", json.str(c.assessment_method));
+    m.set("citation", json.str(c.citation));
+    return json.object(m);
+}
+
+// A body string field.
+pub fn adminBodyStr(body: json.JsonValue, key: string): string {
+    if (body.kind != 5 || !json.has(body, key)) { return ""; }
+    return json.asString(json.get(body, key)) ?? "";
+}
+
+// An empty SCIM ListResponse (no directory wired).
+pub fn adminScimEmpty(): json.JsonValue {
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    let schemas = list.List<json.JsonValue>();
+    schemas.push(json.str("urn:ietf:params:scim:api:messages:2.0:ListResponse"));
+    m.set("schemas", json.array(schemas));
+    m.set("totalResults", json.number(0));
+    m.set("startIndex", json.number(1));
+    m.set("itemsPerPage", json.number(0));
+    m.set("Resources", json.array(list.List<json.JsonValue>()));
+    return json.object(m);
+}

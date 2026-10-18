@@ -1,0 +1,95 @@
+//! AI-system attribution resolver (attribution-design).
+//!
+//! The problem this solves: a violation is captured from a network request at
+//! the Envoy edge, and a raw packet carries no "which registered AI system made
+//! this call" identity. Attribution therefore needs an explicit identity signal.
+//! There are two, in priority order:
+//!
+//!  1. An egress tag the caller (or the caller's own egress sidecar/proxy)
+//!     stamps on the request: the `x-varman-system` header. This is the reliable,
+//!     first-class signal and it is all that is needed for attribution to work.
+//!     An operator registers a system in the console, gets its id, and configures
+//!     that system's egress to send `x-varman-system: <id>`.
+//!
+//!  2. A published principal -> system map, when the caller cannot be changed to
+//!     tag its traffic but its authenticated principal (mTLS SPIFFE id, service
+//!     account, API-key subject) is known and has been mapped to a system in the
+//!     console. The sidecar pulls this signed map from the control plane, the
+//!     same way it pulls policy packs and content rules.
+//!
+//! An untagged call from an unmapped principal stays unattributed (""), which the
+//! console reports honestly rather than guessing. Attribution, once resolved, is
+//! stamped into the violation's signed core (see violation.canonicalDoc), so it
+//! is tamper-evident end to end.
+
+import serde.json;
+import string;
+import map;
+
+/// A principal -> system-id mapping, as pulled from the control plane. `sig` is
+/// the control plane's Ed25519 signature over the canonical entries, carried so
+/// the pull path can verify authenticity before applying (verification lives in
+/// the sync path, alongside the pack/content-rule verification).
+pub class SystemMap {
+    pub entries: Map<string, string>,
+    pub sig: string,
+    init() {
+        self.entries = Map<string, string>(16, string.hash);
+        self.sig = "";
+    }
+
+    pub fn set(self: SystemMap, principal: string, systemId: string): void {
+        self.entries.set(principal, systemId);
+    }
+
+    pub fn lookup(self: SystemMap, principal: string): string {
+        if (string.eql(principal, "")) { return ""; }
+        if (!self.entries.has(principal)) { return ""; }
+        return self.entries.get(principal) ?? "";
+    }
+
+    pub fn size(self: SystemMap): int {
+        return self.entries.size() as int;
+    }
+}
+
+/// Resolves the system id for a captured call. The explicit egress tag always
+/// wins (it is the system's own declaration of identity); otherwise the
+/// authenticated principal is looked up in the published map; otherwise the call
+/// is unattributed ("").
+pub fn resolve(explicitTag: string, principal: string, sm: SystemMap): string {
+    let tag = string.trim(explicitTag);
+    if (!string.eql(tag, "")) { return tag; }
+    return sm.lookup(principal);
+}
+
+/// Parses a pulled system-identity map document into a SystemMap. Shape:
+///   { "sig": "<hex>", "entries": [ { "principal": "...", "system_id": "..." }, ... ] }
+/// Tolerant of a missing/!object document (returns an empty map), so a failed or
+/// empty pull simply means "no principal mappings, tag-only attribution".
+pub fn loadJson(raw: string): SystemMap {
+    let sm = SystemMap();
+    let root = json.parse(raw);
+    if (root.kind != 5) { return sm; }
+    sm.sig = jstr(root, "sig");
+    if (!json.has(root, "entries")) { return sm; }
+    let arr = json.get(root, "entries");
+    if (arr.kind != 4) { return sm; }
+    let n = json.size(arr);
+    let i = 0;
+    while (i < n) {
+        let e = json.at(arr, i);
+        if (e.kind == 5) {
+            let p = jstr(e, "principal");
+            let s = jstr(e, "system_id");
+            if (!string.eql(p, "") && !string.eql(s, "")) { sm.set(p, s); }
+        }
+        i = i + 1;
+    }
+    return sm;
+}
+
+fn jstr(v: json.JsonValue, key: string): string {
+    if (v.kind != 5 || !json.has(v, key)) { return ""; }
+    return json.asString(json.get(v, key)) ?? "";
+}

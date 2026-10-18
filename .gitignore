@@ -1,0 +1,18 @@
+build/
+.claude/
+*.o
+node_modules/
+*.run
+*.log
+.entra.env
+*.secret.env
+# Local dev TLS material (mkcert cert + private keys are per-machine; never commit).
+# Regenerate with: mkcert -ecdsa -cert-file dev-cert.pem -key-file dev-key.pem localhost 127.0.0.1 ::1
+server/certs/
+# Build + runtime artifacts (never commit): compiled sidecar binary, the SQLite
+# read-model index and its WAL/SHM, and the locally-pulled content-rules cache.
+sidecar/main
+*.idx.db
+*.idx.db-shm
+*.idx.db-wal
+varman-sidecar-content-rules.json

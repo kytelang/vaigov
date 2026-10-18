@@ -1,0 +1,119 @@
+// POST /logs -> {"ok":true,"received":n,"stored":m}. The OPA decision-log sink.
+// Mirrors acp-server logs_ingest: accept a bare array or {"logs":[...]}, gunzip when
+// gzipped, land each entry's self-describing decision (result, or result.report) as a
+// `decisions` row keyed by decision_id. Report-token gating is a later auth wave.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import datetime;
+import list;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Decisions.Shared.decisionlog;
+import Features.Decisions.Shared.DecisionRepository;
+import Features.Billing.Shared.BillingRepository;
+
+fn jstrOf(v: json.JsonValue, key: string): string {
+    if (!json.has(v, key)) { return ""; }
+    return json.asString(json.get(v, key)) ?? "";
+}
+
+fn jarrStr(v: json.JsonValue, key: string): string {
+    if (!json.has(v, key)) { return "[]"; }
+    return json.stringify(json.get(v, key));
+}
+
+pub struct LogsHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    billing: BillingRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); self.billing = BillingRepository(app.db); }
+
+    async fn serve(self: LogsHandler, ctx: routing.Context): response.Response {
+        // Fail closed: decision-log ingest is the PEP's report channel and must be
+        // authenticated (acp gates it with the shared report token). Require a
+        // verified bearer token or session, and bind the tenant to that identity,
+        // NOT the spoofable x-acp-tenant header or the body's labels.tenant, so a
+        // caller cannot inject coverage, evidence or billing for another tenant.
+        let prinOpt = Http.principalOf(self.app, ctx);
+        if (prinOpt == undefined) { return Http.forbidden(); }
+        let prin = prinOpt ?? Auth.AuthPrincipal("", "", "", list.List<string>());
+        let v = json.tryParse(decisionlog.decodeBody(ctx));
+        if (v == undefined) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false));
+            e.set("error", json.str("bad json"));
+            return Http.okObj(e);
+        }
+        let entries = decisionlog.entriesOf(v ?? json.null());
+        let headerTenant = Http.tenantForIdentity(self.app, ctx, prin);
+        let now = Http.nowMs();
+        let stored: long = 0;
+        let i = 0;
+        while (i < entries.size()) {
+            let entry = entries.at(i);
+            let dec = decisionlog.decisionOf(entry);
+            let verdict = jstrOf(dec, "verdict");
+            if (verdict.length > 0) {
+                if (await self.ingestOne(entry, dec, verdict, headerTenant, now, i)) { stored = stored + 1; }
+            }
+            i = i + 1;
+        }
+        // Meter governed decisions for billing: one usage bump per ingested batch,
+        // keyed to the current calendar month (YYYYMM).
+        if (stored > 0) {
+            let period = datetime.format(now / 1000, "%Y%m");
+            await self.billing.addUsage(headerTenant, period, stored, now);
+        }
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("received", json.number(entries.size() as long));
+        m.set("stored", json.number(stored));
+        return Http.okObj(m);
+    }
+
+    async fn ingestOne(self: LogsHandler, entry: json.JsonValue, dec: json.JsonValue, verdict: string, headerTenant: string, now: long, idx: int): bool {
+        let ruleId = jstrOf(dec, "rule");
+        let controlsJson = jarrStr(dec, "controls");
+        let obligationsJson = jarrStr(dec, "obligations");
+
+        let input = if (json.has(entry, "input")) (json.get(entry, "input")) else (json.object(Map<string, json.JsonValue>(1, string.hash)));
+
+        let resource = jstrOf(dec, "resource");
+        if (resource.length == 0 && input.kind == 5 && json.has(input, "resource")) {
+            resource = decisionlog.flatOrId(json.get(input, "resource"));
+        }
+        let operation = jstrOf(dec, "operation");
+        if (operation.length == 0 && input.kind == 5 && json.has(input, "operation")) {
+            operation = json.asString(json.get(input, "operation")) ?? "";
+        }
+        let subject = jstrOf(dec, "subject");
+        if (subject.length == 0 && input.kind == 5 && json.has(input, "subject")) {
+            subject = decisionlog.flatOrId(json.get(input, "subject"));
+        }
+
+        // The tenant is the authenticated caller's (passed in as headerTenant); the
+        // body's labels.tenant is attacker-controlled and must NOT override it.
+        let tenant = headerTenant;
+        let bundleRevision = "";
+        if (json.has(entry, "bundles")) {
+            let bundles = json.get(entry, "bundles");
+            if (bundles.kind == 5 && json.has(bundles, "acp")) {
+                let acp = json.get(bundles, "acp");
+                if (acp.kind == 5 && json.has(acp, "revision")) { bundleRevision = json.asString(json.get(acp, "revision")) ?? ""; }
+            }
+        }
+        let tsText = jstrOf(entry, "timestamp");
+        let decisionId = jstrOf(entry, "decision_id");
+        if (decisionId.length == 0) {
+            decisionId = string.concat(string.concat("dl-", `${now}`), string.concat("-", `${idx}`));
+        }
+        let inputJson = json.stringify(input);
+
+        await self.repo.record(decisionId, tenant, now, tsText, verdict, ruleId, controlsJson, obligationsJson, resource, operation, subject, bundleRevision, inputJson, now);
+        return true;
+    }
+}

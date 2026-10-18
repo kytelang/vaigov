@@ -1,0 +1,34 @@
+// GET /integration -> a ready-to-edit OPA sidecar config plus the live state.
+import string;
+import map;
+import serde.json;
+import web.routing;
+import web.response;
+import web.status;
+import Features.Opa.Shared.bundle;
+import Shared.AppContext;
+
+pub struct IntegrationHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: IntegrationHandler, ctx: routing.Context): response.Response {
+        let tenant = self.app.trustCfg.tenant;
+        let regoSrc = activeRego(self.app);
+        let rev = revision(regoSrc);
+        let yaml = string.concat(string.concat(
+            "services:\n  varman:\n    url: CONTROL_PLANE_URL\n    headers:\n      x-acp-tenant: \"", tenant),
+            "\"\nbundles:\n  acp:\n    service: varman\n    resource: /v1/bundles/policy\n    polling:\n      min_delay_seconds: 20\n      max_delay_seconds: 60\ndecision_logs:\n  service: varman\n  reporting:\n    min_delay_seconds: 5\n    max_delay_seconds: 15\n");
+
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("tenant", json.str(tenant));
+        m.set("bundle_path", json.str("/v1/bundles/policy"));
+        m.set("decision_log_path", json.str("/logs"));
+        m.set("revision", json.str(rev));
+        m.set("rule_count", json.number(self.app.trust.rules.size() as long));
+        m.set("opa_config_yaml", json.str(yaml));
+        let r = response.Response(Status.Ok, json.stringify(json.object(m)));
+        r.headers.set("Content-Type", "application/json");
+        return r;
+    }
+}

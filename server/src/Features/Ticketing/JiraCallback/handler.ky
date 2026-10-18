@@ -1,0 +1,23 @@
+// POST /tickets/jira : inbound Jira webhook (HMAC-verified over the raw body with the webhook
+// secret). No webhook secret is configured in this build, so it returns acp's secret-unset path
+// (403). STUB: the signed-payload -> apply-resolution path (approve/deny/grc-status) is a later wave.
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct JiraCallbackHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: JiraCallbackHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(false));
+        m.set("error", json.str("Jira callbacks require --webhook-secret"));
+        return Http.jsonStatus(Status.Forbidden, json.stringify(json.object(m)));
+    }
+}

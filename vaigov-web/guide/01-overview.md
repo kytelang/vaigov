@@ -1,0 +1,237 @@
+# 1. Overview and architecture
+
+Varman sits in the path of what AI agents do and turns each action into a governed, recorded event.
+It is built around one idea: an agent should only be able to touch a resource if a policy allows it
+for the human it acts for, and every one of those decisions should leave a proof an outsider can
+check. Everything else in the stack serves that idea.
+
+::: warning How to read this guide (varman today)
+This guide documents the full intended product. The Kyte varman build has a working core and several
+parts that are still design or parity targets. The honest current state, in one place: runtime
+enforcement runs through an Envoy `ext_authz` content-firewall sidecar plus a signed OPA / Rego policy
+bundle, on the **request path only** (no response-side inspection and no redaction yet); the evidence
+ledger primitive is correct but **not populated at runtime** (so `/verify` is vacuously green); the
+authentication floor is now **fail-closed** (no built-in keys, dev routes behind `--dev-auth`) but
+tenant isolation still trusts a request header on most paths and the OIDC login callback does not fully
+verify the id_token; TLS interception is an **explicit base-URL reverse proxy with a static
+certificate**, not transparent on-the-fly minting; and the control catalogue ships 264 controls with
+the flagship frameworks held as subsets. Each chapter carries a status note where this bites.
+:::
+
+## The six-step spine
+
+Every action, whether a tool call, a model call, or an outbound HTTP request, passes through the
+same six steps.
+
+1. **Identify.** Establish the verified agent identity and, where configured, the human principal it
+   acts for. Identity is never taken from the agent's own claims.
+2. **Authorize.** One policy decides at the resource boundary: which database, secret, file, model
+   class or network destination, for this subject and operation.
+3. **Decide.** The verdict is allow, deny, step up to a human, or allow with obligations (confirm,
+   redact, rate-limit, or a token and cost budget). The default is deny-overrides, and any error
+   fails closed.
+4. **Contain.** A scoped, signed kill-switch can halt an agent or resource; sequence governance
+   catches a toxic combination of individually-allowed steps; a data boundary stops a classified
+   value crossing to a lower-trust destination.
+5. **Prove.** The decision becomes a leaf in a Merkle log with an Ed25519 signed tree head, and the
+   sensitive argument payload is encrypted at rest.
+6. **Verify.** Anyone can re-derive the tree and check the signature with the public key alone, so
+   the proof does not depend on trusting the store that produced it.
+
+## The components
+
+Varman deploys as a control plane and one workstation agent, plus a browser console that the control
+plane serves directly (not a separate binary) and an optional model gateway. For the full capability
+list at a glance (enforcement, identity, evidence, content firewall, containment, governance and
+conformance), see the feature set on the [home page](/). The agent is a single
+binary whose enforcement role is set by the capability you run, so wherever an agent acts you run
+`acp-agent` with the right capability; all of them consult the same signed policy and append to the same
+ledger.
+
+- **`acp-server`** is the control plane: identity, AI endpoints, signed policy deploy, the approvals
+  inbox, break-glass, GRC, evidence and health, and the API the console calls. See
+  [chapter 14](14-operations.md).
+- **The browser console** is a Vue single-page app that `acp-server` serves at `/`, on the same origin
+  as its API; it is not a separate binary or process. See [chapter 17](17-console-reference.md).
+- **`acp-agent`** is the one workstation binary. Its role is configuration, set by the capability:
+  - **`acp-agent mcp`** governs **MCP tool calls**, transparently: it relays the JSON-RPC verbatim and
+    only intervenes to deny, hold or rewrite. Runs over stdio (wrapping a child MCP server) or as an
+    HTTP reverse proxy. See [chapter 3](03-proxy.md).
+  - **`acp-agent firewall`** governs **arbitrary HTTP/API traffic** as a forward proxy, with an optional
+    ACP certificate authority for TLS interception on managed devices, and applies the content firewall.
+    See [chapter 5](05-intercept.md).
+  - **`acp-agent guard`** is a sidecar in front of a tool server that **refuses any call that did not
+    come through ACP**, closing the "just call the server directly" bypass. See [chapter 6](06-guard.md).
+  - `acp-agent run` enables several capabilities at once from one `--control-plane` URL.
+
+Two more binaries are optional or offline, not part of the core control plane and agent:
+
+- **`acp-gateway`** (optional, server-side) governs **direct model API calls**. It holds the upstream
+  key, so a caller cannot reach the model off-ACP (credential brokering). See [chapter 4](04-gateway.md).
+- **`acp-cli`** (invoked as `acp`) is the offline tooling for policy, identity,
+  evidence, discovery, red-team and the GRC surface. See [chapter 13](13-cli.md). `acp native-compile`
+  governs a coding agent's own shell, file and network powers by compiling one policy into the vendor's
+  managed settings. See [chapter 7](07-native-compile.md).
+
+## Two enforcement layers: policy and rules
+
+Two things are often confused. They are different layers, and every enforcement point runs both.
+
+- **Policy is authorization.** It answers "is this agent *allowed* to take this action?". A policy rule
+  matches on the trusted facts of a request (`tool`, `agent`, `principal`, `resource`, `operation`,
+  argument values) and returns a verdict: `allow`, `deny`, `step_up` (human approval) or `shadow`
+  (record but do not block), plus obligations like redact or rate-limit. Policy is a single signed,
+  versioned document in the policy store ([chapter 2](02-policy.md)).
+- **The content firewall is detection.** It answers "does this text carry a threat, and which traffic
+  do I even inspect?". It has two parts: **interception rules** (host / SNI / path predicates that
+  decide which traffic the forward proxy intercepts and how) and a **content config** (block secrets,
+  denied topics, a trained injection model, toxicity, an external scan hook). It is not signed; PEPs
+  fetch it from the control plane ([chapter 10](10-content-firewall.md)).
+
+They are complementary, not duplicates: the firewall decides what traffic to see and screens the text
+for prompt-injection, secrets and denied topics; the policy decides whether the underlying action is
+authorized. A request can pass the firewall and still be denied by policy, or the reverse.
+
+| | Policy (authorization) | Content firewall (rules + config) |
+| --- | --- | --- |
+| Question | can this action happen? | what traffic do I inspect, and is the text a threat? |
+| Matches on | tool, agent, principal, resource, operation, args | host / SNI / path predicates; text content |
+| Outcome | allow / deny / step_up / shadow (+ obligations) | intercept action (block / inspect / dlp / pass); block / step_up / shadow (no redact yet) |
+| Direction | request only (a response is not "authorized") | request (response is the parity design, not yet wired) |
+| Signed? | yes (Ed25519, versioned) | no (fetched from the control plane) |
+
+## What an agent intercepts, and in both directions
+
+The `firewall` capability runs as a **forward proxy on the workstation** (optionally with the ACP CA
+for TLS interception), so a single agent intercepts the prompts that the machine's apps send to **many
+AI providers at once**: OpenAI, Anthropic, Azure OpenAI, Bedrock and so on. Which traffic it intercepts
+is decided by the interception rules, so "which provider" is a rule dimension, not a separate
+deployment. The `mcp` and `guard` capabilities are narrower: each governs a single tool server.
+
+Enforcement is **bidirectional by design**. On the request side ACP runs both the policy
+(authorization) and the content firewall (prompt-injection, secrets, denied topics). On the response
+side the design is to run the content firewall again on what comes back (tagged `response` or
+`tool_result`), catching injected instructions in a fetched document, secrets or PII leaking out, and
+system-prompt-leak patterns. Authorization applies only to requests; a response is screened, not
+"authorized".
+
+On the Kyte varman build today, enforcement is **request-path only**: the response, streaming and
+tool-result screening, the redact action and the groundedness / hallucination checks are the parity
+design and are not yet wired on the edge (see [chapter 10](10-content-firewall.md)).
+
+## How configuration is scoped
+
+Today the firewall config and interception rules are stored **per tenant**: every enforcement point in
+a tenant fetches the same content config and rules from the control plane, and the single deployed
+policy differentiates per user by matching on the principal's directory `group` (from the IdP), or a
+specific `agent:` / `app:`, from within its own rules. An agent identifies
+itself with its registered id and enrolment token; its authorization policy, firewall config and interception rules are all fetched from the control
+plane over `--control-plane` (the policy signed and signature-verified), so a remote proxy needs no
+local policy file; an explicit local `--policy` still takes precedence when you want one.
+
+## Deploy where
+
+Two deployment surfaces, and it matters which is which. The recommended topology is a managed control
+plane (hosted on Azure) with the agent installed on each workstation; self-hosting the control plane is
+supported for air-gapped and sovereign buyers. See [chapter 18](18-deployment-topologies.md) for the
+full picture.
+
+**On a server (run as services):**
+
+- `acp-server`, the control plane. This is the hub. Identity, AI endpoints, policy, approvals,
+  break-glass and the GRC records are created and stored here, the console talks to its API, and
+  `acp-server` serves that browser console at `/`.
+- `acp-gateway`, the optional LLM gateway.
+
+**On developer machines (run on demand):**
+
+- `acp-agent mcp`, launched per session in front of a local MCP server.
+- `acp-agent firewall` (also deployable as a shared egress gateway) and `acp-agent guard`, or
+  `acp-agent run` to enable several capabilities at once.
+- `acp`, the offline tooling, for authoring and testing policy, verifying and exporting
+  evidence, red-teaming, and compiling coding-agent settings.
+
+You register agents, AI endpoints, policy and governance records through the console or the
+control-plane API, and they are stored centrally; you do not hand-edit files on each machine. The CLI
+exists for verification, CI gates, and offline or air-gapped work, not as the primary way to change
+governance state. Install the two sides with `install.sh` (workstation) and `install-server.sh`
+(server); see chapter 16.
+
+## Where it fits
+
+Varman is a strong fit when you must **prove** control over AI, not just claim it: regulated or
+high-assurance settings (finance, healthcare, pharma, government, defence, sovereign or air-gapped),
+on-premises or air-gapped operation, more than one agent vendor under one policy and one evidence
+trail, control at the resource level rather than content filtering alone, and cryptographically
+verifiable evidence for an audit or a board.
+
+It is a weaker fit if you want a turnkey
+commercial product with certifications today (it is a tested reference implementation, see
+[chapter 15](15-security.md) and the repository's `docs/production-readiness.md`), or best-in-class
+heavyweight ML content detection as your single dominant need (the built-in firewall is a trained but
+deliberately lightweight classifier that you can augment through an external hook).
+
+## One product, optional interoperability
+
+Varman is designed to be the whole thing: it has its own content firewall and its own GRC lifecycle,
+plus the runtime authorization and tamper-evident evidence that neither an AI firewall nor a GRC
+platform provides. Interoperability is optional: it can call an external content classifier as an
+obligation, and it can feed signed runtime evidence into an existing GRC platform. Neither is
+required.
+
+## What is deliberately not built
+
+Being honest about the edges matters for a governance product.
+
+- **OS-level sandboxing** of shell commands is not Varman's job; the coding agents enforce their own
+  sandboxes and Varman is the policy origin, not a second seccomp layer.
+- **Heavyweight statistical ML monitoring** (large-scale bias and fairness dashboards computed over
+  training datasets) is not the focus. Varman does record per-model fairness metrics and track their
+  drift across evaluations, and it monitors content-classifier drift and runs adversarial red-teaming
+  ([chapter 10](10-content-firewall.md) and [chapter 12](12-grc.md)); for deep statistical model
+  evaluation over training data you augment through an external evaluator.
+
+Most of what was once only a tested primitive is now wired into the running binaries: high-availability
+leader leases, SCIM user and group directory endpoints, alert webhooks, and the SIEM, ticketing,
+FinOps and dataset-governance surfaces all ship today. A small number of items remain as primitives
+that are implemented and tested but not yet exposed on a route; those are called out as such in the
+relevant chapter rather than presented as shipping features.
+
+## Glossary
+
+A quick reference for the terms this guide coins. Each is expanded in the chapter noted.
+
+- **PEP (policy enforcement point).** A component that sits in the path of an agent action and applies
+  the policy: the MCP proxy, the LLM gateway, the interceptor and the guard.
+- **Control plane.** The central service (`acp-server`) that holds identity, endpoints, policy,
+  approvals, break-glass and the evidence API. See [chapter 14](14-operations.md).
+- **Evidence ledger.** The append-only, tamper-evident Merkle log of every decision, verifiable with a
+  public key alone. See [chapter 9](09-evidence.md).
+- **Verdict.** The policy outcome for a call: `allow`, `deny`, `step_up` (hold for a human) or `shadow`
+  (record only, do not block). See [chapter 2](02-policy.md).
+- **Obligation.** A side condition attached to an allow: `confirm` (route to step-up), `rate_limit`
+  (deny once exhausted) or `redact` (rewrite the frame). See [chapter 2](02-policy.md).
+- **Step-up.** A human-in-the-loop hold: the call pauses until an authorised person approves or denies
+  it. See [chapter 11](11-containment.md).
+- **Break-glass (kill-switch).** A signed emergency grant that overrides normal policy to lock down,
+  disable enforcement or bypass. See [chapter 11](11-containment.md).
+- **Shadow mode.** Running a PEP so it evaluates and records but never blocks, to observe real traffic
+  before enforcing. See [chapter 3](03-proxy.md).
+- **Fail-closed / fail-open.** Fail-closed (the default) refuses to forward a call it cannot record;
+  fail-open forwards ungoverned on an evidence-write failure. See [chapter 3](03-proxy.md).
+- **Trajectory governance.** Denying the action that completes a toxic combination of individually
+  allowed steps. See [chapter 11](11-containment.md).
+- **Data boundary.** Destination-aware DLP: may this class of data cross to that destination. See
+  [chapter 11](11-containment.md).
+- **Content firewall.** Argument and response scanning for injection, PII and secrets. See
+  [chapter 10](10-content-firewall.md).
+- **Endpoint registry.** The set of governed destinations the interceptor matches traffic against. See
+  [chapter 5](05-intercept.md).
+- **Tool-integrity pin (rug-pull detection).** A fingerprint of a tool definition or binary; a mismatch
+  means it changed under a live agent. See [chapter 3](03-proxy.md).
+- **Enforcement attestation.** The signed `x-acp-enforcement` token a guard checks to reject un-proxied
+  calls. See [chapter 6](06-guard.md).
+- **Coverage / posture.** Coverage is how much observed traffic a rule matches; posture is whether that
+  coverage is high enough to switch safely to default-deny. See [chapter 2](02-policy.md).
+- **Meta-audit.** The control plane's own ledger of its governance actions (policy, keys, RBAC,
+  break-glass), so the governor is itself governed. See [chapter 9](09-evidence.md).

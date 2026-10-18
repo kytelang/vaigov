@@ -1,0 +1,64 @@
+// First-party console mutations for the Policy packs screen (back views/packview.kyx):
+// install a pack (instantiates its rules with default parameters) and uninstall it
+// (disables its rules). Returns the refreshed #packs fragment + a status message.
+// Trusted /console/*; the machine /policy-packs/{slug}/install JSON API keeps its cap.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+import Features.PolicyPacks.Shared.packinstall;
+import Features.PolicyPacks.Shared.packcards;
+import Features.PolicyPacks.views.packview;
+
+fn pkTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+
+async fn renderPacks(repo: PackRepository, tenant: string, msg: string): Response {
+    let cards = await packcards.packCards(repo, tenant);
+    let sm = Map<string, json.JsonValue>(1, string.hash);
+    sm.set("pkMsg", json.str(msg));
+    return await ConsoleDs.patchAndSignals(packview.packsPanel(cards), json.stringify(json.object(sm)));
+}
+
+// POST /console/packs/install {pkSlug} -> instantiate the pack's rules (defaults).
+pub struct PacksInstallHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PacksInstallHandler, ctx: routing.Context): Response {
+        let tenant = pkTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let slug = string.trim(json.asString(json.get(body, "pkSlug")) ?? "");
+        let pack = packdata.findPack(slug);
+        if (pack == undefined) { return await renderPacks(self.repo, tenant, string.concat("Unknown pack: ", slug)); }
+        let supplied = Map<string, json.JsonValue>(1, string.hash);
+        let res = await packinstall.installPack(self.repo, pack ?? json.null(), supplied, tenant, Http.nowMs());
+        let created = json.asArray(json.get(res, "rules_created"));
+        let n = if (created != undefined) ((created ?? list_empty()).size()) else (0);
+        return await renderPacks(self.repo, tenant, string.concat(string.concat("Installed ", slug), string.concat(": ", string.concat(`${n}`, " rule(s) added."))));
+    }
+}
+
+fn list_empty(): List<json.JsonValue> { return List<json.JsonValue>(); }
+
+// POST /console/packs/uninstall {pkSlug} -> disable the pack's rules (evidence kept).
+pub struct PacksUninstallHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PacksUninstallHandler, ctx: routing.Context): Response {
+        let tenant = pkTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let slug = string.trim(json.asString(json.get(body, "pkSlug")) ?? "");
+        let n = await self.repo.uninstall(tenant, slug);
+        return await renderPacks(self.repo, tenant, string.concat(string.concat("Uninstalled ", slug), string.concat(": ", string.concat(`${n}`, " rule(s) disabled."))));
+    }
+}

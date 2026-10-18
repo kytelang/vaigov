@@ -1,0 +1,40 @@
+// GET /artifacts/{id}/versions -> {"artifact_id":id,"versions":[{version_id,version_no,author,note,status,created_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Evidence.Shared.EvidenceRepository;
+import Domain.Dtos.IngestedRow;
+
+pub struct ArtifactVersionsHandler impl RouteHandler {
+    repo: EvidenceRepository,
+    app: AppContext,
+    init(repo: EvidenceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ArtifactVersionsHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let rows = await self.repo.listVersions(id);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let v = rows.items.getOr(i, ArtifactVersionRow{ version_id: "", version_no: 0, author: "", note: "", status: "", created_ms: 0 });
+            i = i + 1;
+            let m = Map<string, json.JsonValue>(6, string.hash);
+            m.set("version_id", json.str(v.version_id));
+            m.set("version_no", json.number(v.version_no as long));
+            m.set("author", json.str(v.author));
+            m.set("note", json.str(v.note));
+            m.set("status", json.str(v.status));
+            m.set("created_ms", json.number(v.created_ms));
+            arr.push(json.object(m));
+        }
+        let out = Map<string, json.JsonValue>(2, string.hash);
+        out.set("artifact_id", json.str(id));
+        out.set("versions", json.array(arr));
+        return Http.okObj(out);
+    }
+}

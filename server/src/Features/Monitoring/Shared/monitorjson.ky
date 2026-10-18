@@ -1,0 +1,59 @@
+// Shared JSON helpers for the monitoring feature: a float JSON number builder and
+// the oversight-config object (defaults + merge), persisted in control_state.
+import string;
+import map;
+import serde.json;
+
+// A JSON number holding a double (json.number is long-only).
+pub fn jfloat(d: double): json.JsonValue {
+    let v = json.number(0);
+    v.numIsInt = false;
+    v.num = `${d}`;
+    return v;
+}
+
+// The default oversight thresholds (EU AI Act Art. 14 quality profile). Exact
+// acp_core::oversight defaults may differ; these are the documented knobs.
+pub fn defaultOversightConfig(): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("min_decisions", json.number(20));
+    m.set("approve_rate", jfloat(0.95));
+    m.set("fast_ms", json.number(3000));
+    m.set("fast_fraction", jfloat(0.5));
+    m.set("bulk_window_ms", json.number(60000));
+    m.set("bulk_count", json.number(10));
+    return json.object(m);
+}
+
+// The current oversight config: parse the stored JSON (control_state) or default.
+pub fn oversightConfigOf(stateJson: string): json.JsonValue {
+    if (stateJson.length == 0) { return defaultOversightConfig(); }
+    let v = json.tryParse(stateJson);
+    if (v == undefined) { return defaultOversightConfig(); }
+    let doc = v ?? json.null();
+    if (doc.kind != 5) { return defaultOversightConfig(); }
+    return doc;
+}
+
+// Read a numeric field from a body value (accepts a JSON number or a numeric
+// string, as the console sends string signals); returns `undefined` when absent.
+pub fn bodyNum(body: json.JsonValue, key: string): double | undefined {
+    if (body.kind != 5 || !json.has(body, key)) { return undefined; }
+    let f = json.asFloat(json.get(body, key));
+    if (f != undefined) { return f; }
+    let s = json.asString(json.get(body, key));
+    if (s == undefined) { return undefined; }
+    return string.parseFloat(s ?? "0");
+}
+
+// Merge the present body fields over the current config, keeping ints as ints.
+pub fn mergeOversightConfig(cur: json.JsonValue, body: json.JsonValue): json.JsonValue {
+    let m = json.asObject(cur) ?? Map<string, json.JsonValue>(8, string.hash);
+    let md = bodyNum(body, "min_decisions"); if (md != undefined) { m.set("min_decisions", json.number((md ?? 0.0) as long)); }
+    let ar = bodyNum(body, "approve_rate"); if (ar != undefined) { m.set("approve_rate", jfloat(ar ?? 0.0)); }
+    let fm = bodyNum(body, "fast_ms"); if (fm != undefined) { m.set("fast_ms", json.number((fm ?? 0.0) as long)); }
+    let ff = bodyNum(body, "fast_fraction"); if (ff != undefined) { m.set("fast_fraction", jfloat(ff ?? 0.0)); }
+    let bw = bodyNum(body, "bulk_window_ms"); if (bw != undefined) { m.set("bulk_window_ms", json.number((bw ?? 0.0) as long)); }
+    let bc = bodyNum(body, "bulk_count"); if (bc != undefined) { m.set("bulk_count", json.number((bc ?? 0.0) as long)); }
+    return json.object(m);
+}

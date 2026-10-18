@@ -1,0 +1,325 @@
+//! Known-answer / behavioural gate for the Varman policy layer, slice 3:
+//! the two policy engines ported from Rust `acp-core`.
+//!
+//!   - `rego.ky`  : the UI rule-model (compile to OPA Rego + in-process mirror,
+//!                  validateMatch + lint). Faithful port of `rulemodel.rs`.
+//!   - `policy.ky`: the YAML manifest DSL (When/Matcher AST), evaluated DIRECTLY
+//!                  in Kyte (no Cedar). Faithful port of `policy/dsl.rs` + `eval.rs`.
+//!
+//! The Rego known answer is exact: EXPECTED_REGO is the byte-for-byte module the
+//! Rust emitter produces for the one-rule set below (compact, sorted-key decision
+//! JSON via serde's BTreeMap ordering; the hand-written default tail with spaces).
+//! The in-process evaluator is cross-checked against those emitted semantics on a
+//! battery of inputs, and the manifest engine against its four-way precedence,
+//! observe-mode downgrade, fail-closed error, and trusted-vs-args namespacing.
+
+import list;
+import string;
+import assert;
+import serde.json;
+import types;
+import rego;
+import policy;
+
+// --- rego.ky: compile ------------------------------------------------------
+
+// The exact Rego module the Rust `compile_rules` emits for the rule below.
+const EXPECTED_REGO: string =
+    "package acp\n\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.contains\n\n"
+    + "results contains r if {\n\tinput.operation == \"delete\"\n\tr := {\"controls\":[\"require:C-1\"],\"obligations\":[],\"rule\":\"r1\",\"verdict\":\"deny\"}\n}\n\n"
+    + "decision := d if {\n\tsome d in results\n\td.verdict == \"deny\"\n} else := d if {\n\tsome d in results\n\td.verdict == \"step_up\"\n} else := d if {\n\tsome d in results\n} else := {\"verdict\": \"allow\", \"rule\": \"default\", \"controls\": [], \"obligations\": []}\n";
+
+fn ruleOf(src: string): json.JsonValue {
+    return json.parse(src);
+}
+
+fn rulesOf1(src: string): List<json.JsonValue> {
+    let r = List<json.JsonValue>();
+    r.push(json.parse(src));
+    return r;
+}
+
+fn verdictOf(dec: json.JsonValue): string {
+    return json.asString(json.get(dec, "verdict")) ?? "";
+}
+
+@test
+fn compile_rules_emits_exact_rego(): void {
+    let rules = rulesOf1(`{"rule_id":"r1","verdict":"deny","enabled":true,"controls":[{"act":"require","control_id":"C-1"}],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"delete"}]}]}}`);
+    assert.equalStr(rego.compileRules(rules, "allow"), EXPECTED_REGO);
+}
+
+@test
+fn or_group_expands_to_two_blocks_and_mirror_agrees(): void {
+    // combinator any over two operation conditions: the Rego expands the OR into
+    // two `results contains r if` blocks, and the mirror fires on either branch.
+    let rules = rulesOf1(`{"rule_id":"r1","verdict":"deny","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"any","conditions":[{"target":"operation","op":"eq","value":"infer"},{"target":"operation","op":"eq","value":"fine_tune"}]}]}}`);
+    let text = rego.compileRules(rules, "allow");
+    assert.equalInt(countOccurrences(text, "results contains r if"), 2);
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"operation":"infer"}`), "allow")), "deny");
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"operation":"fine_tune"}`), "allow")), "deny");
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"operation":"read"}`), "allow")), "allow");
+}
+
+@test
+fn and_across_groups_and_set_and_pattern_ops(): void {
+    // all over two groups: restricted classification AND operation in {read,export}.
+    let rules = rulesOf1(`{"rule_id":"r2","verdict":"deny","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"resource.classification","op":"eq","value":"restricted"}]},{"combinator":"all","conditions":[{"target":"operation","op":"in","value":"read,export"}]}]}}`);
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"resource":{"classification":"restricted"},"operation":"export"}`), "allow")), "deny");
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"resource":{"classification":"public"},"operation":"export"}`), "allow")), "allow");
+
+    // negate folds into the complementary set operator; startswith pattern.
+    let rules2 = rulesOf1(`{"rule_id":"r3","verdict":"deny","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"resource.id","op":"startswith","value":"pii."},{"target":"subject.role","op":"in","value":"admin","negate":true}]}]}}`);
+    // pii.* resource and subject NOT an admin -> deny.
+    assert.equalStr(verdictOf(rego.evaluate(rules2, json.parse(`{"resource":{"id":"pii.ssn"},"subject":{"roles":["analyst"]}}`), "allow")), "deny");
+    // admin is exempt -> default allow.
+    assert.equalStr(verdictOf(rego.evaluate(rules2, json.parse(`{"resource":{"id":"pii.ssn"},"subject":{"roles":["admin"]}}`), "allow")), "allow");
+}
+
+@test
+fn deny_overrides_when_two_rules_match(): void {
+    // Two rules both match operation=delete: one allow, one deny. Deny-overrides.
+    let rules = List<json.JsonValue>();
+    rules.push(ruleOf(`{"rule_id":"a","verdict":"allow","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"delete"}]}]}}`));
+    rules.push(ruleOf(`{"rule_id":"d","verdict":"deny","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"delete"}]}]}}`));
+    let dec = rego.evaluate(rules, json.parse(`{"operation":"delete"}`), "allow");
+    assert.equalStr(verdictOf(dec), "deny");
+    assert.equalStr(json.asString(json.get(dec, "rule")) ?? "", "d");
+
+    // step_up wins over allow but loses to deny (precedence deny>step_up>allow).
+    let rules2 = List<json.JsonValue>();
+    rules2.push(ruleOf(`{"rule_id":"a","verdict":"allow","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"pay"}]}]}}`));
+    rules2.push(ruleOf(`{"rule_id":"s","verdict":"step_up","enabled":true,"controls":[],"obligations":[],"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"pay"}]}]}}`));
+    assert.equalStr(verdictOf(rego.evaluate(rules2, json.parse(`{"operation":"pay"}`), "allow")), "step_up");
+}
+
+@test
+fn legacy_rule_still_compiles_and_evaluates(): void {
+    let rules = rulesOf1(`{"rule_id":"old","verdict":"deny","enabled":true,"controls":[],"resource":"model","operation":"infer","condition":[{"field":"action","op":"eq","value":"score_individuals"}]}`);
+    assert.equalStr(verdictOf(rego.evaluate(rules, json.parse(`{"resource":"model","operation":"infer","args":{"action":"score_individuals"}}`), "allow")), "deny");
+    assert.contains(rego.compileRules(rules, "allow"), "input.args[\"action\"]");
+}
+
+// --- rego.ky: validateMatch + lint -----------------------------------------
+
+@test
+fn validate_match_rejects_overlong_and_invalid_regex(): void {
+    // A well-formed, short pattern passes.
+    let ok = json.parse(`{"groups":[{"conditions":[{"target":"resource.id","op":"matches","value":"^pii\\\\..*$"}]}]}`);
+    assert.isTrue(rego.validateMatch(ok) == undefined);
+
+    // An over-long pattern is rejected.
+    let longPat = string.repeat("a", 1100);
+    let overlong = json.parse(`{"groups":[{"conditions":[{"target":"resource.id","op":"matches","value":"` + longPat + `"}]}]}`);
+    let e1 = rego.validateMatch(overlong);
+    assert.isTrue(e1 != undefined);
+    assert.contains(e1 ?? "", "too long");
+
+    // A structurally invalid pattern (unbalanced paren) is rejected.
+    let bad = json.parse(`{"groups":[{"conditions":[{"target":"resource.id","op":"matches","value":"(unclosed"}]}]}`);
+    let e2 = rego.validateMatch(bad);
+    assert.isTrue(e2 != undefined);
+    assert.contains(e2 ?? "", "invalid regex");
+}
+
+@test
+fn lint_flags_catch_all_and_shadowed(): void {
+    let rules = List<json.JsonValue>();
+    rules.push(ruleOf(`{"rule_id":"d","name":"deny all","verdict":"deny","enabled":true,"match":{"combinator":"all","groups":[]}}`));
+    rules.push(ruleOf(`{"rule_id":"a","name":"allow read","verdict":"allow","enabled":true,"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"read"}]}]}}`));
+    let findings = rego.lint(rules);
+    assert.isTrue(hasKind(findings, "catch_all"));
+    assert.isTrue(hasKind(findings, "shadowed"));
+}
+
+@test
+fn lint_flags_conflicting_duplicate(): void {
+    // Two rules, same match, different verdict -> an info "conflict".
+    let rules = List<json.JsonValue>();
+    rules.push(ruleOf(`{"rule_id":"x","name":"x","verdict":"allow","enabled":true,"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"write"}]}]}}`));
+    rules.push(ruleOf(`{"rule_id":"y","name":"y","verdict":"step_up","enabled":true,"match":{"combinator":"all","groups":[{"combinator":"all","conditions":[{"target":"operation","op":"eq","value":"write"}]}]}}`));
+    assert.isTrue(hasKind(rego.lint(rules), "conflict"));
+}
+
+// --- policy.ky: manifest DSL -----------------------------------------------
+
+// Build a trusted context the same shape `build_context_identified_full` emits.
+fn ctx(tool: string, resource: string, operation: string, principal: string, groupsJson: string, argsJson: string): json.JsonValue {
+    return json.parse(
+        `{"tool":"` + tool + `","args":` + argsJson + `,"env":"prod","impact":"low",`
+        + `"principal_scopes":` + groupsJson + `,"agent":"a","app":"",`
+        + `"principal":"` + principal + `","resource":"` + resource + `","operation":"` + operation + `","derived":{}}`);
+}
+
+fn evalVerdict(pol: policy.Policy, context: json.JsonValue): string {
+    return policy.evaluate(pol, context).verdict.toSnake();
+}
+
+@test
+fn manifest_precedence_deny_over_stepup_over_shadow_over_allow(): void {
+    // Four overlapping rules on the same tool, one per verdict. Deny wins.
+    let pol = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[`
+        + `{"id":"al","when":{"tool":"t"},"verdict":"allow"},`
+        + `{"id":"sh","when":{"tool":"t"},"verdict":"shadow"},`
+        + `{"id":"su","when":{"tool":"t"},"verdict":"step_up"},`
+        + `{"id":"dn","when":{"tool":"t"},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(pol, ctx("t", "database", "read", "alice", "[]", "{}")), "deny");
+
+    // Drop the deny -> step_up wins.
+    let pol2 = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[`
+        + `{"id":"al","when":{"tool":"t"},"verdict":"allow"},`
+        + `{"id":"sh","when":{"tool":"t"},"verdict":"shadow"},`
+        + `{"id":"su","when":{"tool":"t"},"verdict":"step_up"}]}`));
+    assert.equalStr(evalVerdict(pol2, ctx("t", "database", "read", "alice", "[]", "{}")), "step_up");
+
+    // Shadow beats allow.
+    let pol3 = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[`
+        + `{"id":"al","when":{"tool":"t"},"verdict":"allow"},`
+        + `{"id":"sh","when":{"tool":"t"},"verdict":"shadow"}]}`));
+    assert.equalStr(evalVerdict(pol3, ctx("t", "database", "read", "alice", "[]", "{}")), "shadow");
+}
+
+@test
+fn manifest_resource_operation_and_group_match_from_trusted_fields(): void {
+    // Deny any delete on the database resource; both come from trusted top-level.
+    let pol = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"no-db-delete","when":{"resource":"database","operation":"delete"},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(pol, ctx("db.delete_row", "database", "delete", "", "[]", "{}")), "deny");
+    assert.equalStr(evalVerdict(pol, ctx("db.query", "database", "read", "", "[]", "{}")), "allow");
+
+    // A spoofed `resource` in agent args must NOT satisfy a trusted-resource rule
+    // when the trusted resource differs.
+    assert.equalStr(evalVerdict(pol, ctx("write_file", "filesystem", "delete", "", "[]", `{"resource":"database"}`)), "allow");
+
+    // Group match keys on the trusted principal_scopes set (IdP groups).
+    let polG = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"fin-no-shell","when":{"group":"finance","tool":"shell.exec"},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polG, ctx("shell.exec", "process", "exec", "alice", `["finance","all-staff"]`, "{}")), "deny");
+    assert.equalStr(evalVerdict(polG, ctx("shell.exec", "process", "exec", "bob", `["engineering"]`, "{}")), "allow");
+    assert.equalStr(evalVerdict(polG, ctx("db.query", "database", "read", "alice", `["finance"]`, "{}")), "allow");
+}
+
+@test
+fn manifest_arg_matchers_only_touch_context_args(): void {
+    // eq / in / contains / exists all read context.args.*, guarded by presence.
+    let polEq = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"r","when":{"arg":{"region":{"eq":"eu"}}},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polEq, ctx("t", "database", "read", "", "[]", `{"region":"eu"}`)), "deny");
+    assert.equalStr(evalVerdict(polEq, ctx("t", "database", "read", "", "[]", `{"region":"us"}`)), "allow");
+    // Missing arg is a non-match (the `has` guard), not an error.
+    assert.equalStr(evalVerdict(polEq, ctx("t", "database", "read", "", "[]", "{}")), "allow");
+
+    let polIn = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"r","when":{"arg":{"env":{"in":["prod","stage"]}}},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polIn, ctx("t", "database", "read", "", "[]", `{"env":"prod"}`)), "deny");
+    assert.equalStr(evalVerdict(polIn, ctx("t", "database", "read", "", "[]", `{"env":"dev"}`)), "allow");
+
+    let polCt = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"r","when":{"arg":{"path":{"contains":"secret"}}},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polCt, ctx("t", "filesystem", "read", "", "[]", `{"path":"/etc/secret.txt"}`)), "deny");
+    assert.equalStr(evalVerdict(polCt, ctx("t", "filesystem", "read", "", "[]", `{"path":"/etc/hosts"}`)), "allow");
+
+    let polEx = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"r","when":{"arg":{"token":{"exists":true}}},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polEx, ctx("t", "database", "read", "", "[]", `{"token":"abc"}`)), "deny");
+    assert.equalStr(evalVerdict(polEx, ctx("t", "database", "read", "", "[]", "{}")), "allow");
+
+    // Identity/resource/operation come from trusted fields: a rule keyed on a
+    // trusted field does NOT read args. Here the trusted operation is "read" so a
+    // delete-keyed rule does not fire even though args claims operation=delete.
+    let polTrust = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"r","when":{"operation":"delete"},"verdict":"deny"}]}`));
+    assert.equalStr(evalVerdict(polTrust, ctx("t", "database", "read", "", "[]", `{"operation":"delete"}`)), "allow");
+}
+
+@test
+fn manifest_observe_mode_downgrades_blocks_to_shadow(): void {
+    let rulesSrc =
+        `"rules":[{"id":"no-db-delete","when":{"resource":"database","operation":"delete"},"verdict":"deny","reason":"no deletes"},`
+        + `{"id":"refund-approval","when":{"tool":"pay.refund"},"verdict":"step_up"}]`;
+
+    // enforce: deny and step_up are enforced as-is.
+    let enforce = policy.parseJson(json.parse(`{"version":1,"default":"allow",` + rulesSrc + `}`));
+    assert.equalStr(evalVerdict(enforce, ctx("db.delete_row", "database", "delete", "", "[]", "{}")), "deny");
+    assert.equalStr(evalVerdict(enforce, ctx("pay.refund", "payments", "write", "", "[]", "{}")), "step_up");
+
+    // observe: deny -> shadow (rule still attributed, reason records the intent).
+    let observe = policy.parseJson(json.parse(`{"version":1,"default":"allow","enforcement_mode":"observe",` + rulesSrc + `}`));
+    let d = policy.evaluate(observe, ctx("db.delete_row", "database", "delete", "", "[]", "{}"));
+    assert.equalStr(d.verdict.toSnake(), "shadow");
+    assert.equalStr(d.ruleId ?? "", "no-db-delete");
+    assert.contains(d.reason ?? "", "would deny");
+    let s = policy.evaluate(observe, ctx("pay.refund", "payments", "write", "", "[]", "{}"));
+    assert.equalStr(s.verdict.toSnake(), "shadow");
+    assert.contains(s.reason ?? "", "would step_up");
+    // an allow is untouched by observe mode.
+    assert.equalStr(evalVerdict(observe, ctx("db.query", "database", "read", "", "[]", "{}")), "allow");
+}
+
+@test
+fn manifest_eval_error_fails_closed_to_deny(): void {
+    // A numeric comparison against a present non-numeric arg is a type error in
+    // the Cedar original; here it fails closed to Deny / "eval-error", NOT a
+    // silent fall-through to the default, and observe never downgrades it.
+    let pol = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"big-spend","when":{"arg":{"amount":{"gt":100}}},"verdict":"deny"}]}`));
+    let d = policy.evaluate(pol, ctx("pay", "payments", "write", "", "[]", `{"amount":"lots"}`));
+    assert.equalStr(d.verdict.toSnake(), "deny");
+    assert.equalStr(d.ruleId ?? "", "eval-error");
+
+    // A genuine numeric arg compares normally.
+    assert.equalStr(evalVerdict(pol, ctx("pay", "payments", "write", "", "[]", `{"amount":150}`)), "deny");
+    assert.equalStr(evalVerdict(pol, ctx("pay", "payments", "write", "", "[]", `{"amount":50}`)), "allow");
+
+    // Fail-closed is not downgraded under observe mode.
+    let obs = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","enforcement_mode":"observe","rules":[{"id":"big-spend","when":{"arg":{"amount":{"gt":100}}},"verdict":"deny"}]}`));
+    let d2 = policy.evaluate(obs, ctx("pay", "payments", "write", "", "[]", `{"amount":"lots"}`));
+    assert.equalStr(d2.verdict.toSnake(), "deny");
+    assert.equalStr(d2.ruleId ?? "", "eval-error");
+}
+
+@test
+fn manifest_obligations_round_trip_and_validate(): void {
+    let pol = policy.parseJson(json.parse(
+        `{"version":1,"default":"allow","rules":[{"id":"mask-pii","when":{"resource":"database","operation":"read"},"verdict":"allow","obligations":[{"kind":"redact","fields":["ssn","card"]}]}]}`));
+    let out = policy.evaluate(pol, ctx("db.query", "database", "read", "", "[]", "{}"));
+    assert.equalStr(out.verdict.toSnake(), "allow");
+    assert.equalInt(out.obligations.size(), 1);
+    assert.equalStr(out.obligations.at(0).kind, "redact");
+    assert.equalInt(out.obligations.at(0).fields.size(), 2);
+    assert.equalStr(out.obligations.at(0).fields.at(0), "ssn");
+
+    // validate: unknown mode and the deferred `regex` arg matcher are rejected.
+    let badMode = policy.parseJson(json.parse(`{"version":1,"default":"allow","enforcement_mode":"whatever","rules":[]}`));
+    assert.isTrue(policy.validate(badMode) != undefined);
+    let okPol = policy.parseJson(json.parse(`{"version":1,"default":"allow","enforcement_mode":"observe","rules":[{"id":"a","when":{"tool":"t"},"verdict":"deny"}]}`));
+    assert.isTrue(policy.validate(okPol) == undefined);
+    let regexPol = policy.parseJson(json.parse(`{"version":1,"default":"allow","rules":[{"id":"a","when":{"arg":{"x":{"regex":"^a"}}},"verdict":"deny"}]}`));
+    assert.isTrue(policy.validate(regexPol) != undefined);
+}
+
+// --- helpers ---------------------------------------------------------------
+
+fn countOccurrences(haystack: string, needle: string): int {
+    let count = 0;
+    let from = 0;
+    while (from <= haystack.length - needle.length) {
+        let idx = string.indexOf(string.slice(haystack, from, haystack.length), needle);
+        if (idx < 0) { from = haystack.length + 1; }
+        else { count = count + 1; from = from + idx + needle.length; }
+    }
+    return count;
+}
+
+fn hasKind(findings: List<json.JsonValue>, kind: string): bool {
+    let i = 0;
+    while (i < findings.size()) {
+        if (string.eql(json.asString(json.get(findings.at(i), "kind")) ?? "", kind)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}

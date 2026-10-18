@@ -1,0 +1,55 @@
+// POST /redteam/run (EditFirewall) -> runs the built-in red-team corpus through the
+// content firewall, stores a signed attestation (grc_records, subject='content-firewall'),
+// and returns {"ok":true,"id","status","catch_rate","attacks","caught","fpr","passed"}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import sign;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Assurance.Shared.AssuranceRepository;
+import Features.Assurance.Shared.asr;
+
+pub struct RedteamRunHandler impl RouteHandler {
+    repo: AssuranceRepository,
+    app: AppContext,
+    init(repo: AssuranceRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: RedteamRunHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditFirewall)) { return Http.forbidden(); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+
+        // acp requires a minimum catch rate before an attestation counts as passed.
+        let minCatch = 0.75;
+        let evalj = asr.asrEvalRedteam();
+        let cr = json.asFloat(json.get(evalj, "catch_rate")) ?? 0.0;
+        let passed = cr >= minCatch;
+        let status = if (passed) ("passed") else ("failed");
+        let id = string.concat("rt-", random.randomHex(6));
+
+        // Build the attestation body, sign it with the control-plane key.
+        let bm = Map<string, json.JsonValue>(8, string.hash);
+        bm.set("kind", json.str("red-team"));
+        bm.set("attacks", json.get(evalj, "attacks"));
+        bm.set("caught", json.get(evalj, "caught"));
+        bm.set("catch_rate", json.get(evalj, "catch_rate"));
+        bm.set("fpr", json.get(evalj, "fpr"));
+        bm.set("min_catch", asr.asrFloat(minCatch));
+        bm.set("missed", json.get(evalj, "missed"));
+        let body = json.stringify(json.object(bm));
+
+        let pubk = self.app.trust.keypair.pubHex;
+        let sig = sign.signHex(self.app.trust.keypair.privHex, body as ptr, body.length);
+        await self.repo.addAttestation(id, "content-firewall", "Red-team run", status, body, "", Http.nowMs(), pubk, sig, tenant);
+
+        let m = Map<string, json.JsonValue>(9, string.hash);
+        m.set("ok", json.bool(true)); m.set("id", json.str(id)); m.set("status", json.str(status));
+        m.set("catch_rate", json.get(evalj, "catch_rate")); m.set("attacks", json.get(evalj, "attacks"));
+        m.set("caught", json.get(evalj, "caught")); m.set("fpr", json.get(evalj, "fpr"));
+        m.set("passed", json.bool(passed));
+        return Http.okObj(m);
+    }
+}

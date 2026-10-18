@@ -1,0 +1,236 @@
+// Governance (GRC) view as KYX (acp/console GovernanceView.vue): a tab bar
+// (All / Assessments / Risks / Model cards / Datasets), a 3x3 residual-risk
+// matrix computed from the risk records, the records table, and a kind-aware
+// create modal whose fields change with the selected kind. Datastar forms post
+// to /console/grc/*. No literal braces in attribute values (built as strings).
+import list;
+import string;
+import serde.json;
+import Domain.Dtos.GrcDto;
+
+fn jsq(s: string): string { let a = string.replace(s, "\\", "\\\\"); return string.replace(a, "'", "\\'"); }
+fn dash(s: string): string { if (s.length == 0) { return "-"; } return s; }
+
+fn kindChip(k: string): Html {
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{k}</span>;
+}
+fn statusBadge(s: string): Html {
+    if (string.eql(s, "open") || string.eql(s, "in-progress")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{s}</span>; }
+    else if (string.eql(s, "closed") || string.eql(s, "approved") || string.eql(s, "accepted") || string.eql(s, "done")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{s}</span>; }
+    else if (string.eql(s, "rejected")) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-bad">{s}</span>; }
+    else if (s.length == 0) { return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">-</span>; }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">{s}</span>;
+}
+
+// Map a record kind to its tab key.
+fn kindTab(k: string): string {
+    if (string.eql(k, "risk")) { return "risks"; }
+    if (string.eql(k, "assessment")) { return "assessments"; }
+    if (string.eql(k, "model-card")) { return "modelcards"; }
+    if (string.eql(k, "dataset")) { return "datasets"; }
+    return "other";
+}
+
+fn grcRow(r: GrcRow): Html {
+    let delExpr = "$grId='" + jsq(r.id) + "'; @post('/console/grc/delete')";
+    let show = "$grcTab === 'all' || $grcTab === '" + kindTab(r.kind) + "'";
+    return <tr data-show={show} class="border-b border-line align-top">
+        <td class="py-2 pr-4">{kindChip(r.kind)}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{dash(r.title)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{dash(r.subject)}</td>
+        <td class="py-2 pr-4">{statusBadge(r.status)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{dash(r.assignee)}</td>
+        <td class="py-2 pr-4 font-mono text-[10px] text-muted">{r.id}</td>
+        <td class="py-2 pr-4 text-right"><button class="text-xs text-bad hover:underline" data-on:click={delExpr}>Delete</button></td>
+    </tr>;
+}
+
+// --- Residual-risk matrix -------------------------------------------------
+fn levelOf(s: string): int {
+    if (string.eql(s, "low")) { return 1; }
+    if (string.eql(s, "medium")) { return 2; }
+    if (string.eql(s, "high")) { return 3; }
+    return 0;
+}
+fn riskField(body: string, key: string): int {
+    let v = json.tryParse(body);
+    if (v == undefined) { return 0; }
+    let o = v ?? json.null();
+    if (o.kind != 5) { return 0; }
+    return levelOf(json.asString(json.get(o, key)) ?? "");
+}
+fn scoreTone(score: int): string {
+    if (score <= 2) { return "text-ok"; }
+    if (score <= 4) { return "text-warn"; }
+    if (score <= 6) { return "text-warn"; }
+    return "text-bad";
+}
+// One matrix cell: the count of risks at (likelihood, impact), tinted by score.
+fn matrixCell(count: int, likelihood: int, impact: int): Html {
+    let score = likelihood * impact;
+    let tone = scoreTone(score);
+    let cls = "border border-line rounded-md h-14 flex items-center justify-center text-lg font-semibold " + tone;
+    return <div class={cls}>{if (count > 0) (<span>{`${count}`}</span>) else (<span class="text-muted text-xs">·</span>)}</div>;
+}
+
+fn countAt(rows: list.List<GrcRow>, likelihood: int, impact: int): int {
+    let n = 0;
+    let i = 0;
+    while (i < rows.size()) {
+        let r = rows.at(i);
+        if (string.eql(r.kind, "risk")) {
+            let l = riskField(r.body, "likelihood");
+            let im = riskField(r.body, "impact");
+            if (l == likelihood && im == impact) { n = n + 1; }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn matrixRow(rows: list.List<GrcRow>, impact: int, impactLabel: string): Html {
+    return <div class="grid grid-cols-[70px_1fr_1fr_1fr] gap-2 items-center">
+        <div class="text-[10px] uppercase tracking-wide text-muted text-right pr-1">{impactLabel}</div>
+        {matrixCell(countAt(rows, 1, impact), 1, impact)}
+        {matrixCell(countAt(rows, 2, impact), 2, impact)}
+        {matrixCell(countAt(rows, 3, impact), 3, impact)}
+    </div>;
+}
+
+fn matrixCard(rows: list.List<GrcRow>): Html {
+    return <div class="bg-panel border border-line rounded-xl">
+        <div class="px-5 py-3 border-b border-line">
+            <h2 class="font-semibold text-txt">Residual-risk matrix</h2>
+            <p class="text-xs text-dim">Risk records bucketed by likelihood (across) and impact (down); colour by score.</p>
+        </div>
+        <div class="px-5 py-4 grid gap-2">
+            {matrixRow(rows, 3, "High")}
+            {matrixRow(rows, 2, "Medium")}
+            {matrixRow(rows, 1, "Low")}
+            <div class="grid grid-cols-[70px_1fr_1fr_1fr] gap-2">
+                <div></div>
+                <div class="text-[10px] uppercase tracking-wide text-muted text-center">Low</div>
+                <div class="text-[10px] uppercase tracking-wide text-muted text-center">Medium</div>
+                <div class="text-[10px] uppercase tracking-wide text-muted text-center">High</div>
+            </div>
+            <div class="text-[10px] uppercase tracking-wide text-muted text-center">Likelihood →</div>
+        </div>
+    </div>;
+}
+
+// --- Tab bar --------------------------------------------------------------
+fn tabBtn(key: string, label: string): Html {
+    let cls = "{'bg-panel2 text-txt border-accent': $grcTab === '" + key + "'}";
+    let click = "$grcTab='" + key + "'";
+    return <button class="border-b-2 border-transparent px-3 py-1.5 text-sm text-dim hover:text-txt" data-class={cls} data-on:click={click}>{label}</button>;
+}
+
+fn grField(labelText: string, bind: string, placeholder: string): Html {
+    return <label class="text-xs text-dim">{labelText}
+        <input type="text" data-bind={bind} class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder={placeholder} />
+    </label>;
+}
+
+pub fn grcPanel(rows: list.List<GrcRow>): Html {
+    let sigs = "{grcTab: 'all', grId: '', grKind: 'risk', grSubject: '', grTitle: '', grStatus: 'open', grAssignee: '', grDesc: '', grLikelihood: 'medium', grImpact: 'medium', grTreatment: 'mitigate', grSource: '', grLicence: '', grPii: 'false', grModelId: '', grUsecase: '', grFramework: 'eu-ai-act', grErr: '', grModal: ''}";
+    let newBtn = "$grId=''; $grSubject=''; $grTitle=''; $grStatus='open'; $grAssignee=''; $grDesc=''; $grErr=''; $grModal='open'";
+    return <div id="grc" data-signals={sigs} class="grid gap-4">
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{`${rows.size()} records`}</span>
+            <span class="text-dim text-sm">Governance records per system: risks, assessments (FRIA), model cards and datasets.</span>
+            <div class="ml-auto flex items-center gap-2">
+                <button class="rounded-lg border border-line2 px-3 py-1.5 text-sm hover:bg-panel2" data-on:click={"$grKind='risk'; " + newBtn}>New risk</button>
+                <button class="rounded-lg border border-line2 px-3 py-1.5 text-sm hover:bg-panel2" data-on:click={"$grKind='assessment'; " + newBtn}>New assessment</button>
+                <button class="rounded-lg border border-line2 px-3 py-1.5 text-sm hover:bg-panel2" data-on:click={"$grKind='model-card'; " + newBtn}>New model card</button>
+                <button class="rounded-lg bg-accent text-white px-3.5 py-1.5 text-sm font-medium hover:opacity-90" data-on:click={"$grKind='dataset'; " + newBtn}>New dataset</button>
+            </div>
+        </div>
+        <div data-show="$grErr != ''" class="text-bad text-sm" data-text="$grErr"></div>
+
+        {matrixCard(rows)}
+
+        <div class="flex items-center gap-1 border-b border-line">
+            {tabBtn("all", "All")}
+            {tabBtn("assessments", "Assessments")}
+            {tabBtn("risks", "Risks")}
+            {tabBtn("modelcards", "Model cards")}
+            {tabBtn("datasets", "Datasets")}
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                        <th class="py-2 pr-4">Kind</th><th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Subject</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Assignee</th><th class="py-2 pr-4">ID</th><th class="py-2 pr-4"></th>
+                    </tr></thead>
+                    <tbody>
+                        {for (i in 0..rows.size()) { grcRow(rows.at(i)); }}
+                        {if (rows.size() == 0) {
+                            <tr><td colspan="7" class="py-10 text-center text-dim">No governance records yet. Create a risk, assessment, model card or dataset.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div data-show="$grModal === 'open'" class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-panel border border-line rounded-2xl p-6 w-full max-w-lg">
+                <h3 class="font-semibold text-txt" data-text="'New ' + $grKind">New governance record</h3>
+                <div class="grid sm:grid-cols-2 gap-3 mt-4">
+                    {grField("Title", "grTitle", "short title")}
+                    {grField("Subject (system / asset)", "grSubject", "e.g. Resume Screener")}
+                    <label class="text-xs text-dim">Status
+                        <select data-bind="grStatus" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="open">open</option><option value="in-progress">in-progress</option><option value="closed">closed</option><option value="approved">approved</option><option value="rejected">rejected</option>
+                        </select>
+                    </label>
+                    {grField("Assignee", "grAssignee", "owner")}
+
+                    <label class="text-xs text-dim" data-show="$grKind === 'risk'">Likelihood
+                        <select data-bind="grLikelihood" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
+                        </select>
+                    </label>
+                    <label class="text-xs text-dim" data-show="$grKind === 'risk'">Impact
+                        <select data-bind="grImpact" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
+                        </select>
+                    </label>
+                    <label class="text-xs text-dim" data-show="$grKind === 'risk'">Treatment
+                        <select data-bind="grTreatment" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="mitigate">mitigate</option><option value="accept">accept</option><option value="transfer">transfer</option><option value="avoid">avoid</option>
+                        </select>
+                    </label>
+
+                    <label class="text-xs text-dim" data-show="$grKind === 'assessment'">Framework
+                        <select data-bind="grFramework" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                            <option value="eu-ai-act">eu-ai-act</option><option value="iso-42001">iso-42001</option><option value="nist-ai-rmf">nist-ai-rmf</option>
+                        </select>
+                    </label>
+
+                    {htmlModelCard()}
+                    {htmlDataset()}
+
+                    <label class="text-xs text-dim sm:col-span-2">Description
+                        <input type="text" data-bind="grDesc" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="details" />
+                    </label>
+                    <div class="col-span-full flex justify-end gap-2 pt-1">
+                        <button class="rounded-lg border border-line2 px-4 py-2 text-sm hover:bg-panel2" data-on:click="$grModal=''">Cancel</button>
+                        <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90" data-on:click="@post('/console/grc/save')">Create record</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>;
+}
+
+fn htmlModelCard(): Html {
+    return <label class="text-xs text-dim" data-show="$grKind === 'model-card'">Model id
+        <input type="text" data-bind="grModelId" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="gpt-4o" />
+    </label>;
+}
+fn htmlDataset(): Html {
+    return <label class="text-xs text-dim" data-show="$grKind === 'dataset'">Source
+        <input type="text" data-bind="grSource" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="origin of the data" />
+    </label>;
+}

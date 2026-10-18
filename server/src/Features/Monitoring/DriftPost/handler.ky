@@ -1,0 +1,28 @@
+// POST /monitor/drift {class,hits,total} -> {"ok":true}. PEP classifier counts.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Monitoring.Shared.MonitorRepository;
+import Features.Monitoring.Shared.monitorjson;
+
+pub struct DriftPostHandler impl RouteHandler {
+    repo: MonitorRepository,
+    app: AppContext,
+    init(repo: MonitorRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DriftPostHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let cls = string.trim(json.asString(json.get(body, "class")) ?? "");
+        if (cls.length == 0) { return Http.errResp(Status.BadRequest, "class is required"); }
+        let hd = monitorjson.bodyNum(body, "hits");
+        let td = monitorjson.bodyNum(body, "total");
+        let hits = (hd ?? 0.0) as long;
+        let total = (td ?? 0.0) as long;
+        await self.repo.reportDrift(cls, hits, total, Http.nowMs());
+        return Http.okTrue();
+    }
+}

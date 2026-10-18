@@ -1,0 +1,20 @@
+// Policy-rule authoring routes (acp-compatible JSON over the shared `acp` db).
+// Mirrors acp-server rules.rs; the compiled Rego + bundle live in the Policy/Opa
+// features. Only registration lives here.
+import web.app;
+import Shared.AppContext;
+import Features.Rules.Shared.RuleRepository;
+import Features.Rules.ListRules.handler;
+import Features.Rules.CreateRule.handler;
+import Features.Rules.UpdateRule.handler;
+import Features.Rules.DeleteRule.handler;
+import Features.Rules.SetRuleControls.handler;
+
+pub fn registerRules(ctx: AppContext): void {
+    let repo = RuleRepository(ctx.db);
+    ctx.app.get("/rules", ListRulesHandler(repo, ctx));
+    ctx.app.post("/rules", CreateRuleHandler(repo, ctx));
+    ctx.app.post("/rules/{id}", UpdateRuleHandler(repo, ctx));
+    ctx.app.post("/rules/{id}/delete", DeleteRuleHandler(repo, ctx));
+    ctx.app.post("/rules/{id}/controls", SetRuleControlsHandler(repo, ctx));
+}

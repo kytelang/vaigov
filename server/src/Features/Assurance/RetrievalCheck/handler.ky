@@ -1,0 +1,37 @@
+// POST /retrieval/check -> partition retrieved docs into visible/filtered by the
+// content firewall. acp returns {"ok":true,"visible":[...],"filtered":[...]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.asr;
+
+pub struct RetrievalCheckHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: RetrievalCheckHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let visible = list.List<json.JsonValue>();
+        let filtered = list.List<json.JsonValue>();
+        if (json.has(body, "documents")) {
+            let docs = json.get(body, "documents");
+            let n = json.size(docs);
+            let i = 0;
+            while (i < n) {
+                let d = json.at(docs, i);
+                let text = json.asString(d) ?? (asr.asrBodyStr(d, "text"));
+                if (asr.asrCaughtPub(text)) { filtered.push(d); } else { visible.push(d); }
+                i = i + 1;
+            }
+        }
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("visible", json.array(visible));
+        m.set("filtered", json.array(filtered));
+        return Http.okObj(m);
+    }
+}

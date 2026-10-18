@@ -1,0 +1,39 @@
+// A row of the `ingested_evidence` table (the central fleet-evidence store).
+@serializable pub struct IngestedRow {
+    pub decision_id: string,
+    pub pep: string,
+    pub kind: string,
+    pub verdict: string,
+    pub record: string,
+    pub operator: string,
+    pub created_ms: long,
+    pub pubkey_hex: string,
+    pub sig_hex: string,
+}
+
+// Existence probe for idempotent ingest.
+@serializable pub struct IngestedProbe {
+    pub one: int,
+}
+
+// A versioned-artifact row (artifacts JOIN version count).
+@serializable pub struct ArtifactRow {
+    pub artifact_id: string,
+    pub kind: string,
+    pub name: string,
+    pub scope: string,
+    pub active_version: string,
+    pub baseline_version: string,
+    pub versions: long,
+    pub updated_ms: long,
+}
+
+// A version-history row (artifact_versions).
+@serializable pub struct ArtifactVersionRow {
+    pub version_id: string,
+    pub version_no: int,
+    pub author: string,
+    pub note: string,
+    pub status: string,
+    pub created_ms: long,
+}

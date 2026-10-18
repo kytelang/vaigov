@@ -1,0 +1,43 @@
+// GET /apps -> {"apps":[{id,name,owner,metadata_json,tenant,created_ms}, ...]}.
+// Byte-shape parity with acp-server handlers/identity.rs::apps.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Apps.Shared.AppRepository;
+import Domain.Dtos.AppListRow;
+
+pub fn appRowJson(r: AppListRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("name", json.str(r.name));
+    m.set("owner", json.str(r.owner));
+    m.set("metadata_json", json.str(r.metadata_json));
+    m.set("tenant", json.str(r.tenant));
+    m.set("created_ms", json.number(r.created_ms));
+    return json.object(m);
+}
+
+pub struct ListAppsHandler impl RouteHandler {
+    repo: AppRepository,
+    app: AppContext,
+    init(repo: AppRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListAppsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(appRowJson(rows.items.getOr(i, AppListRow{ id: "", name: "", owner: "", metadata_json: "{}", tenant: "", created_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("apps", json.array(arr));
+        return Http.okObj(m);
+    }
+}

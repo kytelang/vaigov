@@ -1,0 +1,19 @@
+// Compliance feature route table (machine-facing JSON: console + CLI). Only
+// registration lives here; shared projections are in Shared/compliance.ky and
+// each handler in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Compliance.ListControls.handler;
+import Features.Compliance.ListActs.handler;
+import Features.Compliance.Report.handler;
+import Features.Compliance.ActsView.handler;
+import Features.Compliance.ReportsView.handler;
+
+pub fn registerCompliance(ctx: AppContext): void {
+    ctx.app.get("/controls", ControlsHandler(ctx));
+    ctx.app.get("/reports/view", ReportsViewHandler(ctx));
+    ctx.app.post("/reports/view", ReportsViewHandler(ctx));
+    ctx.app.get("/report/framework/{name}", ReportHandler(ctx));
+    ctx.app.get("/acts", ActsHandler(ctx));
+    ctx.app.get("/acts/view", ActsViewHandler(ctx));
+}

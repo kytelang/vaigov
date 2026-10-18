@@ -1,0 +1,26 @@
+// One ticket_rules row (shared `acp` db). Field names follow acp's store.rs SELECT.
+@serializable pub struct TicketRuleRow {
+    pub id: string,
+    pub name: string,
+    pub enabled: int,
+    pub match_verdict: string,
+    pub match_control: string,
+    pub match_resource: string,
+    pub connector: string,
+    pub target_json: string,
+    pub throttle_sec: int,
+}
+
+// One tickets row.
+@serializable pub struct TicketRow {
+    pub id: string,
+    pub rule_id: string,
+    pub decision_id: string,
+    pub connector: string,
+    pub external_id: string,
+    pub status: string,
+    pub title: string,
+    pub hits: int,
+    pub created_ms: long,
+    pub last_sent_ms: long,
+}

@@ -1,0 +1,42 @@
+// Shared builder: merge the built-in pack catalogue with this tenant's installed
+// state into PackCard view-models. Used by both the Packs view (GET) and the
+// console install/uninstall handlers so they render identically.
+import list;
+import map;
+import string;
+import serde.json;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+import Features.PolicyPacks.views.packview;
+import Domain.Dtos.PackRows;
+
+pub async fn packCards(repo: PackRepository, tenant: string): list.List<packview.PackCard> {
+    let installed = await repo.listInstalled(tenant);
+    let byslug = Map<string, InstalledPackRow>(8, string.hash);
+    let k = 0;
+    while (k < installed.items.size()) {
+        let row = installed.items.getOr(k, InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 });
+        byslug.set(row.slug, row);
+        k = k + 1;
+    }
+    let packs = packdata.builtinPacks();
+    let cards = list.List<packview.PackCard>();
+    let i = 0;
+    while (i < packs.size()) {
+        let p = packs.at(i);
+        let slug = json.asString(json.get(p, "slug")) ?? "";
+        let ver = (json.asNumber(json.get(p, "version")) ?? 1) as int;
+        let inst = byslug.get(slug);
+        let isActive = inst != undefined && string.eql((inst ?? InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 }).status, "active");
+        let instVer = if (inst != undefined) ((inst ?? InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 }).version) else (0);
+        cards.push(packview.PackCard(
+            slug,
+            json.asString(json.get(p, "title")) ?? slug,
+            json.asString(json.get(p, "framework_slug")) ?? "",
+            json.asString(json.get(p, "region")) ?? "",
+            json.asString(json.get(p, "description")) ?? "",
+            ver, instVer, isActive, isActive && instVer < ver));
+        i = i + 1;
+    }
+    return cards;
+}

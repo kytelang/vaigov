@@ -1,0 +1,55 @@
+// GET/POST /reports/view -> the Reports hypermedia view (Datastar fragment),
+// matching acp/console ReportsView.vue. GET renders the default (eu-ai-act, all
+// roles, high tier); POST reads the filter signals (rpFramework/rpRole/rpTier/
+// rpJur) from the Apply button and recomputes via the varman-core conformance
+// engine. Same projection the /report/framework/{name} JSON endpoint uses.
+import ds_response;
+import list;
+import string;
+import serde.json;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Compliance.views.reports;
+import conformance;
+import controls;
+
+pub struct ReportsViewHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: ReportsViewHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let slug0 = string.trim(json.asString(json.get(body, "rpFramework")) ?? "");
+        let slug = if (slug0.length == 0) ("eu-ai-act") else (slug0);
+        let role = string.trim(json.asString(json.get(body, "rpRole")) ?? "");
+        let tier0 = string.trim(json.asString(json.get(body, "rpTier")) ?? "");
+        let tier = if (tier0.length == 0) ("high") else (tier0);
+        let jur = string.trim(json.asString(json.get(body, "rpJur")) ?? "");
+
+        let roles = list.List<string>();
+        if (role.length > 0) { roles.push(role); }
+        let jurOpt: string | undefined = if (jur.length > 0) (jur) else (undefined);
+        let profile = conformance.SubjectProfile(roles, tier, undefined, jurOpt, undefined);
+        let rows = conformance.assessFramework(slug, profile, list.List<string>(), list.List<string>());
+        let sum = conformance.summarise(rows);
+
+        let fw = controls.framework(slug);
+        let label = (fw ?? controls.Framework{ slug: slug, label: slug, version: "", frameworkType: "", effectiveDate: "", recordKeepingReference: "", source: "" }).label;
+
+        // Framework options for the picker (checklist-style frameworks from the catalogue).
+        let fwOpts = list.List<reports.FwOpt>();
+        let all = controls.frameworks();
+        let i = 0;
+        while (i < all.size()) {
+            let f = all.getOr(i, controls.Framework{ slug: "", label: "", version: "", frameworkType: "", effectiveDate: "", recordKeepingReference: "", source: "" });
+            fwOpts.push(reports.FwOpt(f.slug, f.label));
+            i = i + 1;
+        }
+
+        return await ds_response.patch(reports.reportsPanel(
+            slug, label, role, tier, jur, fwOpts,
+            sum.total, sum.applicable, sum.conformant, sum.partial, sum.notAssessed, sum.notApplicable, rows));
+    }
+}

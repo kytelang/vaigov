@@ -1,0 +1,81 @@
+// GRC signing + body helpers. A governance record's signed document is
+// grc_doc = {id,kind,subject,title,status,body}; the signature is Ed25519 over
+// the JCS canonical bytes of that object (acp-server common.rs grc_doc +
+// acp_core::sign over canonical_bytes). We sign with the control-plane keypair.
+import serde.json;
+import string;
+import map;
+import list;
+import sign;
+import canonical;
+
+/// The signed GRC document (field order/names match acp's grc_doc).
+pub fn grcDoc(id: string, kind: string, subject: string, title: string, status: string, body: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(id));
+    m.set("kind", json.str(kind));
+    m.set("subject", json.str(subject));
+    m.set("title", json.str(title));
+    m.set("status", json.str(status));
+    m.set("body", json.str(body));
+    return json.object(m);
+}
+
+/// Ed25519 signature (hex) over the canonical bytes of `doc`, under `privHex`.
+pub fn grcSignHex(privHex: string, doc: json.JsonValue): string {
+    let bytes = canonical.canonicalBytesOfJson(doc);
+    return sign.signHex(privHex, bytes as ptr, bytes.length);
+}
+
+/// Verify a GRC doc signature (used by the list enrichment `verified` field).
+pub fn grcVerify(pubHex: string, doc: json.JsonValue, sigHex: string): bool {
+    if (pubHex.length == 0 || sigHex.length == 0) { return false; }
+    let bytes = canonical.canonicalBytesOfJson(doc);
+    return sign.verifyHex(pubHex, bytes as ptr, bytes.length, sigHex);
+}
+
+/// A trimmed string field from a JSON body, or "".
+pub fn grcStr(body: json.JsonValue, key: string): string {
+    if (body.kind != 5 || !json.has(body, key)) { return ""; }
+    return json.asString(json.get(body, key)) ?? "";
+}
+
+/// A long field from a JSON body, or `def`.
+pub fn grcLong(body: json.JsonValue, key: string, def: long): long {
+    if (body.kind != 5 || !json.has(body, key)) { return def; }
+    return json.asNumber(json.get(body, key)) ?? def;
+}
+
+/// The `body` field as a stored string: a string stays as-is; an object/array is
+/// re-stringified; absent becomes "".
+pub fn grcBodyString(body: json.JsonValue): string {
+    if (body.kind != 5 || !json.has(body, "body")) { return ""; }
+    let v = json.get(body, "body");
+    if (v.kind == 3) { return v.sval; }
+    return json.stringify(v);
+}
+
+/// The advisory `linked_refs` array as a stored JSON string (default "[]").
+pub fn grcLinkedRefs(body: json.JsonValue): string {
+    if (body.kind == 5 && json.has(body, "linked_refs")) {
+        let v = json.get(body, "linked_refs");
+        if (v.kind == 4) { return json.stringify(v); }
+    }
+    return "[]";
+}
+
+/// The GRC record kinds acp accepts.
+pub fn grcKinds(): List<string> {
+    let k = List<string>();
+    k.push("assessment"); k.push("conformity"); k.push("risk"); k.push("model-card");
+    k.push("use-case"); k.push("attestation"); k.push("aibom"); k.push("fria");
+    k.push("incident"); k.push("dataset");
+    return k;
+}
+
+pub fn grcKindAllowed(kind: string): bool {
+    let ks = grcKinds();
+    let i = 0;
+    while (i < ks.size()) { if (string.eql(ks.at(i), kind)) { return true; } i = i + 1; }
+    return false;
+}

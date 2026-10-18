@@ -1,0 +1,226 @@
+//! JCS-style canonical byte encoding for records and tree heads.
+//!
+//! A port of Rust `acp-core`'s `canonical.rs`. The Rust side round-trips a value
+//! through `serde_json::Value`, sorts object keys via a `BTreeMap`, applies the
+//! JCS integer-valued-float rule (so `1.0` and `1` canonicalise identically),
+//! and emits compact bytes with `serde_json::to_vec`. This module reproduces
+//! that over Kyte's `serde.json.JsonValue`:
+//!
+//!   - objects emit their keys in ascending byte order, recursively;
+//!   - arrays emit in order;
+//!   - there is no insignificant whitespace (compact);
+//!   - a number whose value is integral emits without a fractional part.
+//!
+//! Byte image note: a Kyte `string` is just a run of UTF-8 bytes, so the
+//! "canonical bytes" are returned as a `string`. It is fed to SHA-256 through
+//! the string's own data pointer (`s as ptr`, `s.length`), the same bridge the
+//! rest of the trust core uses.
+//!
+//! Simplification vs full RFC 8785: a non-integral number is emitted from the
+//! literal text the JSON parser kept (`JsonValue.num`), not re-formatted to the
+//! shortest round-trip form. For the record/STH shapes this never bites (every
+//! number in them is an integer), and the `1.0 -> 1` rule that the gate checks
+//! is implemented exactly. Control-character string escaping follows
+//! `serde.json.quote` (the record/STH strings are hex and identifiers, so no
+//! control bytes occur).
+
+import string;
+import list;
+import map;
+import bytes;
+import serde.json;
+import collections.string_builder;
+import hashing;
+import types;
+
+/// Formats a signed 64-bit integer as a decimal string, without relying on
+/// string interpolation of a `long`.
+fn longToDecimal(val: long): string {
+    if (val == 0) { return "0"; }
+    let neg = false;
+    let v = val;
+    if (v < 0) { neg = true; v = 0 - v; }
+    let digits = 0;
+    let temp = v;
+    while (temp > 0) { digits = digits + 1; temp = temp / 10; }
+    let total = if (neg) (digits + 1) else (digits);
+    let sb = string_builder.StringBuilder();
+    // Build into a fixed buffer by filling from the least significant digit.
+    let buf = bytes.alloc(total);
+    let i = total - 1;
+    temp = v;
+    while (i >= 0) {
+        if (neg && i == 0) {
+            bytes.write_byte(buf, 0, 45);
+        } else {
+            bytes.write_byte(buf, i, ((temp % 10) as int) + 48);
+            temp = temp / 10;
+        }
+        i = i - 1;
+    }
+    sb.appendBytes(buf as long, total);
+    let out = sb.toString();
+    sb.delete();
+    bytes.free(buf);
+    return out;
+}
+
+// Emits a number value per the JCS integer-valued rule.
+fn emitNumber(v: json.JsonValue, sb: StringBuilder): void {
+    if (v.numIsInt) {
+        sb.append(longToDecimal(v.inum));
+        return;
+    }
+    // Fallback (decimal-string) path: apply the JCS rule that an integral value
+    // emits without a fractional part (1.0 -> 1), otherwise keep the literal.
+    let f = json.asFloat(v) ?? 0.0;
+    let limit = 9007199254740992.0;
+    if ((limit > f) && (f > (0.0 - limit))) {
+        let asLong = f as long;
+        if ((asLong as double) == f) {
+            sb.append(longToDecimal(asLong));
+            return;
+        }
+    }
+    sb.append(v.num);
+}
+
+// Recursively emits the canonical byte image of `v` into `sb`.
+fn emit(v: json.JsonValue, sb: StringBuilder): void {
+    if (v.kind == 0) { sb.append("null"); return; }
+    if (v.kind == 1) { sb.append(if (v.bval) ("true") else ("false")); return; }
+    if (v.kind == 2) { emitNumber(v, sb); return; }
+    if (v.kind == 3) { sb.append(json.quote(v.sval)); return; }
+    if (v.kind == 4) {
+        sb.appendChar(91); // [
+        let arr = json.asArray(v) ?? List<json.JsonValue>();
+        let i = 0;
+        while (i < arr.size()) {
+            if (i > 0) { sb.appendChar(44); } // ,
+            emit(arr.at(i), sb);
+            i = i + 1;
+        }
+        sb.appendChar(93); // ]
+        return;
+    }
+    if (v.kind == 5) {
+        sb.appendChar(123); // {
+        let obj = json.asObject(v) ?? Map<string, json.JsonValue>(8, string.hash);
+        let keys = obj.keys();
+        keys.sort((a, b) => { return string.compare(a, b); });
+        let i = 0;
+        while (i < keys.size()) {
+            if (i > 0) { sb.appendChar(44); } // ,
+            let k = keys.at(i);
+            sb.append(json.quote(k));
+            sb.appendChar(58); // :
+            emit(obj.get(k) ?? json.null(), sb);
+            i = i + 1;
+        }
+        sb.appendChar(125); // }
+        return;
+    }
+    sb.append("null");
+}
+
+/// Canonical bytes of any `JsonValue`: sorted object keys (recursively), arrays
+/// in order, compact, with the JCS integer-valued-float normalisation. Returned
+/// as a `string` whose bytes are the canonical image.
+pub fn canonicalBytesOfJson(v: json.JsonValue): string {
+    let sb = string_builder.StringBuilder();
+    emit(v, sb);
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}
+
+/// SHA-256 (hex) of the canonical bytes of a `JsonValue`.
+pub fn sha256HexOfJson(v: json.JsonValue): string {
+    return sha256HexOfString(canonicalBytesOfJson(v));
+}
+
+/// SHA-256 (hex) of the raw UTF-8 bytes of `s`. The string's own data pointer is
+/// the hashing input (no copy): a Kyte `string` is a run of bytes at `s as ptr`.
+pub fn sha256HexOfString(s: string): string {
+    return hashing.sha256HexOf(s as ptr, s.length);
+}
+
+// --- record / STH -> JsonValue ---------------------------------------------
+
+fn optStr(s: string | undefined): json.JsonValue {
+    if (s == undefined) { return json.null(); }
+    return json.str(s);
+}
+
+fn principalToJson(p: types.Principal): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("id", json.str(p.id));
+    m.set("verified", json.bool(p.verified));
+    return json.object(m);
+}
+
+fn impactToJson(im: types.Impact): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("level", json.str(im.level.toSnake()));
+    m.set("taxonomy", json.str(im.taxonomy));
+    return json.object(m);
+}
+
+fn provenanceToJson(pv: types.Provenance): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("algo_hash", json.str(pv.algoHash));
+    m.set("algo_sig", json.str(pv.algoSig));
+    m.set("evaluator", json.str(pv.evaluator));
+    m.set("compiler", json.str(pv.compiler));
+    m.set("context_derivation", json.str(pv.contextDerivation));
+    return json.object(m);
+}
+
+/// A `Record` as a `JsonValue` object, using the same serde field names the
+/// Rust side emits (snake_case). Optional fields serialise as JSON `null`.
+pub fn recordToJson(rec: types.Record): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("schema", json.number(rec.schema as long));
+    m.set("seq", json.number(rec.seq));
+    m.set("ts_ms", json.number(rec.tsMs));
+    m.set("hlc", json.str(rec.hlc));
+    m.set("tool_server_fingerprint", optStr(rec.toolServerFingerprint));
+    m.set("agent_id", json.str(rec.agentId));
+    m.set("principal", principalToJson(rec.principal));
+    m.set("session_id", json.str(rec.sessionId));
+    m.set("tool", json.str(rec.tool));
+    m.set("args_hash", json.str(rec.argsHash));
+    m.set("impact", impactToJson(rec.impact));
+    m.set("verdict", json.str(rec.verdict.toSnake()));
+    m.set("rule_id", optStr(rec.ruleId));
+    m.set("matched", optStr(rec.matched));
+    m.set("policy_hash", json.str(rec.policyHash));
+    m.set("reason", optStr(rec.reason));
+    m.set("provenance", provenanceToJson(rec.provenance));
+    return json.object(m);
+}
+
+/// Canonical byte image of a `Record` (what the RFC 6962 leaf hash commits to).
+pub fn recordCanonicalBytes(rec: types.Record): string {
+    return canonicalBytesOfJson(recordToJson(rec));
+}
+
+/// SHA-256 (hex) of a record's canonical bytes.
+pub fn recordSha256Hex(rec: types.Record): string {
+    return sha256HexOfString(recordCanonicalBytes(rec));
+}
+
+/// A `SignedTreeHead` as a `JsonValue` object, matching the Rust serde fields
+/// (`tree_size`, `root_hash` as hex, `timestamp_ms`).
+pub fn sthToJson(sth: types.SignedTreeHead): json.JsonValue {
+    let m = Map<string, json.JsonValue>(8, string.hash);
+    m.set("tree_size", json.number(sth.treeSize));
+    m.set("root_hash", json.str(sth.rootHashHex));
+    m.set("timestamp_ms", json.number(sth.timestampMs));
+    return json.object(m);
+}
+
+/// Canonical byte image of a signed tree head (what actually gets signed).
+pub fn sthBytes(sth: types.SignedTreeHead): string {
+    return canonicalBytesOfJson(sthToJson(sth));
+}

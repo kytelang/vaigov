@@ -1,0 +1,22 @@
+// Approvals feature route table (acp approvals.rs). The in-memory ApprovalStore is
+// built once here and injected into every handler, so the step-up queue persists
+// across requests for the app's lifetime. Only registration lives here.
+import web.app;
+import Shared.AppContext;
+import Features.Approvals.Shared.ApprovalStore;
+import Features.Approvals.RegisterApproval.handler;
+import Features.Approvals.ApprovalsPending.handler;
+import Features.Approvals.ApprovalStatus.handler;
+import Features.Approvals.ApproveHold.handler;
+import Features.Approvals.DenyHold.handler;
+import Features.Approvals.Inbox.handler;
+
+pub fn registerApprovals(ctx: AppContext): void {
+    let store = ApprovalStore(ctx.db);
+    ctx.app.post("/approvals/register", RegisterApprovalHandler(store, ctx));
+    ctx.app.get("/approvals/pending", ApprovalsPendingHandler(store, ctx));
+    ctx.app.get("/approvals/{id}/status", ApprovalStatusHandler(store, ctx));
+    ctx.app.post("/approvals/{id}/approve", ApproveHoldHandler(store, ctx));
+    ctx.app.post("/approvals/{id}/deny", DenyHoldHandler(store, ctx));
+    ctx.app.get("/inbox", InboxHandler(store, ctx));
+}

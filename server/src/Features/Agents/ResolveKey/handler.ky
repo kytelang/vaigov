@@ -1,0 +1,40 @@
+// POST /agents/resolve-key {key} -> {ok,verified,agent_id,name,app_id,tenant} (unauthenticated;
+// the key IS the credential). Mirrors acp agent_resolve_key.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import canonical;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Agents.Shared.AgentRepository;
+import Features.Apps.CreateApp.handler;
+import Domain.Dtos.PrincipalListRow;
+
+pub struct ResolveKeyHandler impl RouteHandler {
+    repo: AgentRepository,
+    app: AppContext,
+    init(repo: AgentRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ResolveKeyHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let key = bodyStr(body, "key");
+        if (key.length == 0) { return okFalse("key is required"); }
+        let tokenSha = canonical.sha256HexOfString(key);
+        let rows = await self.repo.resolveByTokenSha(tokenSha);
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("ok", json.bool(true));
+        if (rows.items.size() > 0) {
+            let r = rows.items.getOr(0, AgentAuthRow{ id: "", name: "", app_id: "", tenant: "" });
+            m.set("verified", json.bool(true));
+            m.set("agent_id", json.str(r.id));
+            m.set("name", json.str(r.name));
+            m.set("app_id", json.str(r.app_id));
+            m.set("tenant", json.str(r.tenant));
+        } else {
+            m.set("verified", json.bool(false));
+        }
+        return Http.okObj(m);
+    }
+}

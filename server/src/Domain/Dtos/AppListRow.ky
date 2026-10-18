@@ -1,0 +1,10 @@
+// Row of GET /apps, field names = acp-server's serialized App struct (tenant column
+// aliased to `tenant`). Byte-shape parity with acp over the shared `acp` Postgres db.
+@serializable pub struct AppListRow {
+    pub id: string,
+    pub name: string,
+    pub owner: string,
+    pub metadata_json: string,
+    pub tenant: string,
+    pub created_ms: long,
+}

@@ -1,0 +1,20 @@
+// GET /content-rules/view -> the content-rule authoring screen (Datastar fragment).
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.ContentRules.Shared.ContentRuleRepository;
+import Features.ContentRules.views.contentrules;
+import Domain.Dtos.ContentRuleRow;
+
+pub struct RulesViewHandler impl RouteHandler {
+    repo: ContentRuleRepository,
+    app: AppContext,
+    init(repo: ContentRuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RulesViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rs = await self.repo.list(tenant);
+        return await ds_response.patch(contentrules.contentRulesPanel(rs.items));
+    }
+}

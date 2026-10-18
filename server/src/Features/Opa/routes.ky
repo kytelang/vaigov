@@ -1,0 +1,14 @@
+// OPA integration feature route table (machine-facing: the OPA sidecar consumes
+// these). Only registration lives here; the bundle format is in Shared/bundle.ky
+// and each handler in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Opa.GetBundle.handler;
+import Features.Opa.GetIntegration.handler;
+import Features.Opa.IntegrationView.handler;
+
+pub fn registerOpa(ctx: AppContext): void {
+    ctx.app.get("/v1/bundles/{name}", BundleHandler(ctx));
+    ctx.app.get("/integration", IntegrationHandler(ctx));
+    ctx.app.get("/integration/view", IntegrationViewHandler(ctx));
+}

@@ -1,0 +1,48 @@
+// GET /ticket-rules -> {"rules":[{id,name,enabled(bool),match_verdict,match_control,
+// match_resource,connector,target(parsed),throttle_sec}]}. Mirrors acp list_ticket_rules.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Ticketing.Shared.TicketRepository;
+import Domain.Dtos.TicketRuleRow;
+
+pub fn ticketRuleJson(r: TicketRuleRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(10, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("name", json.str(r.name));
+    m.set("enabled", json.bool(r.enabled != 0));
+    m.set("match_verdict", json.str(r.match_verdict));
+    m.set("match_control", json.str(r.match_control));
+    m.set("match_resource", json.str(r.match_resource));
+    m.set("connector", json.str(r.connector));
+    let tv = json.tryParse(r.target_json);
+    let target = if (tv == undefined) (json.object(Map<string, json.JsonValue>(1, string.hash))) else (tv ?? json.null());
+    m.set("target", target);
+    m.set("throttle_sec", json.number(r.throttle_sec as long));
+    return json.object(m);
+}
+
+pub struct ListTicketRulesHandler impl RouteHandler {
+    repo: TicketRepository,
+    app: AppContext,
+    init(repo: TicketRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListTicketRulesHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listRules(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(ticketRuleJson(rows.items.getOr(i, TicketRuleRow{ id: "", name: "", enabled: 0, match_verdict: "", match_control: "", match_resource: "", connector: "webhook", target_json: "{}", throttle_sec: 3600 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("rules", json.array(arr));
+        return Http.okObj(m);
+    }
+}

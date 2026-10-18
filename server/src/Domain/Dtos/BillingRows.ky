@@ -1,0 +1,17 @@
+// Row DTOs for the SaaS Billing feature (subscriptions + usage metering).
+@serializable pub struct SubscriptionRow {
+    pub tenant_id: string,
+    pub plan_slug: string,
+    pub status: string,
+    pub stripe_customer_id: string,
+    pub stripe_subscription_id: string,
+    pub current_period_end_ms: long,
+    pub created_ms: long,
+    pub updated_ms: long,
+}
+
+@serializable pub struct UsageRow {
+    pub period: string,
+    pub decisions_count: long,
+    pub updated_ms: long,
+}

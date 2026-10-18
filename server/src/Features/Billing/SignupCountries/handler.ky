@@ -1,0 +1,20 @@
+// GET /signup/countries -> the country <select> fragment for the signup page
+// (Datastar morph by id). Populated from the countries catalogue, same source as
+// the acp RegisterView country dropdown.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Admin.Shared.AdminRepository;
+import Features.Billing.views.signupfrag;
+
+pub struct SignupCountriesHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+
+    async fn serve(self: SignupCountriesHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.countries();
+        return await ds_response.patch(signupfrag.countrySelect(rows.items));
+    }
+}

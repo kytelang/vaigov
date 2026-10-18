@@ -1,0 +1,28 @@
+// POST /systems/{id}/delete -> {"ok":true} (cascade roles/soa/evidence).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+
+pub struct DeleteSystemHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: DeleteSystemHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let id = ctx.param("id");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        await self.repo.deleteSystem(id, tenant);
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "system-deleted", "system", "", tenant, Http.nowMs());
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("ok", json.bool(true));
+        return Http.okObj(m);
+    }
+}

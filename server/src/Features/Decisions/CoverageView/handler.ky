@@ -1,0 +1,22 @@
+// GET /coverage/view -> the Coverage matrix hypermedia view (Datastar fragment),
+// matching acp/console CoverageView.vue. Renders the SAME shared projection the
+// JSON endpoint serialises (Decisions/Shared/coverage.ky).
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Decisions.Shared.DecisionRepository;
+import Features.Decisions.Shared.coverage;
+import Features.Decisions.views.coveragev;
+
+pub struct CoverageViewHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); }
+
+    async fn serve(self: CoverageViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let data = await coverage.computeCoverage(self.repo, tenant);
+        return await ds_response.patch(coveragev.coveragePanel(data));
+    }
+}

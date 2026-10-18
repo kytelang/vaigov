@@ -1,0 +1,86 @@
+// ModelRepository: data access for the acp `models` table (shared Postgres `acp`
+// db). Returns rows whose JSON field names match acp-server's Model struct
+// (tenant_id column projected AS tenant). Also writes the grc_records attestation
+// rows the fairness endpoints produce.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.ModelRow;
+import Domain.Dtos.GrcAttestationRow;
+
+pub struct ModelRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn list(self: ModelRepository, tenant: string): Rows<ModelRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<ModelRow>(conn, "models").query(
+            "SELECT id, name, provider, version, card_json, scan_status, aibom_json, tenant_id AS tenant, created_ms FROM models WHERE tenant_id = $1 ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn get(self: ModelRepository, id: string): Rows<ModelRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id));
+        let r = await Repository<ModelRow>(conn, "models").query(
+            "SELECT id, name, provider, version, card_json, scan_status, aibom_json, tenant_id AS tenant, created_ms FROM models WHERE id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn insert(self: ModelRepository, id: string, name: string, provider: string, version: string, cardJson: string, scanStatus: string, aibom: string, tenant: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(name)); p.push(db.dbText(provider)); p.push(db.dbText(version));
+        p.push(db.dbText(cardJson)); p.push(db.dbText(scanStatus)); p.push(db.dbText(aibom)); p.push(db.dbText(tenant));
+        p.push(db.dbLong(nowMs));
+        let _r = await conn.exec("INSERT INTO models (id, name, provider, version, card_json, scan_status, aibom_json, tenant_id, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn update(self: ModelRepository, id: string, name: string, provider: string, version: string, cardJson: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(name)); p.push(db.dbText(provider)); p.push(db.dbText(version)); p.push(db.dbText(cardJson));
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("UPDATE models SET name = $1, provider = $2, version = $3, card_json = $4 WHERE id = $5 AND tenant_id = $6", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn delete(self: ModelRepository, id: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("DELETE FROM models WHERE id = $1 AND tenant_id = $2", p);
+        self.db.pool.release(conn);
+    }
+
+    // Store a fairness attestation as a grc_records row (acp `add_grc`, kind
+    // 'attestation'). answers_json '{}', assignee '', due_ms 0, stage = status.
+    pub async fn addAttestation(self: ModelRepository, gid: string, subject: string, title: string, status: string, body: string, operator: string, nowMs: long, pubHex: string, sigHex: string, refs: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(gid)); p.push(db.dbText(subject)); p.push(db.dbText(title)); p.push(db.dbText(status));
+        p.push(db.dbText(body)); p.push(db.dbText(operator)); p.push(db.dbLong(nowMs)); p.push(db.dbText(pubHex));
+        p.push(db.dbText(sigHex)); p.push(db.dbText(refs)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("INSERT INTO grc_records (id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id) VALUES ($1, 'attestation', $2, $3, $4, $5, $6, $7, $8, $9, $10, '{}', '', 0, $4, $11)", p);
+        self.db.pool.release(conn);
+    }
+
+    // Attestations for one tenant, oldest first (fairness history filters by subject + title).
+    pub async fn attestations(self: ModelRepository, tenant: string): Rows<GrcAttestationRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<GrcAttestationRow>(conn, "grc_records").query(
+            "SELECT id, subject, title, status, body, created_ms FROM grc_records WHERE tenant_id = $1 AND kind = 'attestation' ORDER BY created_ms", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+}

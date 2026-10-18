@@ -1,0 +1,105 @@
+// Signup fragments (matches acp/console RegisterView): the country <select>
+// populated from /countries, and the country-driven "Regulations to comply with"
+// checklist. Both are Datastar fragments morphed into the static signup page by
+// their element id. No literal braces in KYX attribute values; {for} loops yield
+// through helper-function calls (an inline element after `let` does not compile).
+import string;
+import list;
+import Features.Admin.Shared.AdminRepository;
+
+// One act shown in the checklist: slug + display label + framework type + its
+// applicability for the chosen country ("statutory" | "recommended" | "").
+pub struct SigAct {
+    pub slug: string,
+    pub label: string,
+    pub ftype: string,
+    pub applicability: string,
+    init(slug: string, label: string, ftype: string, applicability: string) {
+        self.slug = slug; self.label = label; self.ftype = ftype; self.applicability = applicability;
+    }
+}
+
+// A Datastar signal key for an act slug (slugs use hyphens, which are not valid
+// in a signal path, so map '-' -> '_'; the signup handler maps back).
+pub fn actKey(slug: string): string { return string.replace(slug, "-", "_"); }
+
+fn countryOption(c: CountryRow): Html {
+    let label = c.name + " (" + c.code + ")";
+    return <option value={c.code}>{label}</option>;
+}
+
+// The country <select>. On change it clears any prior selection and reloads the
+// applicable-acts checklist for the newly chosen country.
+pub fn countrySelect(rows: list.List<CountryRow>): Html {
+    // Read the newly selected value straight off the event (evt.target.value), not
+    // $suCountry: data-bind updates the signal on the same change event, so reading
+    // the signal here can race and send an empty country. Reset any prior ticks.
+    let onChange = "$suActs = {}; @get('/signup/acts?country=' + evt.target.value + '&all=' + ($suShowAll ? '1' : '0'))";
+    return <select id="suCountrySel" data-bind="suCountry" data-on:change={onChange}
+            class="bg-panel2 border border-line rounded-md px-3 py-2 text-sm">
+        <option value="">Select a country…</option>
+        {for (i in 0..rows.size()) {
+            let c = rows.getOr(i, CountryRow{ code: "", name: "", region: "" });
+            countryOption(c);
+        }}
+    </select>;
+}
+
+fn applBadge(appl: string): Html {
+    if (string.eql(appl, "statutory")) {
+        return <span class="ml-2 text-[10px] text-accent uppercase">required</span>;
+    } else if (string.eql(appl, "recommended")) {
+        return <span class="ml-2 text-[10px] text-dim uppercase">recommended</span>;
+    }
+    return <span></span>;
+}
+
+fn actRow(a: SigAct): Html {
+    let bind = "suActs." + actKey(a.slug);
+    return <label class="flex items-start gap-2 text-sm px-2 py-1.5 rounded hover:bg-panel2 cursor-pointer">
+        <input type="checkbox" data-bind={bind} class="mt-1" />
+        <span class="flex-1"><span class="font-medium">{a.label}</span>{applBadge(a.applicability)}</span>
+    </label>;
+}
+
+// The regulations checklist for `country`. `region` is the resolved region of the
+// country ("EU"/"UK"/"CA"/"other"); statutory acts are pre-ticked via a
+// data-signals frame on the fragment. The signal reset lives on the select's
+// change handler, so this fragment only needs to set the statutory keys true.
+pub fn actsPanel(country: string, region: string, acts: list.List<SigAct>, showAll: bool): Html {
+    // Build the data-signals object that pre-selects statutory acts. Use
+    // unquoted (identifier) keys and a double-quote-free literal so it survives
+    // as an HTML attribute value; Datastar evaluates it as a JS object. Act keys
+    // are already sanitised to [a-z0-9_], so they are valid identifiers.
+    let pre = "{suActs:{";
+    let first = true;
+    let i = 0;
+    while (i < acts.size()) {
+        let a = acts.getOr(i, SigAct{ slug: "", label: "", ftype: "", applicability: "" });
+        if (string.eql(a.applicability, "statutory")) {
+            if (!first) { pre = pre + ","; }
+            pre = pre + actKey(a.slug) + ":true";
+            first = false;
+        }
+        i = i + 1;
+    }
+    pre = pre + "}}";
+
+    let showHint = !showAll && !string.eql(country, "") && !string.eql(region, "other");
+    let otherHint = !showAll && string.eql(region, "other") && !string.eql(country, "");
+
+    return <div id="suActs" data-signals={pre} class="grid gap-1">
+        {if (showHint) { <p class="text-xs text-dim">Showing regulations relevant to <b>{country}</b>. Statutory ones are pre-selected.</p>; }}
+        {if (otherHint) { <p class="text-xs text-warn">No statutory acts mapped for "{country}"; showing international standards. Tick "show all" for the full list.</p>; }}
+        <div class="max-h-56 overflow-y-auto border border-line rounded-lg p-2 grid gap-1">
+            {for (j in 0..acts.size()) {
+                let a = acts.getOr(j, SigAct{ slug: "", label: "", ftype: "", applicability: "" });
+                actRow(a);
+            }}
+            {if (acts.size() == 0) {
+                <p class="text-xs text-dim px-2 py-3 text-center">Select your country above to see the regulations that apply, or tick "show all".</p>;
+            }}
+        </div>
+        <p class="text-xs text-dim">The console will show only the acts you choose. Pick none to decide later.</p>
+    </div>;
+}

@@ -1,0 +1,234 @@
+// driver: the db-seam layer for SQLite: SqliteConnection (impl db.Connection)
+// and SqliteDriver (impl db.Driver), built ON TOP of the low-level `sqlite` FFI
+// module. This is what makes kyte-sqlite a peer of kyte-postgres / kyte-mysql /
+// kyte-mssql / kyte-kaidb: application code holding a `db.Connection` trait
+// object runs unchanged against an embedded SQLite file.
+//
+//   import driver;
+//   let conn = driver.open(":memory:");                 // or a path, or a sqlite:// DSN
+//   let _  = conn.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", db.noParams());
+//   let rs = conn.query("SELECT id, name FROM t WHERE id = ?", List<DbValue>());
+//   let name = rs.row(0).getText(1);                     // typed, not a string
+//
+// SQLite is local and in-process, so the `async` seam methods do no real waiting:
+// they call blocking libsqlite3 functions and return. An `async fn` that never
+// `await`s is valid, and keeps this driver a drop-in for the async-shaped seam.
+//
+// Responsibilities are split (SRP):
+//   sqlite       raw FFI: Db, Stmt, open/prepare/step/bind/column, result codes
+//   typemap      DbValue <-> bind/column, type + error mapping
+//   connection   DSN parsing (path / :memory: / sqlite://path?mode=..)
+// This module only orchestrates the lifecycle and the query/exec loops.
+import list;
+import string;
+import db;
+import sqlite;
+import typemap;
+import connection;
+
+// The error returned when the SQL itself fails to prepare (a syntax error, an
+// unknown table/column). SQLite has no SQLSTATE, so the code is the numeric
+// result code as text; the kind is classified from it (usually DBERR_SYNTAX is
+// not distinguished by SQLite, so it falls to DBERR_UNKNOWN unless it is a
+// constraint). The message is SQLite's own.
+fn prepareError(dbh: sqlite.Db): DbError { return typemap.errorFrom(dbh); }
+
+/// A live, in-process SQLite connection implementing the db.Connection seam.
+///
+/// It owns one `sqlite.Db` handle and a table of prepared `sqlite.Stmt`s keyed by
+/// the small integer id that `prepare` hands back. The underlying handle is a
+/// single request channel, exactly like the networked drivers, so it is meant for
+/// one logical caller at a time (use a pool for concurrency).
+pub struct SqliteConnection impl Connection {
+    pub dbh: sqlite.Db,
+    pub prepared: List<sqlite.Stmt>,
+    pub lastId: long,          // last_insert_rowid from the most recent exec
+    init(dbh: sqlite.Db) {
+        self.dbh = dbh;
+        self.prepared = List<sqlite.Stmt>();
+        self.lastId = 0;
+    }
+
+    // --- one-shot query / exec (prepare, bind, run, finalise) -----------------
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        let pr = self.dbh.prepareRc(sql);
+        if (pr.rc != sqlite.SQLITE_OK) { return db.errorResult(prepareError(self.dbh)); }
+        typemap.bindAll(pr.stmt, params);
+        let rs = self.runQuery(pr.stmt);
+        pr.stmt.finalize();
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        let pr = self.dbh.prepareRc(sql);
+        if (pr.rc != sqlite.SQLITE_OK) { return db.errorExec(prepareError(self.dbh)); }
+        typemap.bindAll(pr.stmt, params);
+        let xr = self.runExec(pr.stmt);
+        pr.stmt.finalize();
+        return xr;
+    }
+
+    // Drains a stepped statement into a fully-decoded ResultSet: column schema
+    // (names, plus a logical type sniffed from the first row's storage class, or
+    // the declared type when there are no rows) and one typed Row per result row.
+    // A non-ROW/non-DONE step code is a failure and lands in `rs.err`.
+    fn runQuery(self: SqliteConnection, stmt: sqlite.Stmt): ResultSet {
+        let rs = ResultSet();
+        let nc = stmt.columnCount();
+        let names = List<string>();
+        let decls = List<string>();
+        let i = 0;
+        while (i < nc) { names.push(stmt.columnName(i)); decls.push(stmt.columnDecltype(i)); i = i + 1; }
+
+        let colTypes = List<DbType>();
+        let typesSet = false;
+        while (true) {
+            let rc = stmt.stepRc();
+            if (rc == sqlite.SQLITE_ROW) {
+                if (!typesSet) {
+                    let c = 0;
+                    while (c < nc) { colTypes.push(typemap.dbTypeFromColumnType(stmt.columnType(c))); c = c + 1; }
+                    typesSet = true;
+                }
+                let row = Row();
+                let c2 = 0;
+                while (c2 < nc) { row.cells.push(typemap.cellFromColumn(stmt, c2)); c2 = c2 + 1; }
+                rs.rows.push(row);
+            } else if (rc == sqlite.SQLITE_DONE) {
+                break;
+            } else {
+                rs.err = typemap.errorFrom(self.dbh);
+                break;
+            }
+        }
+        if (!typesSet) {
+            let c = 0;
+            while (c < nc) { colTypes.push(typemap.dbTypeFromDecl(decls.get(c) ?? "")); c = c + 1; }
+        }
+        let c3 = 0;
+        while (c3 < nc) { rs.columns.push(Column(names.get(c3) ?? "", colTypes.get(c3) ?? DbType.Text)); c3 = c3 + 1; }
+        rs.tag = `SELECT ${rs.rows.size()}`;
+        rs.rows_affected = rs.rows.size() as long;
+        return rs;
+    }
+
+    // Runs a non-query statement to completion. rowsAffected is sqlite3_changes;
+    // the last insert rowid is stashed on the connection for `lastInsertRowid`.
+    fn runExec(self: SqliteConnection, stmt: sqlite.Stmt): ExecResult {
+        while (true) {
+            let rc = stmt.stepRc();
+            if (rc == sqlite.SQLITE_ROW) { continue; }
+            if (rc == sqlite.SQLITE_DONE) { break; }
+            return db.errorExec(typemap.errorFrom(self.dbh));
+        }
+        self.lastId = self.dbh.lastInsertRowid();
+        let n = self.dbh.changes() as long;
+        return ExecResult(n, `OK ${n}`);
+    }
+
+    pub async fn queryWire(self, sql: string, params: List<DbValue>): WireRows {
+        // Materialised path: SQLite is local, so decode a ResultSet and re-encode
+        // it into the canonical WireRows layout. A zero-copy override could come
+        // later if a profile ever asks for it.
+        return db.wireRowsFromResultSet(await self.query(sql, params));
+    }
+
+    pub fn close(self): void {
+        // Finalise every cached prepared statement, then close the handle. SQLite
+        // will not fully release a file until all its statements are finalised.
+        let i = 0;
+        while (i < self.prepared.size()) {
+            let s = self.prepared.get(i) ?? sqlite.Stmt(0 as ptr, 0 as ptr);
+            s.finalize();
+            i = i + 1;
+        }
+        self.dbh.close();
+    }
+
+    pub fn setTimeout(self, ms: int): int {
+        // SQLite's per-statement busy timeout: how long a blocked statement waits
+        // for a lock before returning SQLITE_BUSY. Returns the value applied.
+        sqlite.setBusyTimeout(self.dbh, ms);
+        return ms;
+    }
+
+    // --- prepared statements (cached by int id) -------------------------------
+
+    pub async fn prepare(self, sql: string): int {
+        let pr = self.dbh.prepareRc(sql);
+        // Even a failed prepare is cached so the returned id stays stable; a later
+        // queryPrepared/execPrepared on a null handle simply yields a clean error.
+        self.prepared.push(pr.stmt);
+        return self.prepared.size() - 1;
+    }
+
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (stmt < 0 || stmt >= self.prepared.size()) {
+            return db.errorResult(db.DbError("", "no such prepared statement"));
+        }
+        let s = self.prepared.get(stmt) ?? sqlite.Stmt(0 as ptr, 0 as ptr);
+        s.resetStmt();
+        s.clearBindings();
+        typemap.bindAll(s, params);
+        return self.runQuery(s);   // a reused stmt is NOT finalised here
+    }
+
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.prepared.size()) {
+            return db.errorExec(db.DbError("", "no such prepared statement"));
+        }
+        let s = self.prepared.get(stmt) ?? sqlite.Stmt(0 as ptr, 0 as ptr);
+        s.resetStmt();
+        s.clearBindings();
+        typemap.bindAll(s, params);
+        return self.runExec(s);
+    }
+
+    // --- transactions ---------------------------------------------------------
+
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN", db.noParams()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT", db.noParams()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", db.noParams()); }
+
+    // --- SQLite-specific convenience (beyond the shared seam) -----------------
+
+    /// The rowid of the most recent successful INSERT run through this connection
+    /// (captured by `exec`/`execPrepared`). The shared ExecResult has no slot for
+    /// it, so it is surfaced here for callers holding the concrete type.
+    pub fn lastInsertRowid(self: SqliteConnection): long { return self.lastId; }
+    /// True when the underlying database opened successfully.
+    pub fn ok(self: SqliteConnection): bool { return self.dbh.ok; }
+}
+
+// Open a connection from an already-parsed DSN: open with the derived flags, then
+// (for a read-write db) set a 5 second busy timeout and enable WAL so concurrent
+// readers do not block a writer. A `cache=shared` request is applied as a PRAGMA
+// hint where it can be. Read-only databases are left untouched (no WAL switch).
+fn openDsn(d: connection.SqliteDsn): SqliteConnection {
+    let dbh = sqlite.openWithFlags(d.path, d.flags);
+    if (dbh.ok) {
+        let readonly = (d.flags % 2) == sqlite.SQLITE_OPEN_READONLY;   // READONLY is the low bit
+        if (!readonly) {
+            sqlite.setBusyTimeout(dbh, 5000);
+            if (!d.isMemory) { let _ = dbh.exec("PRAGMA journal_mode=WAL"); }
+        }
+    }
+    return SqliteConnection(dbh);
+}
+
+/// Opens a SQLite connection from a DSN: a plain path, `:memory:`, or a
+/// `sqlite://path?mode=ro|rw|rwc&cache=..&uri=1` URL. This is the convenience
+/// entry point; the returned value satisfies db.Connection.
+pub fn open(dsn: string): SqliteConnection {
+    return openDsn(connection.parse(dsn));
+}
+
+/// The SQLite driver implementing db.Driver. `connect` takes the same DSN forms
+/// as `open` and returns an erased db.Connection, so it slots into any code that
+/// selects a driver generically.
+pub struct SqliteDriver impl Driver {
+    pub async fn connect(self, dsn: string): Connection {
+        return openDsn(connection.parse(dsn));
+    }
+}

@@ -1,0 +1,57 @@
+// Row DTOs for the Admin feature (organisation/acts-catalogue/tenancy/scim),
+// field names matching acp-server's SELECT aliases over the shared `acp` db.
+@serializable pub struct CountryRow {
+    pub code: string,
+    pub name: string,
+    pub region: string,
+}
+
+@serializable pub struct ActApplRow {
+    pub act_slug: string,
+    pub applicability: string,
+}
+
+@serializable pub struct ChecklistRow {
+    pub item_id: string,
+    pub control_id: string,
+    pub ordinal: int,
+    pub title: string,
+    pub description: string,
+    pub required_evidence: string,
+    pub reference: string,
+    pub obligation_type: string,
+    pub roles_json: string,
+    pub applicability: string,
+    pub assessment_method: string,
+    pub citation: string,
+}
+
+@serializable pub struct OrgRow {
+    pub tenant_id: string,
+    pub org_name: string,
+    pub onboarded: int,
+}
+
+@serializable pub struct TenantIdRow {
+    pub tenant_id: string,
+}
+
+@serializable pub struct TenantSettingsRow {
+    pub onboarded: int,
+    pub jurisdiction: string,
+    pub enabled_acts: string,
+    pub org_name: string,
+    pub address_line1: string,
+    pub address_line2: string,
+    pub city: string,
+    pub postcode: string,
+    pub country: string,
+    pub contact_name: string,
+    pub contact_email: string,
+    pub contact_phone: string,
+    pub profile_json: string,
+}
+
+@serializable pub struct AdminProbeRow {
+    pub one: int,
+}

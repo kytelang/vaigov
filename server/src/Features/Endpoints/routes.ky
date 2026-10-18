@@ -1,0 +1,24 @@
+// Governed AI-endpoint registry routes (acp-compatible JSON over the shared `acp` db).
+// Only registration lives here; each handler is in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Endpoints.Shared.EndpointRepository;
+import Features.Endpoints.ListEndpoints.handler;
+import Features.Endpoints.CreateEndpoint.handler;
+import Features.Endpoints.UpdateEndpoint.handler;
+import Features.Endpoints.DeleteEndpoint.handler;
+import Features.Endpoints.EndpointsView.handler;
+import Features.Endpoints.EndpointsConsole.handler;
+
+pub fn registerEndpoints(ctx: AppContext): void {
+    let repo = EndpointRepository(ctx.db);
+    ctx.app.get("/ai-endpoints/view", EndpointsViewHandler(repo, ctx));
+    // First-party console forms (trusted; no bearer). Mutate + return refreshed fragment.
+    ctx.app.post("/console/endpoints/save", EndpointsSaveHandler(repo, ctx));
+    ctx.app.post("/console/endpoints/delete", EndpointsDeleteHandler(repo, ctx));
+    ctx.app.post("/console/endpoints/toggle", EndpointsToggleHandler(repo, ctx));
+    ctx.app.get("/ai-endpoints", ListEndpointsHandler(repo, ctx));
+    ctx.app.post("/ai-endpoints", CreateEndpointHandler(repo, ctx));
+    ctx.app.post("/ai-endpoints/{id}", UpdateEndpointHandler(repo, ctx));
+    ctx.app.post("/ai-endpoints/{id}/delete", DeleteEndpointHandler(repo, ctx));
+}

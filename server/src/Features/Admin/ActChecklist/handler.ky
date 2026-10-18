@@ -1,0 +1,32 @@
+// GET /acts/{id}/checklist -> {"act_id":id,"items":[{...,roles}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+import Features.Admin.Shared.adminjson;
+
+pub struct ActChecklistHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ActChecklistHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let rows = await self.repo.checklist(id);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(adminChecklistJson(rows.items.getOr(i, ChecklistRow{ item_id: "", control_id: "", ordinal: 0, title: "", description: "", required_evidence: "", reference: "", obligation_type: "", roles_json: "[]", applicability: "", assessment_method: "", citation: "" })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("act_id", json.str(id));
+        m.set("items", json.array(arr));
+        return Http.okObj(m);
+    }
+}

@@ -1,0 +1,90 @@
+// Integration view as KYX: how to connect a stock OPA sidecar at the customer's
+// firewall to this control plane. Mirrors the Vue IntegrationView.vue (stat tiles,
+// endpoints, OPA config YAML, run command, request/decision contract). Themed
+// classes; no literal braces inside attribute values.
+
+pub fn integrationStat(label: string, value: string, tone: string): Html {
+    return <div class="bg-panel border border-line rounded-xl px-4 py-3">
+        <div class="text-[10px] uppercase tracking-wide text-muted">{label}</div>
+        <div class={`text-lg font-semibold mt-1 ${tone}`}>{value}</div>
+    </div>;
+}
+
+pub fn integrationPanel(tenant: string, ruleCount: string, revision: string, bundlePath: string, decisionLogPath: string, yaml: string, tokenStatus: string): Html {
+    return <div id="integration" class="grid gap-4">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {integrationStat("Tenant", tenant, "text-txt")}
+            {integrationStat("Compiled rules", ruleCount, "text-accent")}
+            {integrationStat("Bundle revision", revision, "text-txt")}
+            {integrationStat("Report token", tokenStatus, "text-warn")}
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Endpoints</h2>
+                <p class="text-xs text-dim">What OPA talks to on this control plane</p>
+            </div>
+            <div class="px-5 py-4 grid gap-2 text-sm">
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">bundle (out)</span>
+                    <code class="font-mono text-xs text-txt">{bundlePath}</code>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">decision logs (in)</span>
+                    <code class="font-mono text-xs text-txt">{decisionLogPath}</code>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">OPA configuration</h2>
+                <p class="text-xs text-dim">Drop this in as opa-config.yaml; set CONTROL_PLANE_URL (and the token, if required)</p>
+            </div>
+            <div class="px-5 py-4">
+                <pre class="text-xs overflow-x-auto whitespace-pre bg-panel2 border border-line rounded-md p-3 text-txt">{yaml}</pre>
+            </div>
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Run the sidecar</h2>
+                <p class="text-xs text-dim">A stock OPA image; no custom build</p>
+            </div>
+            <div class="px-5 py-4">
+                <pre class="text-xs overflow-x-auto whitespace-pre bg-panel2 border border-line rounded-md p-3 text-txt">docker run -d --name varman-opa -p 8181:8181 \
+  -v {"$PWD"}/opa-config.yaml:/config.yaml \
+  openpolicyagent/opa:latest run --server --config-file=/config.yaml</pre>
+                <p class="text-xs text-dim mt-2">Your firewall asks OPA for a decision at POST /v1/data/acp/decision with the request as input, and enforces the returned verdict (deny blocks, step_up challenges, allow passes). OPA polls the bundle above and pushes every decision back to the decision-log endpoint, which feeds the Decisions and Coverage screens.</p>
+            </div>
+        </div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Request &amp; decision contract</h2>
+                <p class="text-xs text-dim">what the firewall sends, and what it gets back</p>
+            </div>
+            <div class="px-5 py-4 grid sm:grid-cols-2 gap-4 text-sm">
+                <div>
+                    <div class="text-[10px] text-muted uppercase tracking-wide mb-1">input the firewall provides</div>
+                    <ul class="text-xs text-dim grid gap-0.5 font-mono">
+                        <li>subject.id / .kind / .groups[] / .roles[] / .department</li>
+                        <li>resource.id / .type / .classification / .region</li>
+                        <li>operation</li>
+                        <li>args.* (tool-specific)</li>
+                        <li>context.time_hour / .cost_usd / .tokens / .env</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-[10px] text-muted uppercase tracking-wide mb-1">decision it gets back</div>
+                    <ul class="text-xs text-dim grid gap-0.5">
+                        <li><code class="font-mono">verdict</code>: allow / deny / step_up</li>
+                        <li><code class="font-mono">controls[]</code>: the controls this decision maps to</li>
+                        <li><code class="font-mono">obligations[]</code>: disclose / redact / rate_limit</li>
+                        <li><code class="font-mono">approver_group</code>: where a step_up is routed</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>;
+}

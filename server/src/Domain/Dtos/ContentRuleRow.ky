@@ -1,0 +1,16 @@
+// One content-firewall rule row (shared `acp` db `content_rules` table). Authored
+// centrally, pulled+signed to the edge sidecar. `enabled` is an INTEGER (0/1);
+// `controls_json` is a stored JSON array string of mapped control ids.
+@serializable
+pub struct ContentRuleRow {
+    pub id: string,
+    pub name: string,
+    pub kind: string,
+    pub pattern: string,
+    pub threshold: int,
+    pub target: string,
+    pub action: string,
+    pub severity: string,
+    pub controls_json: string,
+    pub enabled: int,
+}

@@ -1,0 +1,16 @@
+// Health/readiness/liveness feature route table. Only registration lives here;
+// each handler is in its own <UseCase>/handler.ky.
+import web.app;
+import Shared.AppContext;
+import Features.Health.Healthz.handler;
+import Features.Health.Readyz.handler;
+import Features.Health.Metrics.handler;
+import Features.Health.Leader.handler;
+
+pub fn registerHealth(ctx: AppContext): void {
+    ctx.app.get("/healthz", HealthzHandler(ctx));
+    ctx.app.get("/liveness", HealthzHandler(ctx));
+    ctx.app.get("/readyz", ReadyzHandler(ctx));
+    ctx.app.get("/metrics", MetricsHandler(ctx));
+    ctx.app.get("/leader", LeaderHandler(ctx));
+}

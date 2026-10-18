@@ -1,0 +1,131 @@
+//! SHA-256 hashing primitives for the Varman trust core.
+//!
+//! This is a faithful port of the hashing boundary of Rust `acp-core`'s
+//! `merkle.rs`. The RFC 6962 Merkle tree domain separation lives here: leaves
+//! are hashed with a `0x00` prefix and internal nodes with a `0x01` prefix.
+//!
+//! Representation decision: a 32-byte hash is carried everywhere above this
+//! module as a 64-character lowercase hex `string`. That keeps hashes safe to
+//! store in a `List<string>`, compare with `string.eql`, and pass around with
+//! no manual memory management. Raw bytes exist only transiently, at the
+//! hashing boundary, and are converted back to hex before returning.
+
+import bytes;
+import crypto.hash.sha256;
+import collections.string_builder;
+
+/// Maps a single lowercase/uppercase hex digit to its 0..15 numeric value.
+///
+/// Accepts `0-9`, `a-f`, and `A-F`. Any other byte decodes as 0; callers are
+/// expected to pass well-formed hex (the hashes produced here always are).
+fn nib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+/// Maps a 0..15 nibble to its lowercase hex ASCII byte (`0-9`, then `a-f`).
+fn hexChar(v: int): int {
+    if (v < 10) { return 48 + v; }
+    return 87 + v;
+}
+
+/// Encodes `n` bytes at `buf` as a `2 * n`-character lowercase hex string.
+///
+/// This is the general helper behind [`hexEncode`]; `sign.ky` reuses it for
+/// 32-byte public keys and 64-byte signatures. The input buffer is not freed.
+pub fn hexEncodeN(buf: ptr, n: int): string {
+    let sb = string_builder.StringBuilder();
+    let i = 0;
+    while (i < n) {
+        let b = bytes.read_byte(buf, i);
+        sb.appendChar(hexChar((b >> 4) & 0xf));
+        sb.appendChar(hexChar(b & 0xf));
+        i = i + 1;
+    }
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}
+
+/// Encodes a 32-byte hash buffer as a 64-character lowercase hex string.
+pub fn hexEncode(ptr32: ptr): string {
+    return hexEncodeN(ptr32, 32);
+}
+
+/// Decodes a hex string into a freshly allocated byte buffer of `hex.length / 2`
+/// bytes. The CALLER owns the returned pointer and must `bytes.free` it.
+///
+/// A zero-length input still returns a valid 1-byte allocation so the pointer is
+/// never null; only `hex.length / 2` bytes are meaningful.
+pub fn hexDecode(hex: string): ptr {
+    let n = hex.length / 2;
+    let buf = bytes.alloc(if (n == 0) (1) else (n));
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(buf, i, nib(hex[i * 2]) * 16 + nib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return buf;
+}
+
+/// Plain SHA-256 of `len` bytes at `data`, returned as 64-char lowercase hex.
+pub fn sha256HexOf(data: ptr, len: int): string {
+    let out = bytes.alloc(32);
+    sha256.hashInto(data, len, out);
+    let h = hexEncode(out);
+    bytes.free(out);
+    return h;
+}
+
+/// RFC 6962 leaf hash: `SHA-256(0x00 || data)`, returned as hex.
+///
+/// The `0x00` domain-separation prefix is what distinguishes a leaf from an
+/// internal node, so a leaf hash can never be confused with (or forged from) a
+/// node hash. Matches `merkle::leaf_hash`.
+pub fn leafHashHex(data: ptr, len: int): string {
+    let s = sha256.Sha256.create();
+    let pfx = bytes.alloc(1);
+    bytes.write_byte(pfx, 0, 0);
+    s.update(pfx, 1);
+    if (len > 0) { s.update(data, len); }
+    let out = bytes.alloc(32);
+    s.final(out);
+    s.delete();
+    let h = hexEncode(out);
+    bytes.free(pfx);
+    bytes.free(out);
+    return h;
+}
+
+/// RFC 6962 internal node hash: `SHA-256(0x01 || lBytes || rBytes)`, returned as
+/// hex. `lHex` and `rHex` are 64-char hex child hashes. Matches `merkle::node_hash`.
+pub fn nodeHashHex(lHex: string, rHex: string): string {
+    let l = hexDecode(lHex);
+    let r = hexDecode(rHex);
+    let s = sha256.Sha256.create();
+    let pfx = bytes.alloc(1);
+    bytes.write_byte(pfx, 0, 1);
+    s.update(pfx, 1);
+    s.update(l, 32);
+    s.update(r, 32);
+    let out = bytes.alloc(32);
+    s.final(out);
+    s.delete();
+    let h = hexEncode(out);
+    bytes.free(pfx);
+    bytes.free(l);
+    bytes.free(r);
+    bytes.free(out);
+    return h;
+}
+
+/// RFC 6962 Merkle Tree Hash of the empty tree: `SHA-256("")`, returned as hex.
+/// This is `root_of(&[])` in the Rust source.
+pub fn emptyRootHex(): string {
+    let dummy = bytes.alloc(1);
+    let h = sha256HexOf(dummy, 0);
+    bytes.free(dummy);
+    return h;
+}

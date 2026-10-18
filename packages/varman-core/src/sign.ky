@@ -1,0 +1,113 @@
+//! Ed25519 signing seam for the signed tree head (STH).
+//!
+//! A port of the signing seam of Rust `acp-core`'s `sign.rs`, restricted to the
+//! real Ed25519 backend (decision D3). The abstract `Signer` trait, the
+//! `NoopSigner` placeholder, and the serde/`SignedTreeHead` canonical-bytes
+//! plumbing are intentionally NOT ported here: that `SignedTreeHead` structure
+//! and its JCS canonical bytes belong with `types.ky`/`canonical.ky` in a later
+//! slice. What lives here is exactly the cryptographic core the Rust
+//! `Ed25519Signer` / `verify_ed25519` provide, as a thin wrapper over Kyte's
+//! stdlib `crypto.ecc.ed25519`. No crypto is reimplemented.
+//!
+//! Keys and signatures cross this seam as hex strings, matching the rest of the
+//! trust core and the Rust `hex_hash` encoding:
+//!   - seed:      32 bytes  -> 64 hex chars
+//!   - public key:32 bytes  -> 64 hex chars
+//!   - private:   64 bytes (seed || pub) -> 128 hex chars (Go's PrivateKey.Bytes)
+//!   - signature: 64 bytes  -> 128 hex chars
+
+import bytes;
+import crypto.ecc.ed25519;
+import serde.json;
+import hashing;
+import types;
+import canonical;
+
+/// A derived Ed25519 key pair in hex form. `privHex` is the 64-byte
+/// seed-concatenated-with-public-key private key (128 hex chars), matching the
+/// stdlib `seedToKeypair` output and Go's `PrivateKey.Bytes`.
+pub struct KeyPair {
+    /// 32-byte public key as 64 hex chars.
+    pub pubHex: string,
+    /// 64-byte private key (seed || pub) as 128 hex chars.
+    pub privHex: string,
+
+    init(publicHex: string, privateHex: string) {
+        self.pubHex = publicHex;
+        self.privHex = privateHex;
+    }
+}
+
+/// Derives the Ed25519 key pair from a 32-byte seed given as 64 hex chars.
+/// Thin wrapper over `ed25519.seedToKeypair`.
+pub fn keypairFromSeedHex(seedHex64: string): KeyPair {
+    let seed = hashing.hexDecode(seedHex64);
+    let pk = bytes.alloc(32);
+    let sk = bytes.alloc(64);
+    ed25519.seedToKeypair(seed, pk, sk);
+    let pubHex = hashing.hexEncodeN(pk, 32);
+    let privHex = hashing.hexEncodeN(sk, 64);
+    bytes.free(seed);
+    bytes.free(pk);
+    bytes.free(sk);
+    return KeyPair(pubHex, privHex);
+}
+
+/// Signs `msgLen` bytes at `msg` with the 64-byte private key (`privHex`,
+/// 128 hex chars). Returns the 64-byte signature as 128 hex chars.
+/// Deterministic per RFC 8032. Thin wrapper over `ed25519.sign`.
+pub fn signHex(privHex: string, msg: ptr, msgLen: int): string {
+    let sk = hashing.hexDecode(privHex);
+    let sig = bytes.alloc(64);
+    ed25519.sign(sk, msg, msgLen, sig);
+    let sigHex = hashing.hexEncodeN(sig, 64);
+    bytes.free(sk);
+    bytes.free(sig);
+    return sigHex;
+}
+
+/// Verifies the 64-byte signature (`sigHex`, 128 hex chars) over `msgLen` bytes
+/// at `msg` under the 32-byte public key (`pubHex`, 64 hex chars). Thin wrapper
+/// over `ed25519.verify`; matches `sign::verify_ed25519`.
+pub fn verifyHex(pubHex: string, msg: ptr, msgLen: int, sigHex: string): bool {
+    let pk = hashing.hexDecode(pubHex);
+    let sig = hashing.hexDecode(sigHex);
+    let ok = ed25519.verify(pk, msg, msgLen, sig);
+    bytes.free(pk);
+    bytes.free(sig);
+    return ok;
+}
+
+// --- signed tree head seam (port of sign.rs sth_bytes/sign_sth/verify_sth) --
+
+/// Signs a tree head: the Ed25519 signature over its canonical STH bytes
+/// (`core.canonical.sthBytes`). `privHex` is the 128-hex-char private key.
+/// Returns the 128-hex-char signature. Matches `sign::sign_sth`.
+pub fn signSth(privHex: string, sth: types.SignedTreeHead): string {
+    let msg = canonical.sthBytes(sth);
+    return signHex(privHex, msg as ptr, msg.length);
+}
+
+/// Verifies a tree head signature under `pubHex` (64 hex chars). Recomputes the
+/// canonical STH bytes and checks the Ed25519 signature over them, so any change
+/// to `treeSize`, `rootHashHex`, or `timestampMs` fails. Matches `sign::verify_sth`.
+pub fn verifySth(pubHex: string, sth: types.SignedTreeHead, sigHex: string): bool {
+    let msg = canonical.sthBytes(sth);
+    return verifyHex(pubHex, msg as ptr, msg.length, sigHex);
+}
+
+/// Verifies a detached-signature pack `{body, pubkey_hex, sig_hex}`: an Ed25519
+/// signature over the canonical bytes of `body`, checkable with the embedded
+/// public key alone. This is the offline check behind the signed audit and
+/// compliance packs. Matches `sign::verify_detached_pack`, returning `false`
+/// (rather than a `Result<(), String>`) for any missing field or bad signature.
+pub fn verifyDetachedPack(pack: json.JsonValue): bool {
+    if (!json.has(pack, "body")) { return false; }
+    let body = json.get(pack, "body");
+    let pkHex = json.asString(json.get(pack, "pubkey_hex"));
+    if (pkHex == undefined) { return false; }
+    let sigHex = json.asString(json.get(pack, "sig_hex"));
+    if (sigHex == undefined) { return false; }
+    let msg = canonical.canonicalBytesOfJson(body);
+    return verifyHex(pkHex, msg as ptr, msg.length, sigHex);
+}

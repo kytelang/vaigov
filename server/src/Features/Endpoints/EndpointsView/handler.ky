@@ -1,0 +1,22 @@
+// GET /ai-endpoints/view -> the governed AI endpoints hypermedia view (Datastar
+// fragment), matching acp/console EndpointsView.vue. Reads the tenant's endpoint
+// registry from the shared EndpointRepository and renders it.
+import ds_response;
+import web.routing;
+import web.response;
+import Shared.AppContext;
+import Features.Endpoints.Shared.EndpointRepository;
+import Features.Endpoints.views.endpoints;
+import Domain.Dtos.EndpointRow;
+
+pub struct EndpointsViewHandler impl RouteHandler {
+    repo: EndpointRepository,
+    app: AppContext,
+    init(repo: EndpointRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: EndpointsViewHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rs = await self.repo.list(tenant);
+        return await ds_response.patch(endpoints.endpointsPanel(rs.items));
+    }
+}

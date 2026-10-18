@@ -1,0 +1,77 @@
+// GET /systems/{id}/soa/{framework} -> {"system_id","framework","entries":[...]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import conformance;
+import controls;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+import Domain.Dtos.SystemDtos;
+
+pub struct SoaGetHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: SoaGetHandler, ctx: routing.Context): response.Response {
+        let id = ctx.param("id");
+        let framework = ctx.param("framework");
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let srows = await self.repo.getSystem(id, tenant);
+        if (srows.items.size() == 0) {
+            let e = Map<string, json.JsonValue>(1, string.hash); e.set("error", json.str("system not found")); return Http.okObj(e);
+        }
+        let sys = srows.items.getOr(0, SystemRow{ id:"", name:"", purpose:"", owner:"", lifecycle_state:"", risk_tier:"", sector:"", asset_type:"", jurisdictions:"[]", tenant:"", created_ms:0, updated_ms:0 });
+        let roleRows = await self.repo.listRoles(id, tenant);
+        let roles = list.List<SystemRoleRow>();
+        let ri = 0;
+        while (ri < roleRows.items.size()) { roles.push(roleRows.items.getOr(ri, SystemRoleRow{ id:"", system_id:"", role:"", jurisdiction:"", market_date:"", created_ms:0 })); ri = ri + 1; }
+        let profile = systemhelp.systemProfile(sys, roles);
+        let soaRows = await self.repo.listSoa(id, framework, tenant);
+        let soa = list.List<SoaStoredRow>();
+        let si = 0;
+        while (si < soaRows.items.size()) { soa.push(soaRows.items.getOr(si, SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 })); si = si + 1; }
+        let lib = controls.forFramework(framework);
+        let entries = list.List<json.JsonValue>();
+        let ci = 0;
+        while (ci < lib.size()) {
+            let c = lib.at(ci);
+            let ar = conformance.applies(c, profile);
+            let stored = findSoa(soa, c.id);
+            let m = Map<string, json.JsonValue>(8, string.hash);
+            m.set("control_id", json.str(c.id));
+            m.set("reference", json.str(c.reference));
+            m.set("title", json.str(c.title));
+            if (stored == undefined) {
+                m.set("applicable", json.bool(ar.ok));
+                m.set("justification", json.str(if (ar.ok) ("") else (ar.reason)));
+                m.set("status", json.str("planned"));
+                m.set("stored", json.bool(false));
+            } else {
+                let e = stored ?? SoaStoredRow{ framework:"", control_id:"", applicable:0, justification:"", status:"", updated_ms:0 };
+                m.set("applicable", json.bool(e.applicable != 0));
+                m.set("justification", json.str(e.justification));
+                m.set("status", json.str(e.status));
+                m.set("stored", json.bool(true));
+            }
+            entries.push(json.object(m));
+            ci = ci + 1;
+        }
+        let out = Map<string, json.JsonValue>(4, string.hash);
+        out.set("system_id", json.str(id));
+        out.set("framework", json.str(framework));
+        out.set("entries", json.array(entries));
+        return Http.okObj(out);
+    }
+}
+
+fn findSoa(soa: list.List<SoaStoredRow>, cid: string): SoaStoredRow | undefined {
+    let i = 0;
+    while (i < soa.size()) { if (string.eql(soa.at(i).control_id, cid)) { return soa.at(i); } i = i + 1; }
+    return undefined;
+}

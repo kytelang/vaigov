@@ -1,0 +1,60 @@
+// POST /policy-packs/{slug}/upgrade -> move an installed pack to the shipped
+// version. NOTE (flagged): this uses REINSTALL semantics (disable old pack rules,
+// reinstantiate at the new version using the tenant's stored parameters). acp's
+// richer per-template diff that PRESERVES tenant-customised rules is a follow-up
+// (needs the pack_customised provenance flag honoured per rule).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+import Features.PolicyPacks.Shared.packinstall;
+import Domain.Dtos.PackRows;
+
+pub struct UpgradeHandler impl RouteHandler {
+    repo: PackRepository,
+    app: AppContext,
+    init(repo: PackRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: UpgradeHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditPolicy)) { return Http.forbidden(); }
+        let slug = ctx.param("slug");
+        let pack = packdata.findPack(slug);
+        if (pack == undefined) { return Http.jsonResp("{\"ok\":false,\"error\":\"unknown pack\"}"); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+
+        // Must already be installed (active); reuse the stored parameter values.
+        let installed = await self.repo.listInstalled(tenant);
+        let stored = Map<string, json.JsonValue>(8, string.hash);
+        let found = false;
+        let i = 0;
+        while (i < installed.items.size()) {
+            let row = installed.items.getOr(i, InstalledPackRow{ slug: "", version: 0, params_json: "{}", status: "", installed_ms: 0 });
+            if (string.eql(row.slug, slug) && string.eql(row.status, "active")) {
+                found = true;
+                let pv = json.tryParse(row.params_json);
+                if (pv != undefined) { stored = json.asObject(pv ?? json.null()) ?? stored; }
+            }
+            i = i + 1;
+        }
+        if (!found) { return Http.jsonResp("{\"ok\":false,\"error\":\"pack is not installed\"}"); }
+
+        let res = await packinstall.installPack(self.repo, pack ?? json.null(), stored, tenant, Http.nowMs());
+        // Reshape to the upgrade response contract.
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("ok", json.get(res, "ok"));
+        m.set("slug", json.str(slug));
+        m.set("version", json.get(res, "version"));
+        m.set("updated", json.array(list.List<json.JsonValue>()));
+        m.set("added", json.get(res, "rules_created"));
+        m.set("preserved", json.array(list.List<json.JsonValue>()));
+        m.set("disabled", json.array(list.List<json.JsonValue>()));
+        return Http.okObj(m);
+    }
+}

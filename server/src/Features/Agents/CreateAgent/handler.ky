@@ -1,0 +1,43 @@
+// POST /agents {app_id, name, owner?, metadata?} -> {"ok":true,"id","token","note"}.
+// Mirrors acp-server agent_register: referential check, one-time token hashed at rest.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import canonical;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Agents.Shared.AgentRepository;
+import Features.Apps.CreateApp.handler;
+
+pub struct CreateAgentHandler impl RouteHandler {
+    repo: AgentRepository,
+    app: AppContext,
+    init(repo: AgentRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateAgentHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterAgent)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let appId = string.trim(bodyStr(body, "app_id"));
+        let name = string.trim(bodyStr(body, "name"));
+        if (appId.length == 0 || name.length == 0) { return okFalse("app_id and name are required"); }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let ok = await self.repo.appExists(appId, tenant);
+        if (!ok) { return okFalse(string.concat(string.concat("unknown app_id '", appId), "'")); }
+        let owner = bodyStr(body, "owner");
+        let metadata = bodyMeta(body);
+        let id = string.concat("agt-", random.randomHex(6));
+        let token = random.randomHex(24);
+        let tokenSha = canonical.sha256HexOfString(token);
+        await self.repo.add(id, appId, name, tokenSha, owner, metadata, tenant, Http.nowMs());
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("id", json.str(id));
+        m.set("token", json.str(token));
+        m.set("note", json.str("store this token now; it is not shown again"));
+        return Http.okObj(m);
+    }
+}

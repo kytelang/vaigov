@@ -1,0 +1,205 @@
+//! The sidecar operator console (design-refinements R2).
+//!
+//! A small, dependency-free web console served by the sidecar itself. It shows
+//! the violations this edge has captured (with the prompt that violated and the
+//! policy it matched), each record's signature-verified state, and what the edge
+//! is currently enforcing (policy revision, governed endpoints, installed packs).
+//!
+//! It is deliberately dependency-free: the page is a single self-contained HTML
+//! document with vanilla `fetch`, so the edge agent pulls in no Datastar/JS
+//! framework. The handlers return JSON that the page renders. This surface is
+//! operator-facing and must be bound to loopback / the operator network, never
+//! the data-plane proxy port.
+
+import state;
+import violation;
+import envoy;
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import list;
+
+fn jsonResp(bodyStr: string): response.Response {
+    let r = response.Response(Status.Ok, bodyStr);
+    r.headers.set("Content-Type", "application/json");
+    return r;
+}
+
+/// A JSON object for one violation record, including its verified state.
+fn recordJson(v: violation.Violation, verified: bool): string {
+    let ver = if (verified) "true" else "false";
+    return "{" +
+        "\"id\":" + `${v.id}` +
+        ",\"captured_ms\":" + `${v.capturedMs}` +
+        ",\"tenant\":\"" + state.jsonEscape(v.tenant) + "\"" +
+        ",\"endpoint_host\":\"" + state.jsonEscape(v.endpointHost) + "\"" +
+        ",\"endpoint_port\":" + `${v.endpointPort}` +
+        ",\"principal\":\"" + state.jsonEscape(v.principal) + "\"" +
+        ",\"prompt\":\"" + state.jsonEscape(v.prompt) + "\"" +
+        ",\"prompt_sha\":\"" + state.jsonEscape(v.promptSha) + "\"" +
+        ",\"verdict\":\"" + state.jsonEscape(v.verdict) + "\"" +
+        ",\"policy_id\":\"" + state.jsonEscape(v.policyId) + "\"" +
+        ",\"policy_name\":\"" + state.jsonEscape(v.policyName) + "\"" +
+        ",\"rule_rego_path\":\"" + state.jsonEscape(v.ruleRegoPath) + "\"" +
+        ",\"decision_id\":\"" + state.jsonEscape(v.decisionId) + "\"" +
+        ",\"ticket_number\":\"" + state.jsonEscape(v.ticketNumber) + "\"" +
+        ",\"ticket_status\":\"" + state.jsonEscape(v.ticketStatus) + "\"" +
+        ",\"flush_state\":\"" + state.jsonEscape(v.flushState) + "\"" +
+        ",\"sig\":\"" + state.jsonEscape(v.sigHex) + "\"" +
+        ",\"verified\":" + ver +
+        "}";
+}
+
+/// GET /console/violations.json?verdict=&host=&limit= -> recent records.
+pub struct ViolationsJsonHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: ViolationsJsonHandler, ctx: routing.Context): response.Response {
+        let verdict = ctx.query("verdict");
+        let host = ctx.query("host");
+        let limStr = ctx.query("limit");
+        let limit = if (string.eql(limStr, "")) 200 else (string.parseInt(limStr) ?? 200) as int;
+        let recs = self.st.vs.recent(limit, verdict, host);
+        let parts = list.List<string>();
+        let i = 0;
+        while (i < recs.size()) {
+            let rec = recs.get(i) ?? violation.Violation();
+            let ok = self.st.vs.verifyRecord(rec, self.st.pubHex);
+            parts.push(recordJson(rec, ok));
+            i = i + 1;
+        }
+        return jsonResp("{\"total\":" + `${self.st.vs.total()}` +
+            ",\"pending\":" + `${self.st.vs.pendingCount()}` +
+            ",\"violations\":[" + string.join(parts, ",") + "]}");
+    }
+}
+
+/// GET /console/violation/{id} -> one full record + its verified state.
+pub struct ViolationDetailHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: ViolationDetailHandler, ctx: routing.Context): response.Response {
+        // Parse the violation id as a long directly: the store key is a long, so
+        // parsing as int first (then widening) would truncate an id above 2^31.
+        let id = string.parseLong(ctx.param("id")) ?? 0;
+        let found = self.st.vs.byId(id);
+        if (found == undefined) {
+            let r = response.Response(Status.NotFound, "{\"error\":\"not found\"}");
+            r.headers.set("Content-Type", "application/json");
+            return r;
+        }
+        let rec = found ?? violation.Violation();
+        let ok = self.st.vs.verifyRecord(rec, self.st.pubHex);
+        return jsonResp(recordJson(rec, ok));
+    }
+}
+
+/// GET /console/policy.json -> what this edge is currently enforcing.
+pub struct PolicyJsonHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: PolicyJsonHandler, ctx: routing.Context): response.Response {
+        let eps = list.List<string>();
+        let i = 0;
+        while (i < self.st.endpoints.size()) {
+            let e = self.st.endpoints.get(i) ?? envoy.Endpoint("", 443, false);
+            let en = if (e.enabled) "true" else "false";
+            eps.push("{\"host\":\"" + state.jsonEscape(e.host) + "\",\"port\":" + `${e.port}` + ",\"enabled\":" + en + "}");
+            i = i + 1;
+        }
+        return jsonResp("{" +
+            "\"revision\":\"" + state.jsonEscape(self.st.revision) + "\"" +
+            ",\"have_policy\":" + (if (self.st.haveBundle) "true" else "false") +
+            ",\"cp_ok\":" + (if (self.st.cpOk) "true" else "false") +
+            ",\"last_sync_ms\":" + `${self.st.lastSyncMs}` +
+            ",\"endpoints\":[" + string.join(eps, ",") + "]" +
+            ",\"packs\":" + self.st.packsJson +
+            "}");
+    }
+}
+
+/// GET /console -> the self-contained console page.
+pub struct ConsoleHandler impl RouteHandler {
+    pub st: state.SidecarState,
+    init(st: state.SidecarState) { self.st = st; }
+
+    async fn serve(self: ConsoleHandler, ctx: routing.Context): response.Response {
+        let r = response.Response(Status.Ok, consoleHtml());
+        r.headers.set("Content-Type", "text/html; charset=utf-8");
+        return r;
+    }
+}
+
+/// The console page: one self-contained HTML document, vanilla JS, no external
+/// assets. Three tabs (Violations, Policy, Health) over the JSON endpoints.
+pub fn consoleHtml(): string {
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+"<title>Varman sidecar console</title><style>" +
+"*{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;color:#1a2233;background:#f6f8fb}" +
+"header{background:#0f1b33;color:#fff;padding:14px 20px;display:flex;align-items:center;gap:16px}" +
+"header h1{font-size:16px;margin:0;font-weight:600}nav{display:flex;gap:4px}" +
+"nav button{background:transparent;border:0;color:#aab6cc;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px}" +
+"nav button.on{background:#223a63;color:#fff}" +
+"main{padding:20px;max-width:1200px;margin:0 auto}" +
+".card{background:#fff;border:1px solid #e3e9f2;border-radius:10px;padding:16px;margin-bottom:16px}" +
+".filters{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}" +
+".filters input,.filters select{padding:7px 10px;border:1px solid #d3dbe8;border-radius:6px;font-size:13px}" +
+"table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #eef2f8;vertical-align:top}" +
+"th{color:#5a6b86;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}" +
+"td.prompt{max-width:380px;white-space:pre-wrap;word-break:break-word;color:#334}" +
+".pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}" +
+".deny{background:#fde8e8;color:#b42318}.step_up{background:#fef3d7;color:#92610a}.shadow{background:#e7eefc;color:#1d4ed8}.allow{background:#e6f6ec;color:#107a3d}" +
+".ok{color:#107a3d;font-weight:600}.bad{color:#b42318;font-weight:600}" +
+".muted{color:#7a8aa3}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}" +
+".stat{display:inline-block;margin-right:24px}.stat b{display:block;font-size:22px}" +
+"</style></head><body>" +
+"<header><h1>Varman sidecar</h1><nav>" +
+"<button id=\"t-v\" class=\"on\" onclick=\"show('v')\">Violations</button>" +
+"<button id=\"t-p\" onclick=\"show('p')\">Policy</button>" +
+"<button id=\"t-h\" onclick=\"show('h')\">Health</button>" +
+"</nav></header><main>" +
+"<section id=\"v\"><div class=\"card\"><div class=\"filters\">" +
+"<select id=\"fv\"><option value=\"\">all verdicts</option><option>deny</option><option>step_up</option><option>shadow</option></select>" +
+"<input id=\"fh\" placeholder=\"filter host\">" +
+"<button onclick=\"loadV()\">Refresh</button>" +
+"<span id=\"vstat\" class=\"muted\"></span></div>" +
+"<table><thead><tr><th>#</th><th>Time</th><th>Verdict</th><th>Endpoint</th><th>Principal</th><th>Policy</th><th class=\"prompt\">Prompt</th><th>Ticket</th><th>Signed</th></tr></thead>" +
+"<tbody id=\"vrows\"></tbody></table></div></section>" +
+"<section id=\"p\" style=\"display:none\"><div class=\"card\" id=\"pbody\">loading…</div></section>" +
+"<section id=\"h\" style=\"display:none\"><div class=\"card\" id=\"hbody\">loading…</div></section>" +
+"</main><script>" +
+"function esc(s){return (s==null?'':String(s)).replace(/[&<>\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c];});}" +
+"function ts(ms){if(!ms)return '';var d=new Date(Number(ms));return d.toISOString().replace('T',' ').slice(0,19);}" +
+"function show(x){['v','p','h'].forEach(function(k){document.getElementById(k).style.display=(k==x?'':'none');document.getElementById('t-'+k).className=(k==x?'on':'');});if(x=='v')loadV();if(x=='p')loadP();if(x=='h')loadH();}" +
+"function loadV(){var q='?verdict='+encodeURIComponent(document.getElementById('fv').value)+'&host='+encodeURIComponent(document.getElementById('fh').value);" +
+"fetch('/console/violations.json'+q).then(function(r){return r.json();}).then(function(d){" +
+"document.getElementById('vstat').textContent=d.total+' total, '+d.pending+' pending flush';" +
+"var tb=document.getElementById('vrows');tb.innerHTML='';" +
+"(d.violations||[]).forEach(function(v){var tr=document.createElement('tr');" +
+"var sig=v.verified?'<span class=\\'ok\\'>verified</span>':'<span class=\\'bad\\'>UNVERIFIED</span>';" +
+"var tk=v.ticket_number?esc(v.ticket_number)+' <span class=\\'muted\\'>'+esc(v.ticket_status)+'</span>':'<span class=\\'muted\\'>-</span>';" +
+"tr.innerHTML='<td>'+v.id+'</td><td class=\\'mono\\'>'+ts(v.captured_ms)+'</td>'+" +
+"'<td><span class=\\'pill '+esc(v.verdict)+'\\'>'+esc(v.verdict)+'</span></td>'+" +
+"'<td>'+esc(v.endpoint_host)+':'+v.endpoint_port+'</td><td>'+esc(v.principal)+'</td>'+" +
+"'<td>'+esc(v.policy_name||v.rule_rego_path)+'</td>'+" +
+"'<td class=\\'prompt\\'>'+esc(v.prompt)+'</td><td>'+tk+'</td><td>'+sig+'</td>';" +
+"tb.appendChild(tr);});" +
+"if(!(d.violations||[]).length)tb.innerHTML='<tr><td colspan=9 class=\\'muted\\'>No violations captured yet.</td></tr>';});}" +
+"function loadP(){fetch('/console/policy.json').then(function(r){return r.json();}).then(function(d){" +
+"var eps=(d.endpoints||[]).map(function(e){return '<li>'+esc(e.host)+':'+e.port+' '+(e.enabled?'<span class=\\'ok\\'>enabled</span>':'<span class=\\'muted\\'>disabled</span>')+'</li>';}).join('');" +
+"var packs=(d.packs||[]).map(function(p){return '<li>'+esc(p.slug||p.pack_slug||JSON.stringify(p))+'</li>';}).join('')||'<li class=\\'muted\\'>none</li>';" +
+"document.getElementById('pbody').innerHTML='<h3>Enforcing</h3><p>Policy revision <span class=\\'mono\\'>'+esc(d.revision||'(none)')+'</span>, control plane '+(d.cp_ok?'<span class=\\'ok\\'>reachable</span>':'<span class=\\'bad\\'>unreachable</span>')+', last sync <span class=\\'mono\\'>'+ts(d.last_sync_ms)+'</span></p>'+" +
+"'<h3>Governed endpoints (Envoy)</h3><ul>'+(eps||'<li class=\\'muted\\'>none</li>')+'</ul><h3>Installed policy packs</h3><ul>'+packs+'</ul>';});}" +
+"function loadH(){fetch('/healthz').then(function(r){return r.json();}).then(function(d){" +
+"document.getElementById('hbody').innerHTML='<div class=\\'stat\\'><b>'+d.total_violations+'</b>violations</div>'+" +
+"'<div class=\\'stat\\'><b>'+d.pending_violations+'</b>pending flush</div>'+" +
+"'<div class=\\'stat\\'><b>'+(d.cp_ok?'OK':'DOWN')+'</b>control plane</div>'+" +
+"'<p class=\\'muted\\' style=\\'margin-top:16px\\'>tenant <b>'+esc(d.tenant)+'</b> · revision <span class=\\'mono\\'>'+esc(d.revision||'(none)')+'</span></p>'+" +
+"'<p class=\\'muted\\'>signing key <span class=\\'mono\\'>'+esc(d.signing_pubkey)+'</span></p>'+(d.last_error?'<p class=\\'bad\\'>'+esc(d.last_error)+'</p>':'');});}" +
+"loadV();</script></body></html>";
+}

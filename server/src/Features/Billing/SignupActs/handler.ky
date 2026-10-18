@@ -1,0 +1,57 @@
+// GET /signup/acts?country=XX&all=0|1 -> the "Regulations to comply with"
+// checklist fragment for the chosen country (Datastar morph by id), matching the
+// acp RegisterView: statutory acts for the jurisdiction (pre-selected) plus the
+// international standards, or the whole catalogue when all=1. Labels/framework
+// types come from the varman-core controls catalogue.
+import ds_response;
+import web.routing;
+import web.response;
+import string;
+import list;
+import controls;
+import Shared.AppContext;
+import Features.Admin.Shared.AdminRepository;
+import Features.Billing.views.signupfrag;
+
+pub struct SignupActsHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(app: AppContext) { self.app = app; self.repo = AdminRepository(app.db); }
+
+    async fn serve(self: SignupActsHandler, ctx: routing.Context): response.Response {
+        let country = ctx.query("country");
+        let all = string.eql(ctx.query("all"), "1");
+        let fws = controls.frameworks();
+        let acts = list.List<signupfrag.SigAct>();
+        let region = "other";
+
+        if (all) {
+            region = "";
+            let i = 0;
+            while (i < fws.size()) {
+                let f = fws.at(i);
+                acts.push(signupfrag.SigAct(f.slug, f.label, f.frameworkType, ""));
+                i = i + 1;
+            }
+        } else if (!string.eql(country, "")) {
+            region = await self.repo.countryRegion(country);
+            let pairs = await self.repo.actsForCountry(country);
+            let i = 0;
+            while (i < pairs.items.size()) {
+                let pr = pairs.items.getOr(i, ActApplRow{ act_slug: "", applicability: "" });
+                let label = pr.act_slug;
+                let ftype = "";
+                let j = 0;
+                while (j < fws.size()) {
+                    let f = fws.at(j);
+                    if (string.eql(f.slug, pr.act_slug)) { label = f.label; ftype = f.frameworkType; }
+                    j = j + 1;
+                }
+                acts.push(signupfrag.SigAct(pr.act_slug, label, ftype, pr.applicability));
+                i = i + 1;
+            }
+        }
+
+        return await ds_response.patch(signupfrag.actsPanel(country, region, acts, all));
+    }
+}

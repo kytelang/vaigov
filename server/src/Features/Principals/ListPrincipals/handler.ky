@@ -1,0 +1,41 @@
+// GET /principals -> {"principals":[{id,display,source,groups_json,created_ms}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Principals.Shared.PrincipalRepository;
+import Domain.Dtos.PrincipalListRow;
+
+pub fn principalRowJson(r: PrincipalListRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(6, string.hash);
+    m.set("id", json.str(r.id));
+    m.set("display", json.str(r.display));
+    m.set("source", json.str(r.source));
+    m.set("groups_json", json.str(r.groups_json));
+    m.set("created_ms", json.number(r.created_ms));
+    return json.object(m);
+}
+
+pub struct ListPrincipalsHandler impl RouteHandler {
+    repo: PrincipalRepository,
+    app: AppContext,
+    init(repo: PrincipalRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListPrincipalsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.list(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(principalRowJson(rows.items.getOr(i, PrincipalListRow{ id: "", display: "", source: "", groups_json: "[]", created_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("principals", json.array(arr));
+        return Http.okObj(m);
+    }
+}

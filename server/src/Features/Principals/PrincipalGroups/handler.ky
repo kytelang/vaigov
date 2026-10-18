@@ -1,0 +1,24 @@
+// GET /principal/groups?id=... -> {"principal":who,"groups":[...]}. acp resolves the
+// principal's IdP/SCIM directory groups; this dev build has no SCIM directory wired,
+// so it returns an empty groups list (noted). Shape matches acp.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct PrincipalGroupsHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+
+    async fn serve(self: PrincipalGroupsHandler, ctx: routing.Context): response.Response {
+        let who = string.trim(ctx.query("id"));
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("principal", json.str(who));
+        m.set("groups", json.array(list.List<json.JsonValue>()));
+        return Http.okObj(m);
+    }
+}

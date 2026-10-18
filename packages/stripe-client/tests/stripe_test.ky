@@ -1,0 +1,4 @@
+import assert;
+import stripe;
+@test
+fn test_construct(): void { let s = stripe.Stripe("sk_test_x"); assert.equalStr(s.secretKey, "sk_test_x"); }

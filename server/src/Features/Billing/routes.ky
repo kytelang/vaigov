@@ -1,0 +1,17 @@
+// SaaS Billing feature route table: the billing + usage console view and the
+// plan-switch console mutation.
+import web.app;
+import Shared.AppContext;
+import Features.Billing.BillingView.handler;
+import Features.Billing.Signup.handler;
+import Features.Billing.SignupCountries.handler;
+import Features.Billing.SignupActs.handler;
+
+pub fn registerBilling(ctx: AppContext): void {
+    ctx.app.get("/billing/view", BillingViewHandler(ctx));
+    ctx.app.post("/console/billing/select", BillingSelectHandler(ctx));
+    ctx.app.post("/signup", SignupHandler(ctx));
+    ctx.app.get("/signup/countries", SignupCountriesHandler(ctx));
+    ctx.app.get("/signup/acts", SignupActsHandler(ctx));
+    ctx.app.post("/stripe/webhook", StripeWebhookHandler(ctx));
+}

@@ -1,0 +1,28 @@
+// POST /memory/write -> content-firewall gate on agent memory writes.
+// acp returns {"ok":true,"blocked":bool,"findings":[kinds]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Assurance.Shared.asr;
+
+pub struct MemoryWriteHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: MemoryWriteHandler, ctx: routing.Context): response.Response {
+        let body = Http.bodyJson(ctx);
+        let content = asr.asrBodyStr(body, "content");
+        let findings = list.List<json.JsonValue>();
+        if (asr.asrCaughtPub(content)) { findings.push(json.str("prompt-injection")); }
+        let blocked = findings.size() > 0;
+        let m = Map<string, json.JsonValue>(3, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("blocked", json.bool(blocked));
+        m.set("findings", json.array(findings));
+        return Http.okObj(m);
+    }
+}

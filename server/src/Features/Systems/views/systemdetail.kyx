@@ -1,0 +1,186 @@
+// AI system detail view as KYX (matches acp/console SystemDetail.vue): a back
+// button to the registry plus six cards -- System, Roles, Statement of
+// Applicability, Evidence, Governance records, and Change history. Rendered into
+// the same #systems container the registry uses, so "Open" / "Back" swap in place
+// via Datastar morph. Read model for now; the add-row / SoA-save editors are a
+// later interactive enhancement (the backend endpoints already exist).
+import list;
+import string;
+import Domain.Dtos.SystemDtos;
+
+fn sdDash(s: string): string { if (s.length == 0) { return "-"; } return s; }
+
+fn riskBadge(t: string): Html {
+    if (string.eql(t, "high") || string.eql(t, "unacceptable")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-bad">{t}</span>;
+    } else if (string.eql(t, "limited")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{t}</span>;
+    } else if (string.eql(t, "minimal")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{t}</span>;
+    } else if (t.length == 0) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">-</span>;
+    }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">{t}</span>;
+}
+
+fn statusBadge(s: string): Html {
+    if (string.eql(s, "closed") || string.eql(s, "approved") || string.eql(s, "accepted") || string.eql(s, "done") || string.eql(s, "implemented") || string.eql(s, "conformant")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">{s}</span>;
+    } else if (string.eql(s, "rejected") || string.eql(s, "gap") || string.eql(s, "non-conformant")) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-bad">{s}</span>;
+    } else if (s.length == 0) {
+        return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">-</span>;
+    }
+    return <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-warn">{s}</span>;
+}
+
+fn detailField(label: string, value: Html): Html {
+    return <div>
+        <div class="text-[10px] uppercase tracking-wide text-muted">{label}</div>
+        <div class="text-sm text-txt mt-0.5">{value}</div>
+    </div>;
+}
+
+fn cardShell(title: string, subtitle: string, body: Html): Html {
+    return <div class="bg-panel border border-line rounded-xl">
+        <div class="px-5 py-3 border-b border-line">
+            <h2 class="font-semibold text-txt">{title}</h2>
+            {if (subtitle.length > 0) { <p class="text-xs text-dim">{subtitle}</p>; }}
+        </div>
+        <div class="px-5 py-4 overflow-x-auto">{body}</div>
+    </div>;
+}
+
+// Row helpers (a loop yields by CALLING a helper per element; an inline `let`
+// inside a {for} yield does not compile in KYX).
+fn roleRowHtml(r: SystemRoleRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 text-sm text-txt">{sdDash(r.role)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{sdDash(r.jurisdiction)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{sdDash(r.market_date)}</td>
+    </tr>;
+}
+fn soaRowHtml(e: SoaStoredRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{sdDash(e.framework)}</td>
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{sdDash(e.control_id)}</td>
+        <td class="py-2 pr-4 text-xs">{if (e.applicable != 0) (<span class="text-ok">yes</span>) else (<span class="text-muted">no</span>)}</td>
+        <td class="py-2 pr-4">{statusBadge(e.status)}</td>
+    </tr>;
+}
+fn evRowHtml(e: SystemEvidenceRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{sdDash(e.framework)}</td>
+        <td class="py-2 pr-4 font-mono text-xs text-dim">{sdDash(e.control_id)}</td>
+        <td class="py-2 pr-4 text-sm text-txt">{sdDash(e.title)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{sdDash(e.owner)}</td>
+        <td class="py-2 pr-4">{if (e.valid_until_ms > 0) (<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok">fresh</span>) else (<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-muted">none</span>)}</td>
+    </tr>;
+}
+fn grcRowHtml(r: SystemGrcRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 text-xs"><span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-dim">{sdDash(r.kind)}</span></td>
+        <td class="py-2 pr-4 text-sm text-txt">{sdDash(r.title)}</td>
+        <td class="py-2 pr-4">{statusBadge(r.status)}</td>
+    </tr>;
+}
+fn histRowHtml(a: SystemAuditRow): Html {
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4 text-xs text-txt">{sdDash(a.action)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{sdDash(a.actor)}</td>
+        <td class="py-2 pr-4 text-xs text-dim">{sdDash(a.detail)}</td>
+    </tr>;
+}
+
+fn systemCard(s: SystemRow): Html {
+    let body = <div class="grid sm:grid-cols-2 md:grid-cols-3 gap-4">
+        {detailField("Owner", <span>{sdDash(s.owner)}</span>)}
+        {detailField("Risk tier", riskBadge(s.risk_tier))}
+        {detailField("Sector", <span>{sdDash(s.sector)}</span>)}
+        {detailField("Lifecycle", <span>{sdDash(s.lifecycle_state)}</span>)}
+        {detailField("Jurisdictions", <span>{sdDash(s.jurisdictions)}</span>)}
+        {detailField("Purpose", <span>{sdDash(s.purpose)}</span>)}
+    </div>;
+    return cardShell("System", "The governed AI system and its risk classification.", body);
+}
+
+fn rolesCard(roles: list.List<SystemRoleRow>): Html {
+    let body = <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+            <th class="py-2 pr-4">Role</th><th class="py-2 pr-4">Jurisdiction</th><th class="py-2 pr-4">Market date</th>
+        </tr></thead>
+        <tbody>
+            {for (i in 0..roles.size()) { roleRowHtml(roles.at(i)); }}
+            {if (roles.size() == 0) { <tr><td colspan="3" class="py-6 text-center text-dim">No roles assigned.</td></tr>; }}
+        </tbody>
+    </table>;
+    return cardShell("Roles", "How this organisation acts in relation to the system (provider, deployer, importer, distributor).", body);
+}
+
+fn soaCard(soa: list.List<SoaStoredRow>): Html {
+    let body = <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+            <th class="py-2 pr-4">Framework</th><th class="py-2 pr-4">Control</th><th class="py-2 pr-4">Applicable</th><th class="py-2 pr-4">Status</th>
+        </tr></thead>
+        <tbody>
+            {for (i in 0..soa.size()) { soaRowHtml(soa.at(i)); }}
+            {if (soa.size() == 0) { <tr><td colspan="4" class="py-6 text-center text-dim">No Statement of Applicability entries yet. Seed one from a policy pack on the Governance screen.</td></tr>; }}
+        </tbody>
+    </table>;
+    return cardShell("Statement of Applicability", "Which controls apply to this system and their implementation status.", body);
+}
+
+fn evidenceCard(ev: list.List<SystemEvidenceRow>): Html {
+    let body = <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+            <th class="py-2 pr-4">Framework</th><th class="py-2 pr-4">Control</th><th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Owner</th><th class="py-2 pr-4">Fresh</th>
+        </tr></thead>
+        <tbody>
+            {for (i in 0..ev.size()) { evRowHtml(ev.at(i)); }}
+            {if (ev.size() == 0) { <tr><td colspan="5" class="py-6 text-center text-dim">No evidence recorded.</td></tr>; }}
+        </tbody>
+    </table>;
+    return cardShell("Evidence", "Artefacts that demonstrate controls are met, with freshness.", body);
+}
+
+fn grcCard(recs: list.List<SystemGrcRow>): Html {
+    let body = <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+            <th class="py-2 pr-4">Kind</th><th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Status</th>
+        </tr></thead>
+        <tbody>
+            {for (i in 0..recs.size()) { grcRowHtml(recs.at(i)); }}
+            {if (recs.size() == 0) { <tr><td colspan="3" class="py-6 text-center text-dim">No governance records for this system.</td></tr>; }}
+        </tbody>
+    </table>;
+    return cardShell("Governance records", "Risks, assessments, model cards and datasets linked to this system.", body);
+}
+
+fn historyCard(audit: list.List<SystemAuditRow>): Html {
+    let body = <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+            <th class="py-2 pr-4">Action</th><th class="py-2 pr-4">Actor</th><th class="py-2 pr-4">Detail</th>
+        </tr></thead>
+        <tbody>
+            {for (i in 0..audit.size()) { histRowHtml(audit.at(i)); }}
+            {if (audit.size() == 0) { <tr><td colspan="3" class="py-6 text-center text-dim">No change history.</td></tr>; }}
+        </tbody>
+    </table>;
+    return cardShell("Change history", "The audit trail of changes to this system.", body);
+}
+
+pub fn systemDetailPanel(s: SystemRow, roles: list.List<SystemRoleRow>, soa: list.List<SoaStoredRow>, ev: list.List<SystemEvidenceRow>, recs: list.List<SystemGrcRow>, audit: list.List<SystemAuditRow>): Html {
+    return <div id="systems" class="grid gap-4">
+        <div class="flex items-center gap-3">
+            <button class="rounded-lg border border-line2 px-3 py-1.5 text-sm hover:bg-panel2" data-on:click="@get('/systems/view')">← Systems</button>
+            <h2 class="text-lg font-semibold text-txt">{sdDash(s.name)}</h2>
+            <span class="font-mono text-xs text-muted">{s.id}</span>
+        </div>
+        {systemCard(s)}
+        {rolesCard(roles)}
+        {soaCard(soa)}
+        {evidenceCard(ev)}
+        {grcCard(recs)}
+        {historyCard(audit)}
+    </div>;
+}

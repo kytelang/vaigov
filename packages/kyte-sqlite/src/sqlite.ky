@@ -1,0 +1,507 @@
+// sqlite - an embedded SQLite driver for Kyte, as a thin FFI binding over the
+// system `libsqlite3`. There is no server process: the database is a single file
+// (or `:memory:`), opened in-process. The compiler links `-lsqlite3` automatically
+// because of the `extern("sqlite3")` declarations below (libsqlite3 ships on macOS
+// and most Linux distributions).
+//
+// The API is small and explicit: open a `Db`, run DDL/one-shot statements with
+// `exec`, and use a prepared `Stmt` (bind by 1-based index, read columns by
+// 0-based index) for inserts and queries. Values are bound and read as `long`
+// (64-bit) and `string`; `int` is 32-bit in Kyte, so always use `long` for row
+// ids, timestamps, and byte counts.
+import bytes;
+import string;
+
+// --- raw C bindings (libsqlite3) ---------------------------------------------
+// `ptr` is an opaque machine word. SQLite's `sqlite3**` / `sqlite3_stmt**`
+// out-parameters are passed as an 8-byte cell (`bytes.alloc(8)`) whose written
+// handle we recover with `bytes.read_ptr`.
+extern("sqlite3") fn sqlite3_open(path: string, ppDb: ptr): int;
+extern("sqlite3") fn sqlite3_close_v2(db: ptr): int;
+extern("sqlite3") fn sqlite3_exec(db: ptr, sql: string, cb: ptr, arg: ptr, errmsg: ptr): int;
+extern("sqlite3") fn sqlite3_prepare_v2(db: ptr, sql: string, nByte: int, ppStmt: ptr, pzTail: ptr): int;
+extern("sqlite3") fn sqlite3_bind_text(stmt: ptr, idx: int, val: string, n: int, dtor: ptr): int;
+extern("sqlite3") fn sqlite3_bind_int64(stmt: ptr, idx: int, val: long): int;
+extern("sqlite3") fn sqlite3_bind_null(stmt: ptr, idx: int): int;
+extern("sqlite3") fn sqlite3_step(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_reset(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_clear_bindings(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_column_count(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_column_int64(stmt: ptr, col: int): long;
+extern("sqlite3") fn sqlite3_column_bytes(stmt: ptr, col: int): int;
+extern("sqlite3") fn sqlite3_column_text(stmt: ptr, col: int): ptr;
+extern("sqlite3") fn sqlite3_finalize(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_errmsg(db: ptr): ptr;
+extern("sqlite3") fn sqlite3_busy_timeout(db: ptr, ms: int): int;
+extern("sqlite3") fn sqlite3_last_insert_rowid(db: ptr): long;
+extern("sqlite3") fn sqlite3_changes(db: ptr): int;
+
+// --- extended bindings (the "full-fledged" driver layer builds on these) ------
+// Open with explicit flags + a VFS slot (we always pass a null VFS = default).
+extern("sqlite3") fn sqlite3_open_v2(path: string, ppDb: ptr, flags: int, zVfs: ptr): int;
+// Typed binds beyond text/int64/null. Floating point uses the native
+// sqlite3_bind_double / sqlite3_column_double now that the Kyte FFI maps the
+// `double` type to a floating-point register (a REAL column round-trips exactly).
+extern("sqlite3") fn sqlite3_bind_double(stmt: ptr, idx: int, val: double): int;
+extern("sqlite3") fn sqlite3_bind_blob(stmt: ptr, idx: int, val: string, n: int, dtor: ptr): int;
+// Typed column readers beyond int64/text.
+extern("sqlite3") fn sqlite3_column_double(stmt: ptr, col: int): double;
+extern("sqlite3") fn sqlite3_column_blob(stmt: ptr, col: int): ptr;
+extern("sqlite3") fn sqlite3_column_type(stmt: ptr, col: int): int;
+extern("sqlite3") fn sqlite3_column_name(stmt: ptr, col: int): ptr;
+extern("sqlite3") fn sqlite3_column_decltype(stmt: ptr, col: int): ptr;
+// Named/positional parameter introspection.
+extern("sqlite3") fn sqlite3_bind_parameter_count(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_bind_parameter_index(stmt: ptr, name: string): int;
+// Error classification + counters.
+extern("sqlite3") fn sqlite3_extended_errcode(db: ptr): int;
+extern("sqlite3") fn sqlite3_errcode(db: ptr): int;
+extern("sqlite3") fn sqlite3_errstr(rc: int): ptr;
+extern("sqlite3") fn sqlite3_total_changes(db: ptr): int;
+
+// --- advanced surface (Group A: straightforward FFI, no C callbacks) ----------
+// Free a buffer that SQLite allocated for us (sqlite3_serialize, the expanded
+// SQL text). NEVER pass a Kyte-owned pointer here.
+extern("sqlite3") fn sqlite3_free(p: ptr): void;
+// Allocate a buffer SQLite will own (used by deserialize with FREEONCLOSE).
+extern("sqlite3") fn sqlite3_malloc64(n: long): ptr;
+
+// Incremental BLOB I/O: open a handle onto a single BLOB cell and read/write a
+// window of it without loading the whole value. `iRow` is the rowid (64-bit);
+// `flags` is 0 for read-only, non-zero for read-write.
+extern("sqlite3") fn sqlite3_blob_open(db: ptr, zDb: string, zTable: string, zColumn: string, iRow: long, flags: int, ppBlob: ptr): int;
+extern("sqlite3") fn sqlite3_blob_close(blob: ptr): int;
+extern("sqlite3") fn sqlite3_blob_bytes(blob: ptr): int;
+extern("sqlite3") fn sqlite3_blob_read(blob: ptr, z: ptr, n: int, iOffset: int): int;
+extern("sqlite3") fn sqlite3_blob_write(blob: ptr, z: string, n: int, iOffset: int): int;
+
+// Online backup: copy pages from a source database to a destination, even while
+// the source is live. `nPage` of -1 on a step copies every remaining page.
+extern("sqlite3") fn sqlite3_backup_init(pDest: ptr, zDestName: string, pSource: ptr, zSourceName: string): ptr;
+extern("sqlite3") fn sqlite3_backup_step(p: ptr, nPage: int): int;
+extern("sqlite3") fn sqlite3_backup_finish(p: ptr): int;
+
+// Serialize a database to a malloc'd byte buffer (`piSize` receives the length as
+// a 64-bit int) and deserialize a buffer back into a database.
+extern("sqlite3") fn sqlite3_serialize(db: ptr, zSchema: string, piSize: ptr, mFlags: int): ptr;
+extern("sqlite3") fn sqlite3_deserialize(db: ptr, zSchema: string, pData: ptr, szDb: long, szBuf: long, mFlags: int): int;
+
+// WAL checkpoint: flush the write-ahead log back into the main database file.
+// `pnLog`/`pnCkpt` are `int*` out-params (total frames in the WAL, and frames
+// checkpointed).
+extern("sqlite3") fn sqlite3_wal_checkpoint_v2(db: ptr, zDb: ptr, eMode: int, pnLog: ptr, pnCkpt: ptr): int;
+
+// Miscellaneous introspection / control.
+extern("sqlite3") fn sqlite3_interrupt(db: ptr): void;
+extern("sqlite3") fn sqlite3_db_readonly(db: ptr, zDbName: string): int;
+extern("sqlite3") fn sqlite3_stmt_readonly(stmt: ptr): int;
+extern("sqlite3") fn sqlite3_expanded_sql(stmt: ptr): ptr;
+extern("sqlite3") fn sqlite3_limit(db: ptr, id: int, newVal: int): int;
+// NOTE on loadable extensions: sqlite3_enable_load_extension /
+// sqlite3_load_extension are intentionally NOT bound here. The system
+// libsqlite3 on macOS is compiled with SQLITE_OMIT_LOAD_EXTENSION, so those
+// symbols do not exist in the library and binding them makes the driver fail to
+// link on this host. See the README for how to opt in against a custom build.
+
+// Result codes we care about.
+pub const SQLITE_OK: int = 0;
+pub const SQLITE_ROW: int = 100;
+pub const SQLITE_DONE: int = 101;
+
+// Primary result codes used for classification.
+pub const SQLITE_ERROR: int = 1;
+pub const SQLITE_BUSY: int = 5;
+pub const SQLITE_LOCKED: int = 6;
+pub const SQLITE_CONSTRAINT: int = 19;
+
+// Extended result codes (primary | (sub << 8)) we map to neutral DbError kinds.
+pub const SQLITE_CONSTRAINT_PRIMARYKEY: int = 1555;   // 19 | (6 << 8)
+pub const SQLITE_CONSTRAINT_UNIQUE: int = 2067;       // 19 | (8 << 8)
+pub const SQLITE_CONSTRAINT_NOTNULL: int = 1299;      // 19 | (5 << 8)
+pub const SQLITE_CONSTRAINT_FOREIGNKEY: int = 787;    // 19 | (3 << 8)
+pub const SQLITE_CONSTRAINT_CHECK: int = 275;         // 19 | (1 << 8)
+pub const SQLITE_BUSY_SNAPSHOT: int = 517;            // 5  | (2 << 8)
+
+// Dynamic column types reported by sqlite3_column_type.
+pub const SQLITE_INTEGER: int = 1;
+pub const SQLITE_FLOAT: int = 2;
+pub const SQLITE_TEXT: int = 3;
+pub const SQLITE_BLOB: int = 4;
+pub const SQLITE_NULL: int = 5;
+
+// A generic out-of-memory result code (sqlite3_malloc64 failure).
+pub const SQLITE_NOMEM: int = 7;
+
+// WAL checkpoint modes for sqlite3_wal_checkpoint_v2.
+pub const SQLITE_CHECKPOINT_PASSIVE: int = 0;   // checkpoint as much as possible without blocking
+pub const SQLITE_CHECKPOINT_FULL: int = 1;      // wait for writers, then checkpoint everything
+pub const SQLITE_CHECKPOINT_RESTART: int = 2;   // FULL, then restart the WAL
+pub const SQLITE_CHECKPOINT_TRUNCATE: int = 3;  // RESTART, then truncate the WAL to zero bytes
+
+// Open flags for a BLOB handle (sqlite3_blob_open's `flags`).
+pub const SQLITE_BLOB_READONLY: int = 0;
+pub const SQLITE_BLOB_READWRITE: int = 1;
+
+// Flags for sqlite3_deserialize. FREEONCLOSE lets SQLite own and free the buffer
+// (so we hand it a sqlite3_malloc64 buffer); RESIZEABLE lets the db grow.
+pub const SQLITE_DESERIALIZE_FREEONCLOSE: int = 1;
+pub const SQLITE_DESERIALIZE_RESIZEABLE: int = 2;
+pub const SQLITE_DESERIALIZE_READONLY: int = 4;
+
+// A selection of sqlite3_limit categories (id values).
+pub const SQLITE_LIMIT_LENGTH: int = 0;            // max size of any string/BLOB/row
+pub const SQLITE_LIMIT_SQL_LENGTH: int = 1;        // max length of an SQL statement
+pub const SQLITE_LIMIT_COLUMN: int = 2;            // max columns in a table/index/etc
+pub const SQLITE_LIMIT_VARIABLE_NUMBER: int = 9;   // max bound parameters
+
+// Flags for sqlite3_open_v2 (a small, useful subset).
+pub const SQLITE_OPEN_READONLY: int = 1;
+pub const SQLITE_OPEN_READWRITE: int = 2;
+pub const SQLITE_OPEN_CREATE: int = 4;
+pub const SQLITE_OPEN_URI: int = 64;          // 0x40, interpret the path as a URI
+pub const SQLITE_OPEN_MEMORY: int = 128;      // 0x80
+pub const SQLITE_OPEN_NOMUTEX: int = 32768;   // 0x8000, multi-thread mode
+pub const SQLITE_OPEN_FULLMUTEX: int = 65536; // 0x10000, serialised mode
+
+// A null pointer (for the exec callback/arg/errmsg and prepare's pzTail).
+fn nullPtr(): ptr { return 0 as ptr; }
+// SQLITE_TRANSIENT = (sqlite3_destructor_type)-1: tells SQLite to COPY the bound
+// text immediately, so a Kyte string's buffer need not outlive the bind call.
+fn transientPtr(): ptr { return (0 - 1) as ptr; }
+
+// Copies `n` bytes from a raw C pointer into a fresh Kyte string.
+fn readBytes(p: ptr, n: int): string {
+    if (n <= 0) { return ""; }
+    let buf = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, bytes.read_byte(p, i)); i = i + 1; }
+    return buf as string;
+}
+
+// Reads a NUL-terminated C string (used for `sqlite3_errmsg`), capped so a
+// missing terminator cannot run away.
+fn readCStrZ(p: ptr): string {
+    let i = 0;
+    while (i < 4096) {
+        if (bytes.read_byte(p, i) == 0) { break; }
+        i = i + 1;
+    }
+    return readBytes(p, i);
+}
+
+// --- prepared statement ------------------------------------------------------
+/// A prepared statement. Bind parameters by 1-based index, read columns by
+/// 0-based index, then `finalize` when done (or reuse after `resetStmt`).
+pub class Stmt {
+    pub handle: ptr,
+    pub db: ptr,
+
+    init(handle: ptr, db: ptr) { self.handle = handle; self.db = db; }
+
+    /// Binds a text value at 1-based `idx`. SQLite copies the value (TRANSIENT).
+    pub fn bindText(self: Stmt, idx: int, val: string): void {
+        let _ = sqlite3_bind_text(self.handle, idx, val, 0 - 1, transientPtr());
+    }
+    /// Binds a 64-bit integer at 1-based `idx`.
+    pub fn bindLong(self: Stmt, idx: int, val: long): void {
+        let _ = sqlite3_bind_int64(self.handle, idx, val);
+    }
+    /// Binds a 64-bit floating-point value at 1-based `idx` (stored as REAL).
+    pub fn bindDouble(self: Stmt, idx: int, val: double): void {
+        let _ = sqlite3_bind_double(self.handle, idx, val);
+    }
+    /// Binds SQL NULL at 1-based `idx`.
+    pub fn bindNull(self: Stmt, idx: int): void {
+        let _ = sqlite3_bind_null(self.handle, idx);
+    }
+    /// Binds a binary blob at 1-based `idx` using an EXPLICIT byte length (so
+    /// embedded NUL bytes are preserved) and SQLITE_TRANSIENT (SQLite copies the
+    /// bytes immediately, so the Kyte string need not outlive the bind).
+    pub fn bindBlob(self: Stmt, idx: int, val: string, n: int): void {
+        let _ = sqlite3_bind_blob(self.handle, idx, val, n, transientPtr());
+    }
+    /// Binds a text value at 1-based `idx` with an EXPLICIT byte length. Use this
+    /// over `bindText` when the string may carry embedded NULs; `bindText` passes
+    /// n = -1 (NUL-terminated), which truncates at the first NUL.
+    pub fn bindTextN(self: Stmt, idx: int, val: string, n: int): void {
+        let _ = sqlite3_bind_text(self.handle, idx, val, n, transientPtr());
+    }
+    /// The number of bound parameters the prepared SQL expects.
+    pub fn parameterCount(self: Stmt): int { return sqlite3_bind_parameter_count(self.handle); }
+    /// The 1-based index of a named parameter (`:name`, `@name`, `$name`), or 0 if
+    /// there is no such parameter.
+    pub fn parameterIndex(self: Stmt, name: string): int { return sqlite3_bind_parameter_index(self.handle, name); }
+    /// Advances to the next row. Returns true when a row is available
+    /// (`SQLITE_ROW`), false when the statement is done (`SQLITE_DONE`).
+    pub fn step(self: Stmt): bool {
+        return sqlite3_step(self.handle) == SQLITE_ROW;
+    }
+    /// Advances one step and returns the RAW result code (SQLITE_ROW,
+    /// SQLITE_DONE, or an error code), so a caller can tell a clean end from a
+    /// failure that `step` would silently report as "no row".
+    pub fn stepRc(self: Stmt): int { return sqlite3_step(self.handle); }
+    /// Resets the statement so it can be re-bound and re-executed.
+    pub fn resetStmt(self: Stmt): void { let _ = sqlite3_reset(self.handle); }
+    /// Clears every previously bound parameter back to NULL, so a reused
+    /// statement does not keep a stale bind from an earlier, longer param list.
+    pub fn clearBindings(self: Stmt): void { let _ = sqlite3_clear_bindings(self.handle); }
+    /// The number of result columns.
+    pub fn columnCount(self: Stmt): int { return sqlite3_column_count(self.handle); }
+    /// Reads column `col` (0-based) as a 64-bit integer.
+    pub fn columnLong(self: Stmt, col: int): long { return sqlite3_column_int64(self.handle, col); }
+    /// Reads column `col` (0-based) as a 64-bit floating-point value.
+    pub fn columnDouble(self: Stmt, col: int): double { return sqlite3_column_double(self.handle, col); }
+    /// Reads column `col` (0-based) as text (empty string for NULL).
+    pub fn columnText(self: Stmt, col: int): string {
+        let n = sqlite3_column_bytes(self.handle, col);
+        return readBytes(sqlite3_column_text(self.handle, col), n);
+    }
+    /// Reads column `col` (0-based) as raw bytes, copying EXACTLY
+    /// `sqlite3_column_bytes` bytes so embedded NULs survive. Reads the blob
+    /// pointer last so the byte count is taken before any type coercion.
+    pub fn columnBlob(self: Stmt, col: int): string {
+        let n = sqlite3_column_bytes(self.handle, col);
+        return readBytes(sqlite3_column_blob(self.handle, col), n);
+    }
+    /// The dynamic storage type of column `col` (0-based): one of SQLITE_INTEGER,
+    /// SQLITE_FLOAT, SQLITE_TEXT, SQLITE_BLOB, SQLITE_NULL. Valid only after a
+    /// `step` has landed on a row.
+    pub fn columnType(self: Stmt, col: int): int { return sqlite3_column_type(self.handle, col); }
+    /// The name of column `col` (0-based) as declared in the query.
+    pub fn columnName(self: Stmt, col: int): string { return readCStrZ(sqlite3_column_name(self.handle, col)); }
+    /// The declared type of column `col` (0-based) from the table schema, or `""`
+    /// for an expression column with no declared type.
+    pub fn columnDecltype(self: Stmt, col: int): string {
+        let p = sqlite3_column_decltype(self.handle, col);
+        if ((p as long) == 0) { return ""; }
+        return readCStrZ(p);
+    }
+    /// True when the prepared statement is read-only (makes no change to the
+    /// database): SELECTs and most PRAGMAs are read-only, DML/DDL are not.
+    pub fn isReadonly(self: Stmt): bool { return sqlite3_stmt_readonly(self.handle) != 0; }
+    /// The SQL text with bound parameters expanded into literals (handy for
+    /// logging). Copies SQLite's malloc'd C string out and frees it immediately.
+    pub fn expandedSql(self: Stmt): string {
+        let p = sqlite3_expanded_sql(self.handle);
+        if ((p as long) == 0) { return ""; }
+        let s = readCStrZ(p);
+        sqlite3_free(p);
+        return s;
+    }
+    /// Releases the statement. Safe to call once per statement.
+    pub fn finalize(self: Stmt): void { let _ = sqlite3_finalize(self.handle); }
+}
+
+// --- incremental BLOB I/O ----------------------------------------------------
+/// A handle onto a single BLOB cell, for reading or writing a window of its
+/// bytes without materialising the whole value. Open it with `openBlob`, use
+/// `read`/`write` (the byte count is fixed at open: a BLOB handle cannot grow or
+/// shrink the cell), then `close`. `ok` is false when the open failed.
+pub class Blob {
+    pub handle: ptr,
+    pub ok: bool,
+
+    init(handle: ptr, ok: bool) { self.handle = handle; self.ok = ok; }
+
+    /// The size in bytes of the open BLOB cell.
+    pub fn length(self: Blob): int { return sqlite3_blob_bytes(self.handle); }
+    /// Reads `len` bytes starting at `offset`, returning them as a string (exact
+    /// bytes, embedded NULs preserved). Returns "" if the read fails (for example
+    /// offset + len past the end of the cell).
+    pub fn read(self: Blob, offset: int, len: int): string {
+        if (len <= 0) { return ""; }
+        let buf = bytes.alloc(len);
+        let rc = sqlite3_blob_read(self.handle, buf, len, offset);
+        if (rc != SQLITE_OK) { return ""; }
+        return buf as string;
+    }
+    /// Writes `data` at `offset` into the cell. The handle must have been opened
+    /// read-write, and the write must stay within the cell's fixed size. Returns
+    /// the SQLite result code (SQLITE_OK on success).
+    pub fn write(self: Blob, offset: int, data: string): int {
+        return sqlite3_blob_write(self.handle, data, data.length, offset);
+    }
+    /// Closes the BLOB handle. Safe to call once.
+    pub fn close(self: Blob): void { let _ = sqlite3_blob_close(self.handle); }
+}
+
+/// Opens a handle onto the BLOB in `column` of the row with rowid `rowid` in
+/// `table` of attached database `dbName` (usually "main"). Pass
+/// SQLITE_BLOB_READWRITE to write, SQLITE_BLOB_READONLY to read. Check `Blob.ok`.
+pub fn openBlob(db: Db, dbName: string, table: string, column: string, rowid: long, flags: int): Blob {
+    let cell = bytes.alloc(8);
+    let rc = sqlite3_blob_open(db.handle, dbName, table, column, rowid, flags, cell);
+    return Blob(bytes.read_ptr(cell, 0), rc == SQLITE_OK);
+}
+
+// --- database ----------------------------------------------------------------
+/// An open SQLite database. `ok` is false if the open failed (then `handle` is
+/// not usable). A `:memory:` path opens a private in-memory database.
+pub class Db {
+    pub handle: ptr,
+    pub ok: bool,
+
+    init(handle: ptr, ok: bool) { self.handle = handle; self.ok = ok; }
+
+    /// Runs one or more SQL statements with no result rows (DDL, PRAGMA, a
+    /// single INSERT/UPDATE/DELETE). Returns true on success.
+    pub fn exec(self: Db, sql: string): bool {
+        return sqlite3_exec(self.handle, sql, nullPtr(), nullPtr(), nullPtr()) == SQLITE_OK;
+    }
+    /// Prepares `sql` into a reusable `Stmt`. The caller must `finalize` it.
+    pub fn prepare(self: Db, sql: string): Stmt {
+        let cell = bytes.alloc(8);
+        let _ = sqlite3_prepare_v2(self.handle, sql, 0 - 1, cell, nullPtr());
+        return Stmt(bytes.read_ptr(cell, 0), self.handle);
+    }
+    /// The rowid of the most recent successful INSERT on this connection.
+    pub fn lastInsertRowid(self: Db): long { return sqlite3_last_insert_rowid(self.handle); }
+    /// Rows changed by the most recent INSERT/UPDATE/DELETE.
+    pub fn changes(self: Db): int { return sqlite3_changes(self.handle); }
+    /// Total rows changed on this connection since it was opened.
+    pub fn totalChanges(self: Db): int { return sqlite3_total_changes(self.handle); }
+    /// The most recent error message for this connection.
+    pub fn errmsg(self: Db): string { return readCStrZ(sqlite3_errmsg(self.handle)); }
+    /// The primary result code of the most recent failed API call.
+    pub fn errcode(self: Db): int { return sqlite3_errcode(self.handle); }
+    /// The EXTENDED result code of the most recent failed API call (carries the
+    /// constraint sub-type, for example SQLITE_CONSTRAINT_UNIQUE).
+    pub fn extendedErrcode(self: Db): int { return sqlite3_extended_errcode(self.handle); }
+    /// Prepares `sql` and returns both the statement and the prepare result code,
+    /// so a syntax error at prepare time is observable (plain `prepare` hides it).
+    pub fn prepareRc(self: Db, sql: string): PrepareResult {
+        let cell = bytes.alloc(8);
+        let rc = sqlite3_prepare_v2(self.handle, sql, 0 - 1, cell, nullPtr());
+        return PrepareResult(Stmt(bytes.read_ptr(cell, 0), self.handle), rc);
+    }
+    // --- savepoints (nested, named transaction points) -----------------------
+    /// Opens a named savepoint. Unlike BEGIN, savepoints nest: an inner one can be
+    /// rolled back without discarding an enclosing savepoint or transaction.
+    pub fn savepoint(self: Db, name: string): bool { return self.exec(`SAVEPOINT ${name}`); }
+    /// Releases (commits) a savepoint and everything done since it was opened,
+    /// merging it into the enclosing savepoint/transaction.
+    pub fn release(self: Db, name: string): bool { return self.exec(`RELEASE ${name}`); }
+    /// Rolls the database back to a named savepoint, discarding changes made since
+    /// it was opened but keeping the savepoint itself open.
+    pub fn rollbackTo(self: Db, name: string): bool { return self.exec(`ROLLBACK TO ${name}`); }
+
+    // --- WAL checkpoint -------------------------------------------------------
+    /// Checkpoints the write-ahead log back into the main database file with the
+    /// given mode (SQLITE_CHECKPOINT_PASSIVE/FULL/RESTART/TRUNCATE). A harmless
+    /// no-op on a database that is not in WAL mode. Returns true on success.
+    pub fn checkpoint(self: Db, mode: int): bool {
+        let logCell = bytes.alloc(4);
+        let ckptCell = bytes.alloc(4);
+        return sqlite3_wal_checkpoint_v2(self.handle, nullPtr(), mode, logCell, ckptCell) == SQLITE_OK;
+    }
+
+    // --- serialize / deserialize ----------------------------------------------
+    /// Serialises the "main" schema to a byte string (a complete copy of the
+    /// database file image). Copies the bytes out of SQLite's malloc'd buffer and
+    /// frees it. Returns "" if the database is empty or serialisation fails.
+    pub fn serialize(self: Db): string {
+        let sizeCell = bytes.alloc(8);
+        let p = sqlite3_serialize(self.handle, "main", sizeCell, 0);
+        if ((p as long) == 0) { return ""; }
+        let n = bytes.read_ptr(sizeCell, 0) as long;
+        if (n <= 0) { sqlite3_free(p); return ""; }
+        let out = readBytes(p, n as int);
+        sqlite3_free(p);
+        return out;
+    }
+    /// Replaces the "main" schema with a database image previously produced by
+    /// `serialize`. Copies the bytes into a SQLite-owned buffer (FREEONCLOSE), so
+    /// the caller's string need not outlive the database. Returns the SQLite
+    /// result code (SQLITE_OK on success).
+    pub fn deserialize(self: Db, data: string): int {
+        let n = data.length;
+        if (n <= 0) { return SQLITE_ERROR; }
+        let buf = sqlite3_malloc64(n as long);
+        if ((buf as long) == 0) { return SQLITE_NOMEM; }
+        let i = 0;
+        while (i < n) { bytes.write_byte(buf, i, data[i]); i = i + 1; }
+        return sqlite3_deserialize(self.handle, "main", buf, n as long, n as long,
+            SQLITE_DESERIALIZE_FREEONCLOSE + SQLITE_DESERIALIZE_RESIZEABLE);
+    }
+
+    // --- miscellaneous introspection / control --------------------------------
+    /// Signals any in-progress query on this connection to abort at the next
+    /// opportunity (it then returns SQLITE_INTERRUPT). Safe to call from a signal
+    /// or a watchdog.
+    pub fn interrupt(self: Db): void { sqlite3_interrupt(self.handle); }
+    /// Whether attached database `dbName` (usually "main") is read-only: 1 if
+    /// read-only, 0 if read-write, -1 if there is no such database.
+    pub fn readonly(self: Db, dbName: string): int { return sqlite3_db_readonly(self.handle, dbName); }
+    /// Sets a run-time limit category (SQLITE_LIMIT_*) to `newVal`, returning the
+    /// PRIOR value. Pass -1 as `newVal` to query the current limit without changing it.
+    pub fn setLimit(self: Db, id: int, newVal: int): int { return sqlite3_limit(self.handle, id, newVal); }
+
+    // NOTE: loadable-extension opt-in (enableExtensions/loadExtension) is not
+    // provided. Loading native extensions runs arbitrary code with the process's
+    // privileges, so SQLite keeps it off by default; and the macOS system
+    // libsqlite3 omits the API entirely (SQLITE_OMIT_LOAD_EXTENSION), so there is
+    // no symbol to bind here. The README documents how to wire it against a
+    // custom libsqlite3 build that keeps the API.
+
+    /// Closes the database.
+    pub fn close(self: Db): void { let _ = sqlite3_close_v2(self.handle); }
+}
+
+// --- online backup -----------------------------------------------------------
+/// Copies the whole "main" database from `src` into `dest`, overwriting dest's
+/// contents, using SQLite's online backup API (so `src` may stay live). Returns
+/// true when every page copied successfully. For a plain whole-database copy this
+/// one call is enough; the lower-level sqlite3_backup_* steps are bound too for
+/// callers that want incremental progress.
+pub fn backup(dest: Db, src: Db): bool {
+    let b = sqlite3_backup_init(dest.handle, "main", src.handle, "main");
+    if ((b as long) == 0) { return false; }
+    let rc = sqlite3_backup_step(b, 0 - 1);   // -1 copies every remaining page
+    let _ = sqlite3_backup_finish(b);
+    return rc == SQLITE_DONE;
+}
+
+/// The outcome of a checked prepare: the statement plus the result code.
+pub struct PrepareResult {
+    pub stmt: Stmt,
+    pub rc: int,
+    init(stmt: Stmt, rc: int) { self.stmt = stmt; self.rc = rc; }
+}
+
+/// The human-readable text for a result code (via `sqlite3_errstr`), independent
+/// of any connection. Handy when a bind/step code has no connection message.
+pub fn errstr(rc: int): string { return readCStrZ(sqlite3_errstr(rc)); }
+
+/// Opens (creating if needed) the SQLite database at `path`, or `:memory:` for a
+/// private in-memory database. Sets a 5 second busy timeout and, for a file-backed
+/// database, enables WAL journalling for crash-safe concurrent reads. Check the
+/// returned `Db.ok` before use.
+pub fn open(path: string): Db {
+    let cell = bytes.alloc(8);
+    let rc = sqlite3_open(path, cell);
+    let handle = bytes.read_ptr(cell, 0);
+    let db = Db(handle, rc == SQLITE_OK);
+    if (db.ok) {
+        let _ = sqlite3_busy_timeout(handle, 5000);
+        // WAL is file-only; it is a harmless no-op (falls back to memory journal)
+        // for an in-memory database.
+        let _ = db.exec("PRAGMA journal_mode=WAL");
+    }
+    return db;
+}
+
+/// Opens the database at `path` with EXPLICIT `sqlite3_open_v2` flags (for
+/// example SQLITE_OPEN_READONLY, or READWRITE|CREATE, optionally | URI). Unlike
+/// `open`, this sets no busy timeout and no journal mode: the caller decides,
+/// which the DSN layer uses to honour `mode=ro|rw|rwc`. Check `Db.ok` before use.
+pub fn openWithFlags(path: string, flags: int): Db {
+    let cell = bytes.alloc(8);
+    let rc = sqlite3_open_v2(path, cell, flags, nullPtr());
+    let handle = bytes.read_ptr(cell, 0);
+    return Db(handle, rc == SQLITE_OK);
+}
+
+/// Sets the busy timeout (milliseconds) a blocked statement waits for a lock
+/// before returning SQLITE_BUSY. A thin wrapper so the DSN/connection layer can
+/// configure it on a db opened via `openWithFlags`.
+pub fn setBusyTimeout(db: Db, ms: int): void { let _ = sqlite3_busy_timeout(db.handle, ms); }

@@ -1,0 +1,16 @@
+// Apps registry routes (acp-compatible JSON over the shared `acp` db).
+import web.app;
+import Shared.AppContext;
+import Features.Apps.Shared.AppRepository;
+import Features.Apps.ListApps.handler;
+import Features.Apps.CreateApp.handler;
+import Features.Apps.UpdateApp.handler;
+import Features.Apps.DeleteApp.handler;
+
+pub fn registerApps(ctx: AppContext): void {
+    let repo = AppRepository(ctx.db);
+    ctx.app.get("/apps", ListAppsHandler(repo, ctx));
+    ctx.app.post("/apps", CreateAppHandler(repo, ctx));
+    ctx.app.post("/apps/{id}/update", UpdateAppHandler(repo, ctx));
+    ctx.app.post("/apps/{id}/delete", DeleteAppHandler(repo, ctx));
+}

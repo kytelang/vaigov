@@ -1,0 +1,152 @@
+// First-party console mutations for the Policy screen (back views/policy.kyx):
+// create/update a rule and delete one, then refresh the #policy fragment. The
+// subject/condition/match/obligations are stored as empty defaults here (the
+// visual match-builder is a later enhancement); a rule still matches by resource
+// and operation. Trusted /console/*; the machine /rules API keeps its checks.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Rules.Shared.RuleRepository;
+import Features.Policy.Shared.policyrules;
+import Features.Opa.Shared.bundle;
+import Features.Policy.views.policy;
+
+fn plTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+fn sig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+fn readBool(body: json.JsonValue, key: string): bool {
+    let b = json.asBool(json.get(body, key));
+    if (b != undefined) { return b ?? true; }
+    return string.eql(json.asString(json.get(body, key)) ?? "true", "true");
+}
+
+async fn renderPanel(repo: RuleRepository, tenant: string, signals: string): Response {
+    let rows = await repo.list(tenant);
+    return await ConsoleDs.patchAndSignals(policy.policyPanel(rows.items, "", "", ""), signals);
+}
+
+// Render the panel carrying the compiled Rego (rego modal) or a test verdict.
+async fn renderPanelFull(repo: RuleRepository, tenant: string, regoText: string, testVerdict: string, testRule: string, signals: string): Response {
+    let rows = await repo.list(tenant);
+    return await ConsoleDs.patchAndSignals(policy.policyPanel(rows.items, regoText, testVerdict, testRule), signals);
+}
+
+// GET /console/policy/rego -> compile + open the Rego modal.
+pub struct PolicyRegoHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PolicyRegoHandler, ctx: routing.Context): Response {
+        let tenant = plTenant(self.app, ctx);
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let regoSrc = rego.compileRules(rules, self.app.trustCfg.defaultVerdict);
+        return await renderPanelFull(self.repo, tenant, regoSrc, "", "", "{\"plRegoOpen\":\"open\"}");
+    }
+}
+
+// POST /console/policy/compile -> compile + report the new bundle revision.
+pub struct PolicyCompileConsoleHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PolicyCompileConsoleHandler, ctx: routing.Context): Response {
+        let tenant = plTenant(self.app, ctx);
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let regoSrc = rego.compileRules(rules, self.app.trustCfg.defaultVerdict);
+        let rev = bundle.revision(regoSrc);
+        let msg = "Compiled " + `${rules.size()}` + " rule(s) to OPA bundle revision " + rev + ".";
+        return await renderPanel(self.repo, tenant, "{\"plMsg\":\"" + msg + "\"}");
+    }
+}
+
+// POST /console/policy/test -> evaluate the sample request and show the verdict.
+pub struct PolicyTestConsoleHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PolicyTestConsoleHandler, ctx: routing.Context): Response {
+        let tenant = plTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        // Build the OPA-shaped input object from the test-console signals.
+        let subject = Map<string, json.JsonValue>(4, string.hash);
+        subject.set("id", json.str(sig(body, "ptSubject")));
+        let rolesStr = sig(body, "ptRoles");
+        let roles = list.List<json.JsonValue>();
+        if (rolesStr.length > 0) {
+            let parts = string.split(rolesStr, ",");
+            let i = 0;
+            while (i < parts.size()) { let r = string.trim(parts.getOr(i, "")); if (r.length > 0) { roles.push(json.str(r)); } i = i + 1; }
+        }
+        subject.set("roles", json.array(roles));
+        let resource = Map<string, json.JsonValue>(4, string.hash);
+        resource.set("id", json.str(sig(body, "ptResource")));
+        resource.set("classification", json.str(sig(body, "ptClass")));
+        let input = Map<string, json.JsonValue>(8, string.hash);
+        input.set("subject", json.object(subject));
+        input.set("resource", json.object(resource));
+        input.set("operation", json.str(sig(body, "ptOp")));
+        return await renderTest(self.repo, tenant, self.app, json.object(input));
+    }
+}
+
+async fn renderTest(repo: RuleRepository, tenant: string, app: AppContext, input: json.JsonValue): Response {
+    let rules = await policyrules.activeRuleJson(repo, tenant);
+    let decision = rego.evaluate(rules, input, app.trustCfg.defaultVerdict);
+    let verdict = "";
+    let ruleId = "";
+    if (decision.kind == 5) {
+        verdict = json.asString(json.get(decision, "verdict")) ?? "";
+        ruleId = json.asString(json.get(decision, "rule_id")) ?? "";
+    }
+    if (verdict.length == 0) { verdict = app.trustCfg.defaultVerdict; }
+    return await renderPanelFull(repo, tenant, "", verdict, ruleId, "{}");
+}
+
+pub struct PolicySaveHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PolicySaveHandler, ctx: routing.Context): Response {
+        let tenant = plTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = sig(body, "plName");
+        if (name.length == 0) { return await renderPanel(self.repo, tenant, "{\"plErr\":\"Name is required.\"}"); }
+        let desc = sig(body, "plDesc");
+        let verdict = sig(body, "plVerdict"); if (verdict.length == 0) { verdict = "deny"; }
+        let resource = sig(body, "plResource");
+        let operation = sig(body, "plOperation");
+        let approver = sig(body, "plApprover");
+        let priority = string.parseInt(sig(body, "plPriority")) ?? 100;
+        let enabled = readBool(body, "plEnabled");
+        let id = sig(body, "plId");
+        let now = Http.nowMs();
+        if (id.length == 0) {
+            let _ = await self.repo.add(tenant, name, desc, "{}", resource, operation, "{}", "{}", approver, verdict, "[]", enabled, priority, now);
+        } else {
+            await self.repo.update(id, tenant, name, desc, "{}", resource, operation, "{}", "{}", approver, verdict, "[]", enabled, priority, now);
+        }
+        return await renderPanel(self.repo, tenant,
+            "{\"plModal\":\"\",\"plErr\":\"\",\"plId\":\"\",\"plName\":\"\",\"plDesc\":\"\",\"plVerdict\":\"deny\",\"plResource\":\"\",\"plOperation\":\"\",\"plApprover\":\"\",\"plPriority\":\"100\",\"plEnabled\":true}");
+    }
+}
+
+pub struct PolicyDeleteHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: PolicyDeleteHandler, ctx: routing.Context): Response {
+        let tenant = plTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "plId");
+        if (id.length > 0) { await self.repo.remove(id, tenant); }
+        return await renderPanel(self.repo, tenant, "{\"plModal\":\"\",\"plErr\":\"\"}");
+    }
+}

@@ -1,0 +1,8 @@
+// Overview feature route table. Only registration lives here.
+import web.app;
+import Shared.AppContext;
+import Features.Overview.Overview.handler;
+
+pub fn registerOverview(ctx: AppContext): void {
+    ctx.app.get("/overview", OverviewHandler(ctx));
+}

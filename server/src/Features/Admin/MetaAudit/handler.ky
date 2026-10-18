@@ -1,0 +1,30 @@
+// POST /admin/meta -> {"ok":false,"detail":"meta-audit not configured"} (no meta-ledger).
+// GET /meta-audit -> {"configured":false}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct RecordMetaHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: RecordMetaHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(false));
+        m.set("detail", json.str("meta-audit not configured"));
+        return Http.okObj(m);
+    }
+}
+
+pub struct MetaAuditHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: MetaAuditHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(1, string.hash);
+        m.set("configured", json.bool(false));
+        return Http.okObj(m);
+    }
+}

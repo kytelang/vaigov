@@ -1,0 +1,30 @@
+// POST /groups {name} -> {"ok":true,"name":...}. Mirrors acp group_register
+// (stored under control_state key "groupreg:<name>").
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Principals.Shared.PrincipalRepository;
+import Features.Apps.CreateApp.handler;
+
+pub struct RegisterGroupHandler impl RouteHandler {
+    repo: PrincipalRepository,
+    app: AppContext,
+    init(repo: PrincipalRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: RegisterGroupHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.RegisterAgent)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let name = string.trim(bodyStr(body, "name"));
+        if (name.length == 0) { return okFalse("group name is required"); }
+        await self.repo.putState(string.concat("groupreg:", name), name, Http.nowMs());
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("name", json.str(name));
+        return Http.okObj(m);
+    }
+}

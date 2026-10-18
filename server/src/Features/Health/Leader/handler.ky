@@ -1,0 +1,19 @@
+// GET /leader -> leader status (single-node: always the leader).
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+
+pub struct LeaderHandler impl RouteHandler {
+    app: AppContext,
+    init(app: AppContext) { self.app = app; }
+    async fn serve(self: LeaderHandler, ctx: routing.Context): response.Response {
+        let m = Map<string, json.JsonValue>(4, string.hash);
+        m.set("leader", json.bool(true));
+        m.set("node", json.str(self.app.trustCfg.tenant));
+        return Http.okObj(m);
+    }
+}

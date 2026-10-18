@@ -1,0 +1,148 @@
+// Content-firewall rule authoring view (KYX + Datastar). The control plane is
+// where content rules are authored; the edge sidecar only enforces them. This
+// screen lists the tenant's rules, toggles/edits/deletes them, and has a "test"
+// box that runs a rule against sample text server-side (shared cfmatch, so the
+// preview matches what the edge enforces). Shell-level signals (cr*) carry the
+// modal/form state; buttons @post first-party /console/content-rules/* handlers.
+import list;
+import string;
+import Domain.Dtos.ContentRuleRow;
+
+fn jsq(s: string): string {
+    let a = string.replace(s, "\\", "\\\\");
+    return string.replace(a, "'", "\\'");
+}
+
+fn verdictOf(action: string): string {
+    if (string.eql(action, "block")) { return "deny"; }
+    if (string.eql(action, "step_up")) { return "step-up"; }
+    return "shadow";
+}
+
+fn ruleRow(r: ContentRuleRow): Html {
+    let en = r.enabled != 0;
+    let openEdit = "$crId='" + jsq(r.id) + "'; $crName='" + jsq(r.name)
+        + "'; $crKind='" + jsq(r.kind) + "'; $crPattern='" + jsq(r.pattern)
+        + "'; $crThreshold='" + `${r.threshold}` + "'; $crTarget='" + jsq(r.target)
+        + "'; $crAction='" + jsq(r.action) + "'; $crSeverity='" + jsq(r.severity)
+        + "'; $crErr=''; $crTest=''; $crTestResult=''; $crModal='open'";
+    let toggleExpr = string.concat(string.concat("$crId='", jsq(r.id)), "'; @post('/console/content-rules/toggle')");
+    let delExpr = string.concat(string.concat("$crId='", jsq(r.id)), "'; @post('/console/content-rules/delete')");
+    let stateCls = if (en) ("text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-ok")
+        else ("text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-muted");
+    return <tr class="border-b border-line align-top">
+        <td class="py-2 pr-4"><button class="text-accent hover:underline" data-on:click={openEdit}>{r.name}</button></td>
+        <td class="py-2 pr-4 text-xs font-mono">{r.kind}</td>
+        <td class="py-2 pr-4 text-xs font-mono text-dim">{if (r.pattern.length > 0) { r.pattern; } else { <span>-</span>; }}</td>
+        <td class="py-2 pr-4 text-xs">{verdictOf(r.action)}</td>
+        <td class="py-2 pr-4 text-xs">{r.severity}</td>
+        <td class="py-2 pr-4"><button data-on:click={toggleExpr}><span class={stateCls}>{if (en) { "enabled"; } else { "disabled"; }}</span></button></td>
+        <td class="py-2 pr-4 text-right whitespace-nowrap">
+            <button class="text-xs text-dim hover:text-txt mr-3" data-on:click={openEdit}>Edit</button>
+            <button class="text-xs text-bad hover:underline" data-on:click={delExpr}>Delete</button>
+        </td>
+    </tr>;
+}
+
+pub fn contentRulesPanel(rows: list.List<ContentRuleRow>): Html {
+    return <div id="contentrules" class="grid gap-4">
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-panel2 text-accent">{`${rows.size()} rules`}</span>
+            <span class="text-dim text-sm">Deterministic content checks enforced at the edge over request bodies. Authored here, signed, and pulled by the sidecar.</span>
+            <div class="ml-auto">
+                <button class="rounded-lg bg-accent text-white px-3.5 py-1.5 text-sm font-medium hover:opacity-90"
+                    data-on:click="$crId=''; $crName=''; $crKind='substr'; $crPattern=''; $crThreshold='0'; $crTarget='request'; $crAction='shadow'; $crSeverity='medium'; $crErr=''; $crTest=''; $crTestResult=''; $crModal='open'">Add rule</button>
+            </div>
+        </div>
+        <div data-show="$crErr != ''" class="text-bad text-sm" data-text="$crErr"></div>
+
+        <div class="bg-panel border border-line rounded-xl">
+            <div class="px-5 py-3 border-b border-line">
+                <h2 class="font-semibold text-txt">Content firewall rules</h2>
+                <p class="text-xs text-dim">block (deny), step_up, or shadow (record-only, trial). New rules default to shadow.</p>
+            </div>
+            <div class="px-5 py-4 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-[11px] uppercase tracking-wider text-muted">
+                            <th class="py-2 pr-4">Name</th>
+                            <th class="py-2 pr-4">Kind</th>
+                            <th class="py-2 pr-4">Pattern</th>
+                            <th class="py-2 pr-4">Verdict</th>
+                            <th class="py-2 pr-4">Severity</th>
+                            <th class="py-2 pr-4">State</th>
+                            <th class="py-2 pr-4"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {for (i in 0..rows.size()) { ruleRow(rows.at(i)); }}
+                        {if (rows.size() == 0) {
+                            <tr><td colspan="7" class="py-10 text-center text-dim">No content rules yet. Add one (for example a "secret" rule) to start inspecting prompts.</td></tr>;
+                        }}
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-3 border-t border-line">
+                <p class="text-xs text-dim">The sidecar pulls the enabled rules as a signed set and enforces them via its ext_authz content check.</p>
+            </div>
+        </div>
+
+        <div data-show="$crModal === 'open'" class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-panel border border-line rounded-2xl p-6 w-full max-w-lg">
+                <h3 class="font-semibold text-txt" data-text="$crId == '' ? 'Add rule' : 'Edit rule'">Add rule</h3>
+                <div class="grid gap-3 mt-4">
+                    <label class="text-xs text-dim">Name<input type="text" data-bind="crName" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="Secret in prompt" /></label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <label class="text-xs text-dim">Kind
+                            <select data-bind="crKind" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                                <option value="substr">substr (denylist)</option>
+                                <option value="regex">regex</option>
+                                <option value="secret">secret</option>
+                                <option value="pii">pii</option>
+                                <option value="size">size</option>
+                            </select>
+                        </label>
+                        <label class="text-xs text-dim">Action
+                            <select data-bind="crAction" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                                <option value="shadow">shadow (record only)</option>
+                                <option value="block">block (deny)</option>
+                                <option value="step_up">step_up</option>
+                            </select>
+                        </label>
+                    </div>
+                    <label class="text-xs text-dim">Pattern / selector<input type="text" data-bind="crPattern" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm font-mono" placeholder="any | email | card | sk- | ignore all previous instructions" /></label>
+                    <div class="grid grid-cols-3 gap-3">
+                        <label class="text-xs text-dim">Threshold (size)<input type="number" data-bind="crThreshold" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" /></label>
+                        <label class="text-xs text-dim">Target
+                            <select data-bind="crTarget" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                                <option value="request">request</option>
+                                <option value="response">response</option>
+                                <option value="both">both</option>
+                            </select>
+                        </label>
+                        <label class="text-xs text-dim">Severity
+                            <select data-bind="crSeverity" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm">
+                                <option value="low">low</option>
+                                <option value="medium">medium</option>
+                                <option value="high">high</option>
+                                <option value="critical">critical</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div class="border-t border-line pt-3">
+                        <label class="text-xs text-dim">Test against sample text<input type="text" data-bind="crTest" class="mt-1 block w-full bg-panel2 border border-line rounded-md px-2 py-1.5 text-sm" placeholder="paste a sample prompt to see if this rule matches" /></label>
+                        <div class="flex items-center gap-3 mt-2">
+                            <button class="rounded-lg border border-line2 px-3 py-1.5 text-xs hover:bg-panel2" data-on:click="@post('/console/content-rules/test')">Test rule</button>
+                            <span class="text-xs" data-text="$crTestResult"></span>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-2 pt-1">
+                        <button class="rounded-lg border border-line2 px-4 py-2 text-sm hover:bg-panel2" data-on:click="$crModal=''">Cancel</button>
+                        <button class="rounded-lg bg-accent text-white px-4 py-2 text-sm font-medium hover:opacity-90"
+                            data-on:click="@post('/console/content-rules/save')" data-text="$crId == '' ? 'Add' : 'Save'">Add</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>;
+}

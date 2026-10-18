@@ -1,0 +1,12 @@
+// Shared policy helpers.
+import list;
+import serde.json;
+
+// Pull a JSON array of rules out of a body (accepts {rules:[...]} or a bare array).
+pub fn rulesOf(body: json.JsonValue): List<json.JsonValue> | undefined {
+    if (body.kind == 4) { return json.asArray(body); }
+    if (body.kind == 5 && json.has(body, "rules")) {
+        return json.asArray(json.get(body, "rules"));
+    }
+    return undefined;
+}

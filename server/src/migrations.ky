@@ -1,0 +1,178 @@
+import data.migrate;
+import list;
+
+// The ordered, expand-only schema migrations this app owns (Postgres). They ship
+// inside the binary and the orchestrator applies them via `app --migrate` before
+// rolling out new code. Each feature's tables are appended here as the feature
+// lands. Keep every migration EXPAND-ONLY (add tables/nullable columns/indexes).
+pub fn all(): list.List<migrate.Migration> {
+    let ms = list.List<migrate.Migration>();
+    ms.push(migrate.migration(
+        1,
+        "create_agents",
+        migrate.table("agents")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("app_id", "TEXT", "NOT NULL DEFAULT ''")
+            .column("name", "TEXT", "NOT NULL")
+            .column("owner", "TEXT", "NOT NULL DEFAULT ''")
+            .column("metadata_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("active", "BOOLEAN", "NOT NULL DEFAULT TRUE")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("agents")));
+    ms.push(migrate.migration(
+        2,
+        "create_apps",
+        migrate.table("apps")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("name", "TEXT", "NOT NULL")
+            .column("owner", "TEXT", "NOT NULL DEFAULT ''")
+            .column("metadata_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("apps")));
+    ms.push(migrate.migration(
+        3,
+        "create_models",
+        migrate.table("models")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("name", "TEXT", "NOT NULL")
+            .column("provider", "TEXT", "NOT NULL DEFAULT ''")
+            .column("version", "TEXT", "NOT NULL DEFAULT ''")
+            .column("card_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("scan_status", "TEXT", "NOT NULL DEFAULT 'pending'")
+            .column("aibom_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("models")));
+    ms.push(migrate.migration(
+        4,
+        "create_vendors",
+        migrate.table("vendors")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("name", "TEXT", "NOT NULL")
+            .column("risk_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("review_due_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("vendors")));
+    ms.push(migrate.migration(
+        5,
+        "create_principals",
+        migrate.table("principals")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("display", "TEXT", "NOT NULL")
+            .column("source", "TEXT", "NOT NULL DEFAULT 'manual'")
+            .column("groups_json", "TEXT", "NOT NULL DEFAULT '[]'")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("principals")));
+    ms.push(migrate.migration(
+        6,
+        "create_grc",
+        migrate.table("grc")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("kind", "TEXT", "NOT NULL DEFAULT ''")
+            .column("subject", "TEXT", "NOT NULL DEFAULT ''")
+            .column("title", "TEXT", "NOT NULL DEFAULT ''")
+            .column("status", "TEXT", "NOT NULL DEFAULT 'open'")
+            .column("body", "TEXT", "NOT NULL DEFAULT ''")
+            .column("operator", "TEXT", "NOT NULL DEFAULT ''")
+            .column("assignee", "TEXT", "NOT NULL DEFAULT ''")
+            .column("stage", "TEXT", "NOT NULL DEFAULT 'triage'")
+            .column("linked_refs", "TEXT", "NOT NULL DEFAULT '[]'")
+            .column("answers_json", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("due_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("grc")));
+    ms.push(migrate.migration(
+        7,
+        "create_evidence",
+        migrate.table("evidence")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("system_id", "TEXT", "NOT NULL DEFAULT ''")
+            .column("framework", "TEXT", "NOT NULL DEFAULT ''")
+            .column("control_id", "TEXT", "NOT NULL DEFAULT ''")
+            .column("title", "TEXT", "NOT NULL")
+            .column("source", "TEXT", "NOT NULL DEFAULT ''")
+            .column("owner", "TEXT", "NOT NULL DEFAULT ''")
+            .column("produced_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .column("valid_until_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .column("artefact_ref", "TEXT", "NOT NULL DEFAULT ''")
+            .column("note", "TEXT", "NOT NULL DEFAULT ''")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("evidence")));
+    ms.push(migrate.migration(
+        8,
+        "create_redteam_runs",
+        migrate.table("redteam_runs")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("target", "TEXT", "NOT NULL DEFAULT ''")
+            .column("status", "TEXT", "NOT NULL DEFAULT 'done'")
+            .column("total", "INTEGER", "NOT NULL DEFAULT 0")
+            .column("passed", "INTEGER", "NOT NULL DEFAULT 0")
+            .column("failed", "INTEGER", "NOT NULL DEFAULT 0")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("redteam_runs")));
+    ms.push(migrate.migration(
+        9,
+        "create_monitor_events",
+        migrate.table("monitor_events")
+            .column("id", "TEXT", "PRIMARY KEY DEFAULT gen_random_uuid()::text")
+            .column("kind", "TEXT", "NOT NULL DEFAULT ''")
+            .column("pep", "TEXT", "NOT NULL DEFAULT ''")
+            .column("agent", "TEXT", "NOT NULL DEFAULT ''")
+            .column("detail", "TEXT", "NOT NULL DEFAULT ''")
+            .column("severity", "TEXT", "NOT NULL DEFAULT 'info'")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("ts_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("monitor_events")));
+    // Content-firewall rules (authored centrally, pulled+signed to the edge).
+    // Version 1001: the shared `acp` DB already records acp-server's own
+    // migrations 1..N, so a Kyte-owned table must use a high, collision-free id.
+    ms.push(migrate.migration(
+        1001,
+        "create_content_rules",
+        migrate.table("content_rules")
+            .column("id", "TEXT", "PRIMARY KEY")
+            .column("tenant", "TEXT", "NOT NULL DEFAULT 'default'")
+            .column("name", "TEXT", "NOT NULL DEFAULT ''")
+            .column("kind", "TEXT", "NOT NULL DEFAULT 'substr'")
+            .column("pattern", "TEXT", "NOT NULL DEFAULT ''")
+            .column("threshold", "INTEGER", "NOT NULL DEFAULT 0")
+            .column("target", "TEXT", "NOT NULL DEFAULT 'request'")
+            .column("action", "TEXT", "NOT NULL DEFAULT 'shadow'")
+            .column("severity", "TEXT", "NOT NULL DEFAULT 'medium'")
+            .column("controls_json", "TEXT", "NOT NULL DEFAULT '[]'")
+            .column("enabled", "INTEGER", "NOT NULL DEFAULT 1")
+            .column("updated_ms", "BIGINT", "NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("content_rules")));
+    ms.push(migrate.migration(
+        1002,
+        "create_approvals",
+        migrate.table("approvals")
+            .column("id", "TEXT", "PRIMARY KEY")
+            .column("session", "TEXT", "NOT NULL DEFAULT ''")
+            .column("principal", "TEXT", "NOT NULL DEFAULT ''")
+            .column("tool", "TEXT", "NOT NULL DEFAULT ''")
+            .column("arg_hash", "TEXT", "NOT NULL DEFAULT ''")
+            .column("presented", "TEXT", "NOT NULL DEFAULT '{}'")
+            .column("state", "TEXT", "NOT NULL DEFAULT 'pending'")
+            .column("approver", "TEXT", "NOT NULL DEFAULT ''")
+            .column("created_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .column("expires_ms", "BIGINT", "NOT NULL DEFAULT 0")
+            .toSqlIfNotExists(),
+        migrate.dropTableSql("approvals")));
+    return ms;
+}

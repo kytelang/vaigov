@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Varman Content Firewall (test)",
+  "version": "0.1.0",
+  "description": "Routes AI-chat prompts through the local Varman content firewall (/cf/check) and blocks policy violations in the browser before they leave.",
+  "host_permissions": ["http://127.0.0.1:8899/*"],
+  "background": { "service_worker": "sw.js" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*",
+        "https://claude.ai/*"
+      ],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*",
+        "https://claude.ai/*"
+      ],
+      "js": ["hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

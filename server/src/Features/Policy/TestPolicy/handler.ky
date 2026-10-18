@@ -1,0 +1,33 @@
+// POST /policy/test -> evaluate an input through the tenant's rules in-process and
+// return the self-describing decision OPA would produce. {ok, decision, input}.
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Features.Policy.Shared.policyrules;
+import Features.Rules.Shared.RuleRepository;
+import Shared.AppContext;
+import Shared.Http;
+import web.routing;
+import web.response;
+import web.status;
+
+pub struct TestHandler impl RouteHandler {
+    repo: RuleRepository,
+    app: AppContext,
+    init(repo: RuleRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: TestHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let body = Http.bodyJson(ctx);
+        let input = if (body.kind == 5 && json.has(body, "input")) (json.get(body, "input")) else (body);
+        let rules = await policyrules.activeRuleJson(self.repo, tenant);
+        let decision = rego.evaluate(rules, input, self.app.trustCfg.defaultVerdict);
+        let m = Map<string, json.JsonValue>(8, string.hash);
+        m.set("ok", json.bool(true));
+        m.set("decision", decision);
+        m.set("input", input);
+        return Http.okObj(m);
+    }
+}

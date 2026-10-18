@@ -1,0 +1,85 @@
+// EvidenceRepository: the `ingested_evidence` + `artifacts` / `artifact_versions`
+// tables in the shared `acp` Postgres db. SQL mirrors acp-server store.rs.
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.IngestedRow;
+
+pub struct EvidenceRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    // Idempotent: true only when a NEW row was inserted (dedup by decision_id).
+    pub async fn addIngested(self: EvidenceRepository, decisionId: string, pep: string, kind: string, verdict: string, record: string, operator: string, createdMs: long, pubkeyHex: string, sigHex: string): bool {
+        let conn = await self.db.pool.acquire();
+        let probe = list.List<DbValue>();
+        probe.push(db.dbText(decisionId));
+        let ex = await Repository<IngestedProbe>(conn, "ingested_evidence").query("SELECT 1 AS one FROM ingested_evidence WHERE decision_id = $1", probe);
+        if (ex.items.size() > 0) { self.db.pool.release(conn); return false; }
+        let p = list.List<DbValue>();
+        p.push(db.dbText(decisionId)); p.push(db.dbText(pep)); p.push(db.dbText(kind)); p.push(db.dbText(verdict));
+        p.push(db.dbText(record)); p.push(db.dbText(operator)); p.push(db.dbLong(createdMs)); p.push(db.dbText(pubkeyHex)); p.push(db.dbText(sigHex));
+        let _r = await conn.exec("INSERT INTO ingested_evidence(decision_id,pep,kind,verdict,record,operator,created_ms,pubkey_hex,sig_hex) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", p);
+        self.db.pool.release(conn);
+        return true;
+    }
+
+    pub async fn listIngested(self: EvidenceRepository, limit: int): Rows<IngestedRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbInt(limit));
+        let r = await Repository<IngestedRow>(conn, "ingested_evidence").query(
+            "SELECT decision_id, pep, kind, verdict, record, operator, created_ms, pubkey_hex, sig_hex FROM ingested_evidence ORDER BY created_ms DESC LIMIT $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn listArtifacts(self: EvidenceRepository, tenant: string, kind: string): Rows<ArtifactRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant)); p.push(db.dbText(kind));
+        let r = await Repository<ArtifactRow>(conn, "artifacts").query(
+            "SELECT artifact_id, kind, name, scope, active_version, baseline_version, (SELECT count(*) FROM artifact_versions v WHERE v.artifact_id = a.artifact_id) AS versions, updated_ms FROM artifacts a WHERE tenant_id = $1 AND kind = $2 ORDER BY name", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn listVersions(self: EvidenceRepository, artifactId: string): Rows<ArtifactVersionRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(artifactId));
+        let r = await Repository<ArtifactVersionRow>(conn, "artifact_versions").query(
+            "SELECT version_id, version_no, author, note, status, created_ms FROM artifact_versions WHERE artifact_id = $1 ORDER BY version_no DESC", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Returns true when the version belongs to the artifact and the pointer was moved.
+    pub async fn setPointer(self: EvidenceRepository, artifactId: string, which: string, versionId: string, nowMs: long): bool {
+        let conn = await self.db.pool.acquire();
+        let probe = list.List<DbValue>();
+        probe.push(db.dbText(versionId)); probe.push(db.dbText(artifactId));
+        let ex = await Repository<IngestedProbe>(conn, "artifact_versions").query("SELECT 1 AS one FROM artifact_versions WHERE version_id = $1 AND artifact_id = $2", probe);
+        if (ex.items.size() == 0) { self.db.pool.release(conn); return false; }
+        let col = if (string.eql(which, "baseline")) ("baseline_version") else ("active_version");
+        let sql = string.concat(string.concat("UPDATE artifacts SET ", col), " = $1, updated_ms = $2 WHERE artifact_id = $3");
+        let p = list.List<DbValue>();
+        p.push(db.dbText(versionId)); p.push(db.dbLong(nowMs)); p.push(db.dbText(artifactId));
+        let _r = await conn.exec(sql, p);
+        self.db.pool.release(conn);
+        return true;
+    }
+
+    // Counts for the audit-pack summary.
+    pub async fn countIngested(self: EvidenceRepository): long {
+        let conn = await self.db.pool.acquire();
+        let r = await Repository<CountRow>(conn, "ingested_evidence").query("SELECT count(*) AS n FROM ingested_evidence", list.List<DbValue>());
+        self.db.pool.release(conn);
+        if (r.items.size() == 0) { return 0; }
+        return (r.items.getOr(0, CountRow{ n: 0 })).n;
+    }
+}
+
+@serializable pub struct CountRow { pub n: long }

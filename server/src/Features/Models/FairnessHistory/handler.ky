@@ -1,0 +1,77 @@
+// GET /models/{id}/fairness/history -> prior fairness runs for a model, oldest
+// first, with the worst parity gap per run and a drift flag when the latest run's
+// gap rose materially over the previous one (acp model_fairness_history).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Features.Models.Shared.ModelRepository;
+import Features.Models.Shared.modeljson;
+import Domain.Dtos.GrcAttestationRow;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+
+pub struct ModelFairnessHistoryHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ModelFairnessHistoryHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Capability.Export)) { return Http.forbidden(); }
+        let th = ctx.request.getHeader("x-acp-tenant");
+        let tenant = if (th == undefined) (self.app.trustCfg.tenant) else (th ?? "");
+        let id = ctx.param("id");
+        let recs = await self.repo.attestations(tenant);
+
+        let runs = list.List<json.JsonValue>();
+        let gaps = list.List<double>();
+        let i = 0;
+        while (i < recs.items.size()) {
+            let r = recs.items.getOr(i, GrcAttestationRow{ id: "", subject: "", title: "", status: "", body: "", created_ms: 0 });
+            if (string.eql(r.subject, id) && string.startsWith(r.title, "Fairness test")) {
+                let rep = json.tryParse(r.body);
+                if (rep != undefined) {
+                    let repv = rep ?? json.null();
+                    let dp = json.asFloat(json.get(repv, "demographic_parity_gap")) ?? 0.0;
+                    let eo = json.asFloat(json.get(repv, "equal_opportunity_gap")) ?? 0.0;
+                    let acc = json.asFloat(json.get(repv, "overall_accuracy")) ?? 0.0;
+                    let maxGap = if (dp > eo) (dp) else (eo);
+                    gaps.push(maxGap);
+                    let run = Map<string, json.JsonValue>(8, string.hash);
+                    run.set("id", json.str(r.id));
+                    run.set("ts_ms", json.number(r.created_ms));
+                    run.set("status", json.str(r.status));
+                    run.set("demographic_parity_gap", jnum(dp));
+                    run.set("equal_opportunity_gap", jnum(eo));
+                    run.set("overall_accuracy", jnum(acc));
+                    run.set("max_gap", jnum(maxGap));
+                    runs.push(json.object(run));
+                }
+            }
+            i = i + 1;
+        }
+
+        // Drift: the latest worst-gap rose by more than the tolerance over the previous run.
+        let tolerance = 0.05;
+        let drifted = false;
+        if (gaps.size() >= 2) {
+            let last = gaps.at(gaps.size() - 1);
+            let prev = gaps.at(gaps.size() - 2);
+            if (last - prev > tolerance) { drifted = true; }
+        }
+        let latest = if (runs.size() > 0) (runs.at(runs.size() - 1)) else (json.null());
+
+        let out = Map<string, json.JsonValue>(8, string.hash);
+        out.set("ok", json.bool(true));
+        out.set("model", json.str(id));
+        out.set("count", json.number(runs.size() as long));
+        out.set("runs", json.array(runs));
+        out.set("latest", latest);
+        out.set("drifted", json.bool(drifted));
+        out.set("tolerance", jnum(tolerance));
+        return Http.okObj(out);
+    }
+}

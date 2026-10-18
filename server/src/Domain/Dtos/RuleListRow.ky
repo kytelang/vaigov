@@ -1,0 +1,27 @@
+// A policy_rules row, selected for GET /rules. Field names match the acp SELECT
+// columns exactly so Repository<T> binds them. The *_json columns are TEXT and
+// are parsed into embedded JSON by the handler to match acp's rule JSON.
+@serializable pub struct RuleListRow {
+    pub rule_id: string,
+    pub name: string,
+    pub description: string,
+    pub subject_json: string,
+    pub resource: string,
+    pub operation: string,
+    pub condition_json: string,
+    pub match_json: string,
+    pub approver_group: string,
+    pub verdict: string,
+    pub obligations_json: string,
+    pub enabled: int,
+    pub priority: int,
+    pub updated_ms: long,
+}
+
+// A rule_controls JOIN row (rc.item_id, c.control_id, a.slug) for the controls a
+// rule satisfies.
+@serializable pub struct RuleControlRow {
+    pub item_id: string,
+    pub control_id: string,
+    pub slug: string,
+}

@@ -1,0 +1,34 @@
+// GET /orgs -> {"orgs":[{tenant_id,org_name,onboarded}]}.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Admin.Shared.AdminRepository;
+
+pub struct OrgsHandler impl RouteHandler {
+    repo: AdminRepository,
+    app: AppContext,
+    init(repo: AdminRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: OrgsHandler, ctx: routing.Context): response.Response {
+        let rows = await self.repo.orgs();
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let o = rows.items.getOr(i, OrgRow{ tenant_id: "", org_name: "", onboarded: 0 });
+            let om = Map<string, json.JsonValue>(4, string.hash);
+            om.set("tenant_id", json.str(o.tenant_id));
+            om.set("org_name", json.str(o.org_name));
+            om.set("onboarded", json.bool(o.onboarded != 0));
+            arr.push(json.object(om));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("orgs", json.array(arr));
+        return Http.okObj(m);
+    }
+}

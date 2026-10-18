@@ -1,0 +1,99 @@
+//! The decision-to-record evaluation path.
+//!
+//! A port of how the Rust proxy turns an intercepted tool call plus its resolved
+//! policy `Decision` into one evidence `Record` (the leaf that the ledger
+//! appends). The Rust `ActionContext` (`types.rs`) carries everything known at
+//! the decision point, including the raw argument JSON; the `Record` it produces
+//! never stores those raw args, only their SHA-256 (`args_hash`), while the full
+//! payload goes to the separately-purgeable `args_blob` table. This module
+//! reproduces that split: [`ActionContext`] keeps the live `args` as a
+//! `serde.json.JsonValue`, and [`recordFromDecision`] hashes them through the
+//! canonical encoder to fill `args_hash`.
+//!
+//! The field mapping is mechanical and matches the Rust `Record` assembly:
+//!
+//!   - from the context:  agent_id, principal, session_id, tool, args_hash
+//!   - from the decision:  verdict, rule_id, matched, policy_hash, reason, impact
+//!   - from the caller:    seq, ts_ms, hlc, provenance
+//!   - fixed:              schema = 1
+//!
+//! Two faithful simplifications are called out:
+//!
+//!   - `tool_server_fingerprint` is set to `undefined` here. In Rust it is the
+//!     verified identity of the launched/dialled tool server, which is known on
+//!     the transport path, not at this pure assembly point; a caller that has it
+//!     can set it on the returned record.
+//!   - `impact` is taken from the `Decision` (the evaluated impact the policy
+//!     engine resolved), which in the Rust pipeline equals the impact the proxy
+//!     scored into the `ActionContext`. The context keeps its own `impact` so a
+//!     caller that wants the pre-evaluation score still has it.
+
+import string;
+import types;
+import canonical;
+import serde.json;
+
+/// Everything known about a single intercepted tool call at the decision point.
+///
+/// A faithful port of Rust `types::ActionContext`. Unlike the stored `Record`,
+/// this keeps the raw arguments live (`args`, a JSON value) so the evaluator can
+/// both hash them (for the record) and hand them to the `args_blob` store.
+pub struct ActionContext {
+    pub agentId: string,
+    pub principal: types.Principal,
+    pub sessionId: string,
+    pub tool: string,
+    /// Raw tool arguments as received (a JSON object).
+    pub args: json.JsonValue,
+    /// The proxy-scored impact for this call (`BlastRadius` + taxonomy version).
+    pub impact: types.Impact,
+
+    init(agentId: string, principal: types.Principal, sessionId: string, tool: string, args: json.JsonValue, impact: types.Impact) {
+        self.agentId = agentId;
+        self.principal = principal;
+        self.sessionId = sessionId;
+        self.tool = tool;
+        self.args = args;
+        self.impact = impact;
+    }
+}
+
+/// SHA-256 (hex) of the canonical bytes of a context's arguments. This is
+/// exactly the value stored in `Record.argsHash`, and is equal to
+/// `canonical.sha256HexOfJson(ctx.args)`; exposed on its own so a caller can
+/// derive the `args_blob` key without building a whole record.
+pub fn argsHashOf(ctx: ActionContext): string {
+    return canonical.sha256HexOfJson(ctx.args);
+}
+
+/// Assembles the evidence `Record` for a decision.
+///
+/// `seq`, `tsMs`, `hlc`, and `provenance` are supplied by the caller (the ledger
+/// assigns the sequence, the clock stamps the time, the HLC comes from the
+/// cross-proxy clock, and provenance records the algorithms/evaluator in use).
+/// Everything else is pulled from `ctx` and `decision` per the mapping in the
+/// module header. `args_hash` is computed from the canonical bytes of
+/// `ctx.args`, so the raw arguments never enter the record.
+pub fn recordFromDecision(ctx: ActionContext, decision: types.Decision, seq: long, tsMs: long, hlc: string, provenance: types.Provenance): types.Record {
+    let argsHash = argsHashOf(ctx);
+    let noFingerprint: string | undefined = undefined;
+    return types.Record(
+        1,                      // schema (fixed, for mixed-fleet safety)
+        seq,
+        tsMs,
+        hlc,
+        noFingerprint,          // tool_server_fingerprint (set by the transport path)
+        ctx.agentId,
+        ctx.principal,
+        ctx.sessionId,
+        ctx.tool,
+        argsHash,
+        decision.impact,        // the resolved, evaluated impact
+        decision.verdict,
+        decision.ruleId,
+        decision.matched,
+        decision.policyHash,
+        decision.reason,
+        provenance
+    );
+}

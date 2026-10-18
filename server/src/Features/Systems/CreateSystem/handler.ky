@@ -1,0 +1,39 @@
+// POST /systems {name,purpose,owner,lifecycle_state,risk_tier,sector,asset_type,jurisdictions} -> {"ok":true,"id":"sys-.."}.
+import web.routing;
+import web.response;
+import string;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.Auth;
+import Features.Systems.Shared.SystemRepository;
+import Features.Systems.Shared.systemhelp;
+
+pub struct CreateSystemHandler impl RouteHandler {
+    repo: SystemRepository,
+    app: AppContext,
+    init(repo: SystemRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: CreateSystemHandler, ctx: routing.Context): response.Response {
+        if (!Http.requireCap(self.app, ctx, Auth.Capability.EditGrc)) { return Http.forbidden(); }
+        let body = Http.bodyJson(ctx);
+        let name = systemhelp.sysStr(body, "name");
+        if (name.length == 0) {
+            let e = Map<string, json.JsonValue>(2, string.hash);
+            e.set("ok", json.bool(false)); e.set("error", json.str("name is required"));
+            return Http.okObj(e);
+        }
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let lifecycle = systemhelp.sysStr(body, "lifecycle_state");
+        if (lifecycle.length == 0) { lifecycle = "development"; }
+        let id = string.concat("sys-", random.randomHex(6));
+        let now = Http.nowMs();
+        await self.repo.addSystem(id, name, systemhelp.sysStr(body, "purpose"), systemhelp.sysStr(body, "owner"), lifecycle, systemhelp.sysStr(body, "risk_tier"), systemhelp.sysStr(body, "sector"), systemhelp.sysStr(body, "asset_type"), systemhelp.sysJurText(body), tenant, now);
+        await self.repo.addAudit(string.concat("aud-", random.randomHex(6)), id, "system-created", "system", name, tenant, now);
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("ok", json.bool(true)); m.set("id", json.str(id));
+        return Http.okObj(m);
+    }
+}

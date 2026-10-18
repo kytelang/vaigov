@@ -1,0 +1,61 @@
+// GET /compliance/coverage -> {"rows":[{act,control_id,title,obligation_type,rules,decisions,denies,status}],
+//                              "summary":{authored,observed,gap,total}}
+// Mirrors acp coverage_matrix. The matrix itself is computed once in the shared
+// projection (Decisions/Shared/coverage.ky); this handler only serialises it to
+// the acp-compatible JSON shape. The console hypermedia view renders the SAME
+// projection as HTML (Decisions/CoverageView).
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Decisions.Shared.DecisionRepository;
+import Features.Decisions.Shared.coverage;
+
+fn strArr(xs: list.List<string>): json.JsonValue {
+    let out = list.List<json.JsonValue>();
+    let i = 0;
+    while (i < xs.size()) { out.push(json.str(xs.at(i))); i = i + 1; }
+    return json.array(out);
+}
+
+pub struct CoverageHandler impl RouteHandler {
+    app: AppContext,
+    repo: DecisionRepository,
+    init(app: AppContext) { self.app = app; self.repo = DecisionRepository(app.db); }
+
+    async fn serve(self: CoverageHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let data = await coverage.computeCoverage(self.repo, tenant);
+
+        let rows = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < data.rows.size()) {
+            let r = data.rows.at(i);
+            let rm = Map<string, json.JsonValue>(8, string.hash);
+            rm.set("act", json.str(r.act));
+            rm.set("control_id", json.str(r.controlId));
+            rm.set("title", json.str(r.title));
+            rm.set("obligation_type", json.str(r.obligationType));
+            rm.set("rules", strArr(r.rules));
+            rm.set("decisions", json.number(r.decisions));
+            rm.set("denies", json.number(r.denies));
+            rm.set("status", json.str(r.status));
+            rows.push(json.object(rm));
+            i = i + 1;
+        }
+
+        let sm = Map<string, json.JsonValue>(4, string.hash);
+        sm.set("authored", json.number(data.authored));
+        sm.set("observed", json.number(data.observed));
+        sm.set("gap", json.number(data.gap));
+        sm.set("total", json.number(data.total));
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("rows", json.array(rows));
+        m.set("summary", json.object(sm));
+        return Http.okObj(m);
+    }
+}

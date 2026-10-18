@@ -1,0 +1,221 @@
+//! Envoy configuration emission (CDS clusters + LDS listener) and per-host leaf
+//! certificate minting.
+//!
+//! The sidecar drives a firewall-agnostic Envoy as its data plane: a listener
+//! with a TLS inspector, one TLS-bump filter chain per registered AI host
+//! (terminate -> ext_authz to OPA -> forward upstream), and a default "splice"
+//! chain that transparently forwards any unregistered host without inspection.
+//!
+//! The emit functions here are pure (config + endpoint set -> YAML text), so a
+//! test can assert the generated shape without Envoy, OpenSSL, or disk.
+//! `writeConfig` is the side-effecting wrapper that mints certs and writes the
+//! files the live sidecar hot-reloads.
+
+import io.file;
+import io.dir;
+import process;
+import string;
+import list;
+
+/// Runs `cmd` with `args` to completion and returns its exit code.
+fn runToExit(cmd: string, args: list.List<string>): int {
+    let p = Process.spawn(cmd, args);
+    return p.wait();
+}
+
+/// One governed AI endpoint from the control plane's registry.
+pub struct Endpoint {
+    pub host: string,
+    pub port: int,
+    pub enabled: bool,
+
+    init(host: string, port: int, enabled: bool) {
+        self.host = host;
+        self.port = port;
+        self.enabled = enabled;
+    }
+}
+
+/// The Envoy cluster name for a host: `upstream_` + host with dots turned to
+/// underscores (`api.openai.com` -> `upstream_api_openai_com`).
+pub fn clusterName(host: string): string {
+    return "upstream_" + string.replace(host, ".", "_");
+}
+
+/// Splits an `addr` of the form `host:port` into its parts, using the given
+/// defaults when a part is missing.
+pub fn splitHostPort(addr: string, defHost: string, defPort: int): (string, int) {
+    let idx = string.lastIndexOf(addr, ":");
+    if (idx < 0) { return (addr, defPort); }
+    let h = string.slice(addr, 0, idx);
+    let p = string.parseInt(string.slice(addr, idx + 1, addr.length)) ?? defPort;
+    if (string.eql(h, "")) { h = defHost; }
+    return (h, p);
+}
+
+/// The enabled endpoints, sorted by host for a stable signature and output.
+pub fn enabledEndpoints(eps: list.List<Endpoint>): list.List<Endpoint> {
+    let out = list.List<Endpoint>();
+    let i = 0;
+    while (i < eps.size()) {
+        let e = eps.get(i) ?? Endpoint("", 443, false);
+        if (e.enabled) { out.push(e); }
+        i = i + 1;
+    }
+    // Insertion sort by host (small lists; keeps a deterministic order).
+    let a = 1;
+    while (a < out.size()) {
+        let cur = out.get(a) ?? Endpoint("", 443, false);
+        let b = a - 1;
+        while (b >= 0 && string.compare((out.get(b) ?? cur).host, cur.host) > 0) {
+            out.set(b + 1, out.get(b) ?? cur);
+            b = b - 1;
+        }
+        out.set(b + 1, cur);
+        a = a + 1;
+    }
+    return out;
+}
+
+/// A comma-joined `host:port` signature of the enabled set, used to detect when
+/// the registry changed and the config must be regenerated.
+pub fn signature(eps: list.List<Endpoint>): string {
+    let en = enabledEndpoints(eps);
+    let parts = list.List<string>();
+    let i = 0;
+    while (i < en.size()) {
+        let e = en.get(i) ?? Endpoint("", 443, false);
+        parts.push(`${e.host}:${e.port}`);
+        i = i + 1;
+    }
+    return string.join(parts, ",");
+}
+
+/// Emits the CDS resource document: the `opa` cluster (HTTP/2 gRPC), the
+/// `dyn_forward` dynamic-forward-proxy cluster for splicing, and one upstream
+/// TLS cluster per registered host.
+pub fn emitCds(opaAddr: string, contentAddr: string, eps: list.List<Endpoint>): string {
+    let (opaH, opaP) = splitHostPort(opaAddr, "127.0.0.1", 9191);
+    let sb = "resources:\n";
+    sb = sb + "- \"@type\": type.googleapis.com/envoy.config.cluster.v3.Cluster\n  name: opa\n  connect_timeout: 1s\n  type: STRICT_DNS\n  typed_extension_protocol_options:\n    envoy.extensions.upstreams.http.v3.HttpProtocolOptions:\n      \"@type\": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\n      explicit_http_config: { http2_protocol_options: {} }\n  load_assignment:\n    cluster_name: opa\n    endpoints:\n    - lb_endpoints:\n      - endpoint: { address: { socket_address: { address: " + opaH + ", port_value: " + `${opaP}` + " } } }\n";
+    // The content-firewall inspector cluster (HTTP/1.1 to the sidecar itself),
+    // emitted only when the firewall is wired.
+    if (!string.eql(contentAddr, "")) {
+        let (ch, cp) = splitHostPort(contentAddr, "127.0.0.1", 8899);
+        sb = sb + "- \"@type\": type.googleapis.com/envoy.config.cluster.v3.Cluster\n  name: content\n  connect_timeout: 1s\n  type: STRICT_DNS\n  load_assignment:\n    cluster_name: content\n    endpoints:\n    - lb_endpoints:\n      - endpoint: { address: { socket_address: { address: " + ch + ", port_value: " + `${cp}` + " } } }\n";
+    }
+    sb = sb + "- \"@type\": type.googleapis.com/envoy.config.cluster.v3.Cluster\n  name: dyn_forward\n  lb_policy: CLUSTER_PROVIDED\n  cluster_type:\n    name: envoy.clusters.dynamic_forward_proxy\n    typed_config:\n      \"@type\": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig\n      dns_cache_config: { name: dyn, dns_lookup_family: V4_ONLY }\n";
+    let en = enabledEndpoints(eps);
+    let i = 0;
+    while (i < en.size()) {
+        let e = en.get(i) ?? Endpoint("", 443, false);
+        let cl = clusterName(e.host);
+        sb = sb + "- \"@type\": type.googleapis.com/envoy.config.cluster.v3.Cluster\n  name: " + cl + "\n  connect_timeout: 5s\n  type: LOGICAL_DNS\n  dns_lookup_family: V4_ONLY\n  load_assignment:\n    cluster_name: " + cl + "\n    endpoints:\n    - lb_endpoints:\n      - endpoint: { address: { socket_address: { address: " + e.host + ", port_value: " + `${e.port}` + " } } }\n  transport_socket:\n    name: envoy.transport_sockets.tls\n    typed_config:\n      \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext\n      sni: " + e.host + "\n";
+        i = i + 1;
+    }
+    return sb;
+}
+
+/// Emits one TLS-bump HTTP filter chain for `host`, terminating TLS with the
+/// host's leaf cert, running ext_authz against the `opa` cluster, and routing to
+/// the host's upstream cluster.
+fn bumpChain(certsDir: string, host: string, contentAddr: string): string {
+    let crt = `${certsDir}/${host}.crt`;
+    let key = `${certsDir}/${host}.key`;
+    let cl = clusterName(host);
+    let sp = string.replace(host, ".", "_");
+    // The content-firewall ext_authz HTTP filter, inserted after the OPA filter
+    // and before the router, only when the firewall is wired.
+    //
+    // with_request_body inspects the body before it reaches upstream. We buffer up
+    // to the real maximum body (4 MB) and set allow_partial_message:false so a body
+    // larger than the inspected window is REJECTED (413) rather than forwarded with
+    // an un-inspected tail. With allow_partial_message:true a prompt padded past
+    // 64 KB would skip inspection entirely, so the bypass is closed by failing shut.
+    let contentFilter = "";
+    if (!string.eql(contentAddr, "")) {
+        contentFilter = "          - name: envoy.filters.http.ext_authz\n            typed_config:\n              \"@type\": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz\n              transport_api_version: V3\n              with_request_body: { max_request_bytes: 4194304, allow_partial_message: false }\n              http_service:\n                server_uri: { uri: http://" + contentAddr + ", cluster: content, timeout: 2s }\n                path_prefix: \"/cf/check\"\n";
+    }
+    return "    - filter_chain_match: { server_names: [\"" + host + "\"] }\n      transport_socket:\n        name: envoy.transport_sockets.tls\n        typed_config:\n          \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext\n          common_tls_context:\n            tls_certificates:\n            - certificate_chain: { filename: \"" + crt + "\" }\n              private_key: { filename: \"" + key + "\" }\n      filters:\n      - name: envoy.filters.network.http_connection_manager\n        typed_config:\n          \"@type\": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\n          stat_prefix: bump_" + sp + "\n          codec_type: AUTO\n          route_config:\n            name: r\n            virtual_hosts:\n            - name: " + host + "\n              domains: [\"*\"]\n              routes:\n              - match: { prefix: \"/\" }\n                route: { cluster: " + cl + ", host_rewrite_literal: " + host + ", timeout: 120s }\n          http_filters:\n          - name: envoy.filters.http.ext_authz\n            typed_config:\n              \"@type\": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz\n              transport_api_version: V3\n              with_request_body: { max_request_bytes: 4194304, allow_partial_message: false }\n              grpc_service: { envoy_grpc: { cluster_name: opa }, timeout: 1s }\n" + contentFilter + "          - name: envoy.filters.http.router\n            typed_config:\n              \"@type\": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\n";
+}
+
+/// Emits the LDS resource document: the `ingress` listener with a TLS inspector,
+/// one bump filter chain per registered host, and a default splice chain for any
+/// unregistered host (SNI dynamic forward proxy -> TCP proxy to `dyn_forward`).
+pub fn emitLds(certsDir: string, proxyListen: string, contentAddr: string, eps: list.List<Endpoint>): string {
+    let (lh, lp) = splitHostPort(proxyListen, "0.0.0.0", 10000);
+    let en = enabledEndpoints(eps);
+    let chains = "";
+    let i = 0;
+    while (i < en.size()) {
+        let e = en.get(i) ?? Endpoint("", 443, false);
+        chains = chains + bumpChain(certsDir, e.host, contentAddr);
+        i = i + 1;
+    }
+    return "resources:\n- \"@type\": type.googleapis.com/envoy.config.listener.v3.Listener\n  name: ingress\n  address: { socket_address: { address: " + lh + ", port_value: " + `${lp}` + " } }\n  listener_filters:\n  - name: envoy.filters.listener.tls_inspector\n    typed_config: { \"@type\": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector }\n  filter_chains:\n" + chains + "    - filters:\n      - name: envoy.filters.network.sni_dynamic_forward_proxy\n        typed_config:\n          \"@type\": type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig\n          port_value: 443\n          dns_cache_config: { name: dyn, dns_lookup_family: V4_ONLY }\n      - name: envoy.filters.network.tcp_proxy\n        typed_config:\n          \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy\n          stat_prefix: splice\n          cluster: dyn_forward\n";
+}
+
+/// Emits the Envoy bootstrap: node id and file-based LDS/CDS watched-directory
+/// config, plus the admin endpoint.
+pub fn emitBootstrap(dir: string): string {
+    return "node: { id: varman, cluster: varman }\ndynamic_resources:\n  lds_config: { path_config_source: { path: " + dir + "/lds.yaml, watched_directory: { path: " + dir + " } }, resource_api_version: V3 }\n  cds_config: { path_config_source: { path: " + dir + "/cds.yaml, watched_directory: { path: " + dir + " } }, resource_api_version: V3 }\nadmin:\n  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }\n";
+}
+
+/// Writes `content` to `path` atomically (temp file + rename).
+pub fn atomicWrite(path: string, content: string): void {
+    let tmp = path + ".tmp";
+    File.writeText(tmp, content);
+    Dir.rename(tmp, path);
+}
+
+/// Mints a leaf certificate for `host` signed by the Varman CA, if not already
+/// present. Shells out to `openssl`, exactly like the Rust sidecar. Returns true
+/// on success (or when the cert already exists). Needs a live environment with
+/// `openssl` and a CA at `caDir/ca.crt` + `caDir/ca.key`; not exercised offline.
+pub fn mintLeaf(caDir: string, certsDir: string, host: string): bool {
+    let crt = `${certsDir}/${host}.crt`;
+    let key = `${certsDir}/${host}.key`;
+    if (File.exists(crt) && File.exists(key)) { return true; }
+    let csr = `${certsDir}/${host}.csr`;
+    let ext = `${certsDir}/${host}.ext`;
+    File.writeText(ext, `subjectAltName=DNS:${host}\n`);
+
+    let a1 = list.List<string>();
+    a1.push("genrsa"); a1.push("-out"); a1.push(key); a1.push("2048");
+    if (runToExit("openssl", a1) != 0) { return false; }
+
+    let a2 = list.List<string>();
+    a2.push("req"); a2.push("-new"); a2.push("-key"); a2.push(key);
+    a2.push("-subj"); a2.push(`/CN=${host}`); a2.push("-out"); a2.push(csr);
+    if (runToExit("openssl", a2) != 0) { return false; }
+
+    let a3 = list.List<string>();
+    a3.push("x509"); a3.push("-req"); a3.push("-in"); a3.push(csr);
+    a3.push("-CA"); a3.push(`${caDir}/ca.crt`); a3.push("-CAkey"); a3.push(`${caDir}/ca.key`);
+    a3.push("-CAcreateserial"); a3.push("-days"); a3.push("825"); a3.push("-sha256");
+    a3.push("-extfile"); a3.push(ext); a3.push("-out"); a3.push(crt);
+    return runToExit("openssl", a3) == 0;
+}
+
+/// The side-effecting path: ensures the envoy dir exists, mints a leaf cert per
+/// host, and writes `cds.yaml`, `lds.yaml`, and (once) `bootstrap.yaml`. Returns
+/// the number of endpoints configured. Requires a live environment; the pure
+/// `emitCds`/`emitLds` functions above are what the gate tests.
+pub fn writeConfig(dir: string, caDir: string, opaAddr: string, contentAddr: string, proxyListen: string, eps: list.List<Endpoint>): int {
+    let certsDir = `${dir}/certs`;
+    Dir.create(dir, 493);
+    Dir.create(certsDir, 493);
+    let en = enabledEndpoints(eps);
+
+    atomicWrite(`${dir}/cds.yaml`, emitCds(opaAddr, contentAddr, en));
+    let i = 0;
+    while (i < en.size()) {
+        let e = en.get(i) ?? Endpoint("", 443, false);
+        mintLeaf(caDir, certsDir, e.host);
+        i = i + 1;
+    }
+    atomicWrite(`${dir}/lds.yaml`, emitLds(certsDir, proxyListen, contentAddr, en));
+    let bp = `${dir}/bootstrap.yaml`;
+    if (!File.exists(bp)) { File.writeText(bp, emitBootstrap(dir)); }
+    return en.size();
+}

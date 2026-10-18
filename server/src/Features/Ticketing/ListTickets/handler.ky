@@ -1,0 +1,47 @@
+// GET /tickets -> {"tickets":[{id,rule_id,decision_id,connector,external_id,status,title,
+// hits,created_ms,last_sent_ms}]} (limit 200, last_sent_ms DESC). Mirrors acp list_tickets.
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import Shared.AppContext;
+import Shared.Http;
+import Features.Ticketing.Shared.TicketRepository;
+import Domain.Dtos.TicketRuleRow;
+
+pub fn ticketJson(t: TicketRow): json.JsonValue {
+    let m = Map<string, json.JsonValue>(10, string.hash);
+    m.set("id", json.str(t.id));
+    m.set("rule_id", json.str(t.rule_id));
+    m.set("decision_id", json.str(t.decision_id));
+    m.set("connector", json.str(t.connector));
+    m.set("external_id", json.str(t.external_id));
+    m.set("status", json.str(t.status));
+    m.set("title", json.str(t.title));
+    m.set("hits", json.number(t.hits as long));
+    m.set("created_ms", json.number(t.created_ms));
+    m.set("last_sent_ms", json.number(t.last_sent_ms));
+    return json.object(m);
+}
+
+pub struct ListTicketsHandler impl RouteHandler {
+    repo: TicketRepository,
+    app: AppContext,
+    init(repo: TicketRepository, app: AppContext) { self.repo = repo; self.app = app; }
+
+    async fn serve(self: ListTicketsHandler, ctx: routing.Context): response.Response {
+        let tenant = ctx.request.getHeader("x-acp-tenant") ?? self.app.trustCfg.tenant;
+        let rows = await self.repo.listTickets(tenant);
+        let arr = list.List<json.JsonValue>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            arr.push(ticketJson(rows.items.getOr(i, TicketRow{ id: "", rule_id: "", decision_id: "", connector: "", external_id: "", status: "", title: "", hits: 0, created_ms: 0, last_sent_ms: 0 })));
+            i = i + 1;
+        }
+        let m = Map<string, json.JsonValue>(2, string.hash);
+        m.set("tickets", json.array(arr));
+        return Http.okObj(m);
+    }
+}

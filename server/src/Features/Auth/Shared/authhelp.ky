@@ -1,0 +1,139 @@
+// Auth helpers: map an AuthPrincipal's roles to the capability names acp reports
+// in GET /auth/session (the Rust `format!("{c:?}")` enum names). Also the Entra
+// interactive-sign-in helpers: redirect URI, DPO-email extraction, and the
+// email->roles gate that admits only the org's primary contact and DPO.
+import list;
+import string;
+import env;
+import serde.json;
+import web.client;
+import Shared.Auth;
+import Shared.AppConfig;
+
+/// Parse a JWK Set document (the JSON an OIDC `jwks_uri` returns) into a `Jwks`,
+/// registering every RSA key by its `kid` with the base64url modulus/exponent.
+/// Non-RSA or malformed entries are skipped. Pure (no I/O), so it is unit-tested.
+pub fn parseJwks(jsonText: string): Auth.Jwks {
+    let j = Auth.Jwks();
+    let v = json.tryParse(jsonText);
+    if (v == undefined) { return j; }
+    let root = v ?? json.null();
+    let keysV = json.asArray(json.get(root, "keys"));
+    if (keysV == undefined) { return j; }
+    let keys = keysV ?? List<json.JsonValue>();
+    let i = 0;
+    while (i < keys.size()) {
+        let k = keys.get(i) ?? json.null();
+        let kty = json.asString(json.get(k, "kty")) ?? "";
+        let kid = json.asString(json.get(k, "kid")) ?? "";
+        if (string.eql(kty, "RSA") && kid.length > 0) {
+            let n = json.asString(json.get(k, "n")) ?? "";
+            let e = json.asString(json.get(k, "e")) ?? "";
+            if (n.length > 0 && e.length > 0) { j.addRsa(kid, n, e); }
+        }
+        i = i + 1;
+    }
+    return j;
+}
+
+/// Verify an Entra `id_token` end to end: fetch the configured tenant's JWKS over
+/// HTTPS, then check the RS256 signature plus `iss`/`aud`/`exp`/`nbf` against the
+/// EXPECTED tenant (built from `cfg.tenantId`/`cfg.clientId`, never the token's own
+/// claimed tenant). Fails closed on any fetch, parse, or verification error. The
+/// signature-and-claims half is unit-tested; the live fetch is exercised at the
+/// real-tenant cutover.
+pub fn verifyIdToken(cfg: EntraSignInConfig, idToken: string, nowMs: long): bool {
+    let base = "https://login.microsoftonline.com/" + cfg.tenantId;
+    let resp = client.Http.get(base + "/discovery/v2.0/keys");
+    if (resp.status.toCode() != 200) { return false; }
+    let jwks = parseJwks(resp.body);
+    let vcfg = Auth.EntraConfig(base + "/v2.0", cfg.clientId);
+    return Auth.verify(idToken, jwks, vcfg, nowMs).ok;
+}
+
+/// The OIDC redirect URI registered with the Entra app (from app.yaml; a sensible
+/// local default when unset).
+pub fn entraRedirectUri(cfg: EntraSignInConfig): string {
+    if (cfg.redirectUri.length > 0) { return cfg.redirectUri; }
+    return "http://127.0.0.1:8080/auth/callback";
+}
+
+/// The client secret: from app.yaml if present, otherwise the
+/// `ENTRA_CLIENT_SECRET` environment variable, so the secret need not be
+/// committed to app.yaml.
+pub fn entraSecret(cfg: EntraSignInConfig): string {
+    if (cfg.clientSecret.length > 0) { return cfg.clientSecret; }
+    return env.get("ENTRA_CLIENT_SECRET");
+}
+
+/// Whether Entra interactive sign-in is configured: tenant + client id from
+/// app.yaml and a secret from app.yaml or the environment.
+pub fn entraConfigured(cfg: EntraSignInConfig): bool {
+    return cfg.tenantId.length > 0 && cfg.clientId.length > 0 && entraSecret(cfg).length > 0;
+}
+
+/// The DPO email captured at signup, read out of the tenant's profile_json.
+pub fn dpoEmailOf(profileJson: string): string {
+    let v = json.tryParse(profileJson);
+    if (v == undefined) { return ""; }
+    let o = v ?? json.null();
+    if (o.kind != 5) { return ""; }
+    return json.asString(json.get(o, "dpo_email")) ?? "";
+}
+
+fn sameEmail(a: string, b: string): bool {
+    if (string.eql(string.trim(a), "") || string.eql(string.trim(b), "")) { return false; }
+    return string.eql(string.toLowerCase(string.trim(a)), string.toLowerCase(string.trim(b)));
+}
+
+/// The roles to grant a signed-in Entra user, gated to the org's two authorised
+/// identities: the primary contact (org administrator) and the DPO (governance +
+/// audit). Any other email returns an empty list, which the callback treats as
+/// "not authorised to sign in" (403).
+pub fn loginRolesFor(email: string, contactEmail: string, dpoEmail: string): list.List<string> {
+    let roles = list.List<string>();
+    if (sameEmail(email, contactEmail)) {
+        roles.push("PolicyAdmin"); roles.push("GrcAuthor"); roles.push("FirewallAdmin"); roles.push("Approver");
+        return roles;
+    }
+    if (sameEmail(email, dpoEmail)) {
+        roles.push("GrcAuthor"); roles.push("Auditor");
+        return roles;
+    }
+    return roles;
+}
+
+pub fn authCapName(code: int): string {
+    if (code == 0) { return "EditPolicy"; }
+    if (code == 1) { return "Approve"; }
+    if (code == 2) { return "Export"; }
+    if (code == 3) { return "SeeArgs"; }
+    if (code == 4) { return "RegisterApp"; }
+    if (code == 5) { return "RegisterAgent"; }
+    if (code == 6) { return "EditGrc"; }
+    if (code == 7) { return "EditFirewall"; }
+    if (code == 8) { return "BreakGlass"; }
+    return "";
+}
+
+fn authHas(xs: list.List<string>, v: string): bool {
+    let i = 0;
+    while (i < xs.size()) { if (string.eql(xs.get(i) ?? "", v)) { return true; } i = i + 1; }
+    return false;
+}
+
+pub fn authCapsForRoles(roles: list.List<string>): list.List<string> {
+    let out = list.List<string>();
+    let i = 0;
+    while (i < roles.size()) {
+        let codes = Auth.roleCaps(roles.get(i) ?? "");
+        let j = 0;
+        while (j < codes.size()) {
+            let nm = authCapName(codes.get(j) ?? (0 - 1));
+            if (nm.length > 0 && !authHas(out, nm)) { out.push(nm); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}

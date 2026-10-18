@@ -1,0 +1,169 @@
+//! varman-cli (`varman`): the offline / CI toolset. A port of Rust `acp-cli`'s
+//! hand-rolled argv dispatch (`main.rs`). It is file-first and signs locally;
+//! no network. Management operations (approvals, registration, the kill-switch,
+//! GRC records, policy deploy) are RETIRED from the CLI and live in the console
+//! or the control-plane API; running one prints where to do it instead.
+//!
+//! Active subcommands:
+//!   policy-compile <file>              compile a policy to Rego
+//!   policy-lint    <file>              heuristic lint findings
+//!   policy-test    <file> <calls.jsonl>        per-call verdicts
+//!   policy-test --diff <old> <new> <calls>     verdict flips between policies
+//!   verify         <pack.json>         verify a signed pack
+//!   verify-pack    <pack.json>         verify a detached signed pack
+//!   export         <body.json> <keyfile>       sign a body into a detached pack
+//!   content-scan   <text-or-@file> [--block-secrets]   basic PII/secret scan
+//!   sign-artifact  <file> <keyfile>            Ed25519 over the file bytes
+//!   verify-artifact <file> <pub> <sig>         verify an artifact signature
+//!   init [dir]                         scaffold a starter policy
+
+import env;
+import string;
+import list;
+import cmd_policy;
+import cmd_evidence;
+import cmd_content;
+import cmd_artifact;
+import cmd_init;
+
+extern("c") fn kyte_exit(code: int): void;
+
+fn isActive(cmd: string): bool {
+    return string.eql(cmd, "policy-compile") || string.eql(cmd, "policy-lint")
+        || string.eql(cmd, "policy-test") || string.eql(cmd, "verify")
+        || string.eql(cmd, "verify-pack") || string.eql(cmd, "export")
+        || string.eql(cmd, "content-scan") || string.eql(cmd, "sign-artifact")
+        || string.eql(cmd, "verify-artifact") || string.eql(cmd, "init");
+}
+
+fn isHelp(cmd: string): bool {
+    return string.eql(cmd, "help") || string.eql(cmd, "--help")
+        || string.eql(cmd, "-h") || string.eql(cmd, "version")
+        || string.eql(cmd, "--version") || string.eql(cmd, "-V");
+}
+
+fn retiredHint(cmd: string): string | undefined {
+    if (string.eql(cmd, "approve")) { return "Resolve holds from the console Approvals inbox, or POST /approvals/:id/approve."; }
+    if (string.eql(cmd, "deny")) { return "Resolve holds from the console Approvals inbox, or POST /approvals/:id/deny."; }
+    if (string.eql(cmd, "approvals")) { return "See the console Approvals inbox, or GET /approvals/pending."; }
+    if (string.eql(cmd, "break-glass")) { return "Operate the kill-switch from the console, or POST /break-glass/engage and /clear."; }
+    if (string.eql(cmd, "app")) { return "Register teams from the console Teams page, or POST /apps."; }
+    if (string.eql(cmd, "agent")) { return "Register agents from the console Agents page, or POST /agents."; }
+    if (string.eql(cmd, "enroll")) { return "Register AI endpoints from the console AI Endpoints page, or POST /endpoints/register."; }
+    if (string.eql(cmd, "registry")) { return "Inspect teams and agents from the console, or GET /apps and /agents."; }
+    if (string.eql(cmd, "risk")) { return "Manage the risk register from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "aibom")) { return "Create an AI-BOM record from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "controls")) { return "The control library is served by the control plane; see the console Governance page."; }
+    if (string.eql(cmd, "assess")) { return "Create an assessment from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "attest")) { return "Create an attestation from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "usecase")) { return "Manage the use-case lifecycle from the console Governance page, or POST /grc and /grc/:id/status."; }
+    if (string.eql(cmd, "conformity")) { return "Manage the conformity checklist from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "modelcard")) { return "Manage model cards from the console Governance page, or POST /grc."; }
+    if (string.eql(cmd, "policy")) { return "Deploy signed policy from the console, or POST /policy-store/deploy."; }
+    return undefined;
+}
+
+fn retired(cmd: string, hint: string): int {
+    console.log(`varman: '${cmd}' is retired from the CLI. Manage it from the console or the control-plane API. ${hint}`);
+    return 2;
+}
+
+fn printHelp(): int {
+    console.log("Varman, the Agent Control Plane (ACP)");
+    console.log("Offline / CI toolset: author and test policy, verify evidence, scan content, sign artifacts.");
+    console.log("");
+    console.log("Commands:");
+    console.log("  policy-compile <file>            compile a policy to Rego");
+    console.log("  policy-lint    <file>            heuristic lint findings");
+    console.log("  policy-test    <file> <calls>    per-call verdicts (--diff <old> <new> <calls> for flips)");
+    console.log("  verify | verify-pack <pack>      verify a signed (detached) pack");
+    console.log("  export <body.json> <keyfile>     sign a JSON body into a detached pack");
+    console.log("  content-scan <text|@file> [--block-secrets]   basic PII/secret scan");
+    console.log("  sign-artifact <file> <keyfile>   Ed25519 over the file bytes");
+    console.log("  verify-artifact <file> <pub> <sig>   verify an artifact signature");
+    console.log("  init [dir]                       scaffold a starter policy");
+    console.log("");
+    console.log("Managed from the console or the control-plane API (retired from the CLI):");
+    console.log("  approvals/approve/deny, teams/agents (app/agent), AI endpoints (enroll),");
+    console.log("  the kill-switch (break-glass), policy deploy (policy), and GRC records");
+    console.log("  (risk/assess/attest/usecase/conformity/modelcard/aibom/controls).");
+    return 0;
+}
+
+fn argAt(args: List<string>, i: int): string {
+    if (i < 0 || i >= args.size()) { return ""; }
+    return args.get(i) ?? "";
+}
+
+fn main(): void {
+    let args = env.args();
+
+    // Locate the command token: the first argv that is a known command, a
+    // retired command, or a help flag (argv[0] may or may not be the program).
+    let cmd = "";
+    let cmdIdx = -1;
+    let i = 0;
+    while (i < args.size()) {
+        let a = argAt(args, i);
+        if (isActive(a) || isHelp(a) || retiredHint(a) != undefined) {
+            cmd = a; cmdIdx = i; break;
+        }
+        i = i + 1;
+    }
+    if (string.len(cmd) == 0) { let _ = printHelp(); kyte_exit(0); return; }
+
+    // Positional arguments after the command token.
+    let rest = List<string>();
+    let j = cmdIdx + 1;
+    while (j < args.size()) { rest.push(argAt(args, j)); j = j + 1; }
+
+    if (isHelp(cmd)) { kyte_exit(printHelp()); return; }
+
+    let hint = retiredHint(cmd);
+    if (hint != undefined) { kyte_exit(retired(cmd, hint)); return; }
+
+    let code = 2;
+    if (string.eql(cmd, "policy-compile")) {
+        if (rest.size() < 1) { console.log("usage: varman policy-compile <policy.json|yaml>"); code = 2; }
+        else { code = cmd_policy.cmdPolicyCompile(rest.at(0)); }
+    } else if (string.eql(cmd, "policy-lint")) {
+        if (rest.size() < 1) { console.log("usage: varman policy-lint <policy.json|yaml>"); code = 2; }
+        else { code = cmd_policy.cmdPolicyLint(rest.at(0)); }
+    } else if (string.eql(cmd, "policy-test")) {
+        code = cmd_policy.cmdPolicyTest(rest);
+    } else if (string.eql(cmd, "verify")) {
+        if (rest.size() < 1) { console.log("usage: varman verify <pack.json>"); code = 2; }
+        else { code = cmd_evidence.cmdVerify(rest.at(0)); }
+    } else if (string.eql(cmd, "verify-pack")) {
+        if (rest.size() < 1) { console.log("usage: varman verify-pack <pack.json>"); code = 2; }
+        else { code = cmd_evidence.cmdVerifyPack(rest.at(0)); }
+    } else if (string.eql(cmd, "export")) {
+        if (rest.size() < 2) { console.log("usage: varman export <body.json> <keyfile>"); code = 2; }
+        else { code = cmd_evidence.cmdExport(rest.at(0), rest.at(1)); }
+    } else if (string.eql(cmd, "content-scan")) {
+        if (rest.size() < 1) { console.log("usage: varman content-scan <text-or-@file> [--block-secrets]"); code = 2; }
+        else {
+            let subj = "";
+            let blockSecrets = false;
+            let k = 0;
+            while (k < rest.size()) {
+                let a = rest.at(k);
+                if (string.eql(a, "--block-secrets")) { blockSecrets = true; }
+                else if (subj.length == 0 && !string.startsWith(a, "--")) { subj = a; }
+                k = k + 1;
+            }
+            if (subj.length == 0) { console.log("usage: varman content-scan <text-or-@file> [--block-secrets]"); code = 2; }
+            else { code = cmd_content.cmdContentScan(subj, blockSecrets); }
+        }
+    } else if (string.eql(cmd, "sign-artifact")) {
+        if (rest.size() < 2) { console.log("usage: varman sign-artifact <file> <keyfile>"); code = 2; }
+        else { code = cmd_artifact.cmdSignArtifact(rest.at(0), rest.at(1)); }
+    } else if (string.eql(cmd, "verify-artifact")) {
+        if (rest.size() < 3) { console.log("usage: varman verify-artifact <file> <pub> <sig>"); code = 2; }
+        else { code = cmd_artifact.cmdVerifyArtifact(rest.at(0), rest.at(1), rest.at(2)); }
+    } else if (string.eql(cmd, "init")) {
+        let dir = if (rest.size() >= 1) rest.at(0) else "varman-demo";
+        code = cmd_init.cmdInit(dir);
+    }
+    kyte_exit(code);
+}

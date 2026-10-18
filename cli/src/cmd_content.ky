@@ -1,0 +1,167 @@
+//! varman-cli: `content-scan`. A BASIC, deterministic PII / secret scan.
+//!
+//! A deliberately small, honest subset of Rust `acp-cli`'s `commands/content.rs`
+//! (`cmd_content_scan`) and the varman `content` firewall. It detects, with no
+//! model and no network:
+//!   - email addresses (PII),
+//!   - US SSNs in the ddd-dd-dddd shape (PII),
+//!   - a few obvious secret markers (AWS AKIA keys, `sk-` tokens, PEM private
+//!     keys) when `--block-secrets` is set.
+//!
+//! PII that is found is redacted to `[REDACTED]` and the text is BLOCKED (exit
+//! 3). This differs from the Rust default, which redacts PII but only blocks on
+//! injection / secrets; here any PII blocks, which is what the offline gate
+//! exercises. The full content firewall (prompt-injection signatures, toxicity,
+//! denied topics, the ML classifier and the red-team corpus) is NOT ported.
+//
+// TODO: port the full content firewall: injection signatures, denied-topic
+//   matching, toxicity, the LinearScorer ML path and obfuscation red-teaming.
+
+import string;
+import list;
+import io.file;
+
+/// The result of a content scan.
+pub struct ScanResult {
+    /// True when the text should be blocked (exit 3).
+    pub blocked: bool,
+    /// The text with detected PII replaced by `[REDACTED]` (whitespace is
+    /// normalised to single spaces in this subset).
+    pub redacted: string,
+    /// The distinct detector names that fired, e.g. "email", "ssn", "secret".
+    pub findings: List<string>,
+
+    init(blocked: bool, redacted: string, findings: List<string>) {
+        self.blocked = blocked;
+        self.redacted = redacted;
+        self.findings = findings;
+    }
+}
+
+fn isSpace(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+fn isDigit(c: int): bool { return c >= 48 && c <= 57; }
+
+// Split on any run of whitespace.
+fn tokenize(text: string): List<string> {
+    let out = List<string>();
+    let i = 0;
+    let start = -1;
+    while (i < text.length) {
+        if (isSpace(text[i])) {
+            if (start >= 0) { out.push(string.slice(text, start, i)); start = -1; }
+        } else {
+            if (start < 0) { start = i; }
+        }
+        i = i + 1;
+    }
+    if (start >= 0) { out.push(string.slice(text, start, text.length)); }
+    return out;
+}
+
+// A token looks like an email: it has an '@' with a character before it and a
+// '.' somewhere after it (with at least one more character following the dot).
+fn isEmail(tok: string): bool {
+    let at = string.indexOf(tok, "@");
+    if (at <= 0) { return false; }
+    let after = string.slice(tok, at + 1, tok.length);
+    let dot = string.indexOf(after, ".");
+    if (dot < 0) { return false; }
+    return dot + 1 < after.length;
+}
+
+// Does an SSN (ddd-dd-dddd) start at position i of s?
+fn ssnAt(s: string, i: int): bool {
+    if (i + 11 > s.length) { return false; }
+    let d = 0;
+    while (d < 3) { if (!isDigit(s[i + d])) { return false; } d = d + 1; }
+    if (s[i + 3] != 45) { return false; } // '-'
+    if (!isDigit(s[i + 4]) || !isDigit(s[i + 5])) { return false; }
+    if (s[i + 6] != 45) { return false; }
+    d = 0;
+    while (d < 4) { if (!isDigit(s[i + 7 + d])) { return false; } d = d + 1; }
+    return true;
+}
+
+fn containsSsn(tok: string): bool {
+    let i = 0;
+    while (i + 11 <= tok.length) {
+        if (ssnAt(tok, i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Obvious secret markers. A conservative, false-positive-averse subset.
+fn isSecretToken(tok: string): bool {
+    if (string.startsWith(tok, "AKIA") && tok.length >= 20) { return true; }
+    if (string.startsWith(tok, "sk-") && tok.length >= 20) { return true; }
+    return false;
+}
+
+fn addOnce(xs: List<string>, v: string): void {
+    let i = 0;
+    while (i < xs.size()) { if (string.eql(xs.at(i), v)) { return; } i = i + 1; }
+    xs.push(v);
+}
+
+/// Scan `text`. PII (email/SSN) is always redacted and blocks; secret markers
+/// block only when `blockSecrets` is set.
+pub fn scan(text: string, blockSecrets: bool): ScanResult {
+    let findings = List<string>();
+    let secret = false;
+    if (string.contains(text, "-----BEGIN")) { secret = true; }
+
+    let tokens = tokenize(text);
+    let out = List<string>();
+    let hasPii = false;
+    let i = 0;
+    while (i < tokens.size()) {
+        let tok = tokens.at(i);
+        if (isEmail(tok)) {
+            hasPii = true; addOnce(findings, "email"); out.push("[REDACTED]");
+        } else if (containsSsn(tok)) {
+            hasPii = true; addOnce(findings, "ssn"); out.push("[REDACTED]");
+        } else if (isSecretToken(tok)) {
+            secret = true; out.push("[REDACTED]");
+        } else {
+            out.push(tok);
+        }
+        i = i + 1;
+    }
+    if (secret) { addOnce(findings, "secret"); }
+
+    let blocked = hasPii || (blockSecrets && secret);
+    return ScanResult(blocked, string.join(out, " "), findings);
+}
+
+/// The process exit code for a scan result: 3 when blocked, else 0.
+pub fn scanExitCode(r: ScanResult): int {
+    return if (r.blocked) 3 else 0;
+}
+
+// Read the scan subject: a literal string, or `@path` to read a file.
+pub fn readSubject(arg: string): string {
+    if (string.startsWith(arg, "@")) {
+        let path = string.slice(arg, 1, arg.length);
+        if (File.exists(path)) { return File.readText(path); }
+        return "";
+    }
+    return arg;
+}
+
+/// CLI wrapper: scan `<text-or-@file>` with optional `--block-secrets`. Prints a
+/// verdict line and returns the exit code (3 when blocked).
+pub fn cmdContentScan(arg: string, blockSecrets: bool): int {
+    let text = readSubject(arg);
+    let r = scan(text, blockSecrets);
+    let names = string.join(r.findings, ", ");
+    if (r.blocked) {
+        console.log(`BLOCKED (${names})`);
+    } else if (r.findings.size() > 0) {
+        console.log(`ALLOW (findings: ${names})`);
+    } else {
+        console.log("ALLOW (clean)");
+    }
+    console.log(`redacted: ${r.redacted}`);
+    return scanExitCode(r);
+}

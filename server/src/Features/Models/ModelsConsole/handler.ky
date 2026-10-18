@@ -1,0 +1,109 @@
+// Models console: the hypermedia view (GET /models/view) + first-party mutation
+// handlers (POST /console/models/{save,delete}) backing views/models.kyx. The
+// card_json is parsed here into ModelCard so the view stays JSON-free. Trusted
+// /console/* (no bearer); the machine /models JSON API keeps requireCap.
+import ds_response;
+import web.routing;
+import web.response;
+import string;
+import list;
+import map;
+import serde.json;
+import crypto.random;
+import Shared.AppContext;
+import Shared.Http;
+import Shared.ConsoleDs;
+import Features.Models.Shared.ModelRepository;
+import Features.Models.views.models;
+import Domain.Dtos.ModelRow;
+
+fn mTenant(app: AppContext, ctx: routing.Context): string {
+    return ctx.request.getHeader("x-acp-tenant") ?? app.trustCfg.tenant;
+}
+fn sig(body: json.JsonValue, key: string): string { return string.trim(json.asString(json.get(body, key)) ?? ""); }
+
+// ModelRow (raw card_json) -> ModelCard (modality + description extracted).
+fn toCard(r: ModelRow): models.ModelCard {
+    let modality = "text";
+    let desc = "";
+    let parsed = json.tryParse(r.card_json);
+    if (parsed != undefined) {
+        let c = parsed ?? json.null();
+        let m = json.asString(json.get(c, "modality")) ?? "";
+        if (m.length > 0) { modality = m; }
+        desc = json.asString(json.get(c, "description")) ?? "";
+    }
+    return models.ModelCard(r.id, r.name, r.provider, r.version, modality, desc);
+}
+
+async fn modelCards(repo: ModelRepository, tenant: string): list.List<models.ModelCard> {
+    let rows = await repo.list(tenant);
+    let out = list.List<models.ModelCard>();
+    let i = 0;
+    while (i < rows.items.size()) {
+        out.push(toCard(rows.items.getOr(i, ModelRow{ id:"", name:"", provider:"", version:"", card_json:"{}", scan_status:"", aibom_json:"{}", tenant:"", created_ms:0 })));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub struct ModelsViewHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: ModelsViewHandler, ctx: routing.Context): Response {
+        let cards = await modelCards(self.repo, mTenant(self.app, ctx));
+        return await ds_response.patch(models.modelsPanel(cards));
+    }
+}
+
+fn cardJson(modality: string, desc: string): string {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("modality", json.str(modality));
+    m.set("description", json.str(desc));
+    return json.stringify(json.object(m));
+}
+
+pub struct ModelsSaveHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: ModelsSaveHandler, ctx: routing.Context): Response {
+        let tenant = mTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let name = sig(body, "mdlName");
+        if (name.length == 0) {
+            let cards = await modelCards(self.repo, tenant);
+            return await ConsoleDs.patchAndSignals(models.modelsPanel(cards), "{\"mdlErr\":\"Name is required.\"}");
+        }
+        let provider = sig(body, "mdlProvider");
+        let version = sig(body, "mdlVersion");
+        let modality = sig(body, "mdlModality"); if (modality.length == 0) { modality = "text"; }
+        let desc = sig(body, "mdlDesc");
+        let card = cardJson(modality, desc);
+        let id = sig(body, "mdlId");
+        if (id.length == 0) {
+            let newId = string.concat("mdl-", random.randomHex(6));
+            await self.repo.insert(newId, name, provider, version, card, "unscanned", "{}", tenant, Http.nowMs());
+        } else {
+            await self.repo.update(id, name, provider, version, card, tenant);
+        }
+        let cards = await modelCards(self.repo, tenant);
+        return await ConsoleDs.patchAndSignals(models.modelsPanel(cards),
+            "{\"mdlModal\":\"\",\"mdlErr\":\"\",\"mdlId\":\"\",\"mdlName\":\"\",\"mdlProvider\":\"\",\"mdlVersion\":\"\",\"mdlModality\":\"text\",\"mdlDesc\":\"\"}");
+    }
+}
+
+pub struct ModelsDeleteHandler impl RouteHandler {
+    repo: ModelRepository,
+    app: AppContext,
+    init(repo: ModelRepository, app: AppContext) { self.repo = repo; self.app = app; }
+    async fn serve(self: ModelsDeleteHandler, ctx: routing.Context): Response {
+        let tenant = mTenant(self.app, ctx);
+        let body = Http.bodyJson(ctx);
+        let id = sig(body, "mdlId");
+        if (id.length > 0) { await self.repo.delete(id, tenant); }
+        let cards = await modelCards(self.repo, tenant);
+        return await ConsoleDs.patchAndSignals(models.modelsPanel(cards), "{\"mdlModal\":\"\",\"mdlErr\":\"\"}");
+    }
+}

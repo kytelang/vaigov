@@ -1,0 +1,99 @@
+// Pack install logic, shared by Install + Upgrade: resolve parameters (defaults
+// overlaid by supplied), substitute {{param}} in each rule template, validate the
+// match tree (varman-core rego.validateMatch), instantiate into policy_rules with
+// pack provenance, tag controls, and record the install. Mirrors acp-server
+// handlers/policy_packs.rs `install`.
+import string;
+import list;
+import map;
+import serde.json;
+import rego;
+import Features.PolicyPacks.Shared.PackRepository;
+import Features.PolicyPacks.Shared.packdata;
+
+fn packOkFalse(msg: string): json.JsonValue {
+    let m = Map<string, json.JsonValue>(2, string.hash);
+    m.set("ok", json.bool(false));
+    m.set("error", json.str(msg));
+    return json.object(m);
+}
+
+// Resolve the pack's parameters into a {key:stringValue} object; returns the
+// object, or an error JSON when a required parameter is missing.
+fn resolveParams(pack: json.JsonValue, supplied: Map<string, json.JsonValue>): Map<string, json.JsonValue> | undefined {
+    let out = Map<string, json.JsonValue>(8, string.hash);
+    let ps = json.asArray(json.get(pack, "parameters"));
+    if (ps == undefined) { return out; }
+    let arr = ps ?? list.List<json.JsonValue>();
+    let i = 0;
+    while (i < arr.size()) {
+        let p = arr.at(i);
+        let key = json.asString(json.get(p, "key")) ?? "";
+        let sv = supplied.get(key);
+        if (sv != undefined) { out.set(key, sv ?? json.null()); }
+        else if (json.has(p, "default")) { out.set(key, json.get(p, "default")); }
+        else if (json.asBool(json.get(p, "required")) ?? false) { return undefined; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Instantiate the pack into the tenant. Returns the acp response JSON object.
+pub async fn installPack(repo: PackRepository, pack: json.JsonValue, supplied: Map<string, json.JsonValue>, tenant: string, nowMs: long): json.JsonValue {
+    let params = resolveParams(pack, supplied);
+    if (params == undefined) { return packOkFalse("missing required parameter"); }
+    let pmap = params ?? Map<string, json.JsonValue>(1, string.hash);
+    let slug = json.asString(json.get(pack, "slug")) ?? "";
+    let version = (json.asNumber(json.get(pack, "version")) ?? 1) as int;
+    let framework = json.asString(json.get(pack, "framework_slug")) ?? "";
+    let description = json.asString(json.get(pack, "description")) ?? "";
+
+    // Reinstall safety: disable any prior install of this pack first.
+    let _n = await repo.uninstall(tenant, slug);
+
+    let created = list.List<json.JsonValue>();
+    let rules = json.asArray(json.get(pack, "rules")) ?? list.List<json.JsonValue>();
+    let i = 0;
+    while (i < rules.size()) {
+        let r = packdata.substJson(rules.at(i), pmap);
+        let templateId = json.asString(json.get(r, "template_id")) ?? "rule";
+        let name = string.concat(string.concat("[", slug), string.concat("] ", templateId));
+        let verdict = json.asString(json.get(r, "verdict")) ?? "deny";
+        let approver = json.asString(json.get(r, "approver_group")) ?? "";
+        let matchVal = if (json.has(r, "match")) (json.get(r, "match")) else (json.object(Map<string, json.JsonValue>(1, string.hash)));
+        let matchJson = json.stringify(matchVal);
+        if (string.contains(matchJson, "{{") || string.contains(approver, "{{")) {
+            return packOkFalse(string.concat(string.concat("rule ", templateId), " has an unresolved parameter"));
+        }
+        let verr = rego.validateMatch(matchVal);
+        if (verr != undefined) {
+            return packOkFalse(string.concat(string.concat("pack rule ", templateId), string.concat(": ", verr ?? "")));
+        }
+        let obligations = if (json.has(r, "obligations")) (json.stringify(json.get(r, "obligations"))) else ("[]");
+        let ruleId = await repo.addRule(tenant, name, description, matchJson, approver, verdict, obligations, nowMs);
+        await repo.setProvenance(ruleId, slug, version);
+        // Tag controls resolved against the pack's framework.
+        let items = list.List<string>();
+        let cs = json.asArray(json.get(r, "controls")) ?? list.List<json.JsonValue>();
+        let j = 0;
+        while (j < cs.size()) {
+            let cid = json.asString(cs.at(j)) ?? "";
+            let item = await repo.resolveControlItem(framework, cid);
+            if (item != undefined) { items.push(item ?? ""); }
+            j = j + 1;
+        }
+        if (items.size() > 0) { await repo.setRuleControls(ruleId, items); }
+        created.push(json.str(ruleId));
+        i = i + 1;
+    }
+
+    let paramsJson = json.stringify(json.object(pmap));
+    await repo.recordInstall(tenant, slug, version, paramsJson, nowMs);
+
+    let m = Map<string, json.JsonValue>(4, string.hash);
+    m.set("ok", json.bool(true));
+    m.set("slug", json.str(slug));
+    m.set("version", json.number(version as long));
+    m.set("rules_created", json.array(created));
+    return json.object(m);
+}

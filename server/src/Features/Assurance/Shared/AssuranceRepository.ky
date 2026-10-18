@@ -1,0 +1,94 @@
+// AssuranceRepository: the assurance surface over acp's shared tables -
+// violation_events (the decision/violation feed), grc_records (red-team
+// attestations, kind='attestation'), and firewall_config (threat signatures).
+import list;
+import string;
+import data.db;
+import data.repository;
+import Shared.Db;
+import Domain.Dtos.ViolationRow;
+
+pub struct AssuranceRepository {
+    db: Db,
+    init(db: Db) { self.db = db; }
+
+    pub async fn listViolations(self: AssuranceRepository, limit: int): Rows<ViolationRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbInt(limit));
+        let r = await Repository<ViolationRow>(conn, "violation_events").query(
+            "SELECT id, kind, pep, agent, tool, verdict, rule_id, impact, outcome, ts_ms FROM violation_events ORDER BY ts_ms DESC LIMIT $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    pub async fn addViolation(self: AssuranceRepository, id: string, kind: string, pep: string, agent: string, tool: string, verdict: string, ruleId: string, impact: string, outcome: string, ts: long, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(kind)); p.push(db.dbText(pep)); p.push(db.dbText(agent));
+        p.push(db.dbText(tool)); p.push(db.dbText(verdict)); p.push(db.dbText(ruleId)); p.push(db.dbText(impact));
+        p.push(db.dbText(outcome)); p.push(db.dbLong(ts)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("INSERT INTO violation_events (id, kind, pep, agent, tool, verdict, rule_id, impact, outcome, ts_ms, tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn listRedteam(self: AssuranceRepository, tenant: string): Rows<RedteamAttestRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<RedteamAttestRow>(conn, "grc_records").query(
+            "SELECT id, status, created_ms, body, pubkey_hex, sig_hex FROM grc_records WHERE tenant_id = $1 AND kind = 'attestation' AND subject IN ('content-firewall','customer-agent') ORDER BY created_ms DESC", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Mirrors acp store.add_grc for an attestation record.
+    pub async fn addAttestation(self: AssuranceRepository, id: string, subject: string, title: string, status: string, body: string, operator: string, createdMs: long, pubkeyHex: string, sigHex: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(subject)); p.push(db.dbText(title)); p.push(db.dbText(status));
+        p.push(db.dbText(body)); p.push(db.dbText(operator)); p.push(db.dbLong(createdMs)); p.push(db.dbText(pubkeyHex));
+        p.push(db.dbText(sigHex)); p.push(db.dbText(status)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("INSERT INTO grc_records (id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id) VALUES ($1,'attestation',$2,$3,$4,$5,$6,$7,$8,$9,'[]','{}','',0,$10,$11)", p);
+        self.db.pool.release(conn);
+    }
+
+    // Promote a violation into a GRC incident (kind='incident' so the Grc feature lists it).
+    pub async fn addIncident(self: AssuranceRepository, id: string, title: string, status: string, body: string, operator: string, createdMs: long, pubkeyHex: string, sigHex: string, tenant: string): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(id)); p.push(db.dbText(title)); p.push(db.dbText(status)); p.push(db.dbText(body));
+        p.push(db.dbText(operator)); p.push(db.dbLong(createdMs)); p.push(db.dbText(pubkeyHex)); p.push(db.dbText(sigHex));
+        p.push(db.dbText(status)); p.push(db.dbText(tenant));
+        let _r = await conn.exec("INSERT INTO grc_records (id, kind, subject, title, status, body, operator, created_ms, pubkey_hex, sig_hex, linked_refs, answers_json, assignee, due_ms, stage, tenant_id) VALUES ($1,'incident','incident',$2,$3,$4,$5,$6,$7,$8,'[]','{}','',0,$9,$10)", p);
+        self.db.pool.release(conn);
+    }
+
+    pub async fn getFirewall(self: AssuranceRepository, tenant: string): Rows<FwRow> {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let r = await Repository<FwRow>(conn, "firewall_config").query(
+            "SELECT deny_topics, threat_signatures, block_secrets, block_toxicity, model, feed_version FROM firewall_config WHERE tenant_id = $1", p);
+        self.db.pool.release(conn);
+        return r;
+    }
+
+    // Bump the feed version and store threat signatures (acp threat_pack_load).
+    pub async fn setThreatSignatures(self: AssuranceRepository, tenant: string, version: long, sigs: string, nowMs: long): void {
+        let conn = await self.db.pool.acquire();
+        let p = list.List<DbValue>();
+        p.push(db.dbText(tenant));
+        let probe = await Repository<AsrProbe>(conn, "firewall_config").query("SELECT 1 AS one FROM firewall_config WHERE tenant_id = $1", p);
+        if (probe.items.size() == 0) {
+            let ip = list.List<DbValue>();
+            ip.push(db.dbText(tenant)); ip.push(db.dbLong(version)); ip.push(db.dbText(sigs)); ip.push(db.dbLong(nowMs));
+            let _i = await conn.exec("INSERT INTO firewall_config (tenant_id, enabled, block_secrets, deny_topics, model, scan_url, block_on_scanner_error, feed_version, threat_signatures, block_toxicity, updated_ms) VALUES ($1, 1, 1, '[]', '', '', 0, $2, $3, 0, $4)", ip);
+        } else {
+            let up = list.List<DbValue>();
+            up.push(db.dbLong(version)); up.push(db.dbText(sigs)); up.push(db.dbLong(nowMs)); up.push(db.dbText(tenant));
+            let _u = await conn.exec("UPDATE firewall_config SET feed_version = $1, threat_signatures = $2, updated_ms = $3 WHERE tenant_id = $4", up);
+        }
+        self.db.pool.release(conn);
+    }
+}
